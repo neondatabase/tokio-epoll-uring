@@ -9,6 +9,7 @@ use tracing::{debug, info};
 enum ThreadLocalStateInner {
     NotUsed,
     Used {
+        split_uring: *mut io_uring::IoUring,
         submit_side: SubmitSide,
         rx_completion_queue_from_poller_task: std::sync::mpsc::Receiver<SendSyncCompletionQueue>,
     },
@@ -17,17 +18,16 @@ enum ThreadLocalStateInner {
 struct ThreadLocalState(ThreadLocalStateInner);
 
 thread_local! {
-    static THREAD_LOCAL: std::cell::RefCell<Arc<Mutex<ThreadLocalState>>> = std::cell::RefCell::new(Arc::new(Mutex::new(ThreadLocalState(ThreadLocalStateInner::NotUsed))));
+    static THREAD_LOCAL: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState(ThreadLocalStateInner::NotUsed));
 }
 
 fn get_this_executor_threads_submit_side() -> std::io::Result<SubmitSide> {
     THREAD_LOCAL.with(|local_state| {
-        let local_state = local_state.borrow_mut();
-        let mut local_state = local_state.lock().unwrap();
+        let mut local_state = local_state.borrow_mut();
         Ok(match &local_state.0 {
             ThreadLocalStateInner::NotUsed => {
-                let uring = Box::leak(Box::new(io_uring::IoUring::new(128).unwrap()));
-                let (mut submitter, sq, cq) = uring.split();
+                let uring = Box::into_raw(Box::new(io_uring::IoUring::new(128).unwrap()));
+                let (mut submitter, sq, cq) = unsafe { (&mut *uring).split() };
                 let rx = setup_poller_task(
                     &mut submitter,
                     SendSyncCompletionQueue {
@@ -39,6 +39,7 @@ fn get_this_executor_threads_submit_side() -> std::io::Result<SubmitSide> {
                     inner: Arc::new(Mutex::new(SubmitSideInner { submitter, sq })),
                 };
                 *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
+                    split_uring: uring,
                     rx_completion_queue_from_poller_task: rx,
                     submit_side: submit_side.clone(),
                 });
@@ -62,6 +63,7 @@ impl Drop for ThreadLocalState {
         match cur {
             ThreadLocalStateInner::NotUsed => {}
             ThreadLocalStateInner::Used {
+                split_uring,
                 submit_side,
                 rx_completion_queue_from_poller_task,
             } => {
@@ -105,6 +107,7 @@ impl Drop for ThreadLocalState {
                         }
                     }
                 }
+                assert!(cq.seen_poison);
 
                 let inner = Arc::try_unwrap(submit_side.inner)
                     .ok()
@@ -116,10 +119,16 @@ impl Drop for ThreadLocalState {
                 assert_eq!(cq.cq.len(), 0, "cqe: {:?}", cq.cq.next());
                 sq.sync();
                 assert_eq!(sq.len(), 0);
+                let SendSyncCompletionQueue { seen_poison: _, cq } = cq;
                 drop(cq);
                 drop(sq);
                 drop(submitter);
-                info!("thread-local uring shut down for thread {:?}", std::thread::current().id());
+                let uring = unsafe { Box::from_raw(split_uring) };
+                drop(uring);
+                info!(
+                    "thread-local uring shut down for thread {:?}",
+                    std::thread::current().id()
+                );
             }
             ThreadLocalStateInner::ShuttingDown => {
                 panic!("ThreadLocalState::drop() called twice");
@@ -178,7 +187,10 @@ impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        info!("polling preadv future on thread id {:?}", std::thread::current().id());
+        info!(
+            "polling preadv future on thread id {:?}",
+            std::thread::current().id()
+        );
         let mut state = self.state.0.lock().unwrap();
         let cur = std::mem::replace(&mut *state, PreadvCompletionFutStateInner::Undefined);
         match cur {
