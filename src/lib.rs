@@ -4,7 +4,7 @@ use std::{
 };
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
-use tracing::{info, instrument, trace};
+use tracing::{debug, info};
 
 enum ThreadLocalStateInner {
     NotUsed,
@@ -119,6 +119,7 @@ impl Drop for ThreadLocalState {
                 drop(cq);
                 drop(sq);
                 drop(submitter);
+                info!("thread-local uring shut down for thread {:?}", std::thread::current().id());
             }
             ThreadLocalStateInner::ShuttingDown => {
                 panic!("ThreadLocalState::drop() called twice");
@@ -127,13 +128,13 @@ impl Drop for ThreadLocalState {
     }
 }
 
-type PreadvOutput<F> = (F, Vec<u8>, std::io::Result<usize>);
+type PreadvOutput<F, B> = (F, B, std::io::Result<usize>);
 
-pub fn preadv<F: AsRawFd + 'static>(
+pub fn preadv<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut>(
     file: F,
     offset: u64,
-    buf: Vec<u8>,
-) -> impl std::future::Future<Output = PreadvOutput<F>> {
+    buf: B,
+) -> impl std::future::Future<Output = PreadvOutput<F, B>> {
     PreadvCompletionFut {
         state: Arc::new(PreadvCompletionFutState(Mutex::new(
             PreadvCompletionFutStateInner::TrySubmission { file, offset, buf },
@@ -141,43 +142,52 @@ pub fn preadv<F: AsRawFd + 'static>(
     }
 }
 
-enum DoneSubState<F: AsRawFd> {
-    Ready(PreadvOutput<F>),
+enum DoneSubState<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
+    Ready(PreadvOutput<F, B>),
     Taken,
 }
 
-struct PreadvCompletionFutState<T: AsRawFd>(Mutex<PreadvCompletionFutStateInner<T>>);
-enum PreadvCompletionFutStateInner<F: AsRawFd> {
+struct PreadvCompletionFutState<T: AsRawFd, B: tokio_uring::buf::IoBufMut>(
+    Mutex<PreadvCompletionFutStateInner<T, B>>,
+);
+enum PreadvCompletionFutStateInner<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
     Undefined,
     TrySubmission {
         file: F,
         offset: u64,
-        buf: Vec<u8>,
+        buf: B,
     },
     Pending {
         file_currently_owned_by_kernel: F,
-        buf_currently_owned_by_kernel: Vec<u8>,
+        buf_currently_owned_by_kernel: B,
         waker: std::task::Waker,
     },
-    Done(DoneSubState<F>),
+    Done(DoneSubState<F, B>),
 }
 
-struct PreadvCompletionFut<F: AsRawFd> {
-    state: Arc<PreadvCompletionFutState<F>>,
+struct PreadvCompletionFut<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
+    state: Arc<PreadvCompletionFutState<F, B>>,
 }
 
-impl<F: AsRawFd + 'static> std::future::Future for PreadvCompletionFut<F> {
-    type Output = (F, Vec<u8>, std::io::Result<usize>);
+impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
+    for PreadvCompletionFut<F, B>
+{
+    type Output = PreadvOutput<F, B>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        info!("polling preadv future on thread id {:?}", std::thread::current().id());
         let mut state = self.state.0.lock().unwrap();
         let cur = std::mem::replace(&mut *state, PreadvCompletionFutStateInner::Undefined);
         match cur {
             PreadvCompletionFutStateInner::Undefined => panic!("future is in undefined state"),
-            PreadvCompletionFutStateInner::TrySubmission { file, offset, buf } => {
+            PreadvCompletionFutStateInner::TrySubmission {
+                file,
+                offset,
+                mut buf,
+            } => {
                 let submit_side = match get_this_executor_threads_submit_side() {
                     Ok(local) => local,
                     Err(e) => {
@@ -196,8 +206,8 @@ impl<F: AsRawFd + 'static> std::future::Future for PreadvCompletionFut<F> {
                 );
 
                 let iov = libc::iovec {
-                    iov_base: buf.as_ptr() as *mut libc::c_void,
-                    iov_len: buf.len(),
+                    iov_base: buf.stable_mut_ptr() as *mut libc::c_void,
+                    iov_len: buf.bytes_total(),
                 };
 
                 let sqe = io_uring::opcode::Readv::new(
@@ -259,7 +269,7 @@ fn process_completion(user_data: u64, res: i32) {
     completion.op_future_state.on_completion(res);
 }
 
-impl<F: AsRawFd> OpFuture for PreadvCompletionFutState<F> {
+impl<F: AsRawFd, B: tokio_uring::buf::IoBufMut> OpFuture for PreadvCompletionFutState<F, B> {
     fn on_completion(&self, res: i32) {
         let mut state = self.0.lock().unwrap();
         let cur = std::mem::replace(&mut *state, PreadvCompletionFutStateInner::Undefined);
@@ -271,18 +281,20 @@ impl<F: AsRawFd> OpFuture for PreadvCompletionFutState<F> {
             PreadvCompletionFutStateInner::Done(_) => panic!("future is in done state"),
             PreadvCompletionFutStateInner::Pending {
                 file_currently_owned_by_kernel,
-                buf_currently_owned_by_kernel,
+                mut buf_currently_owned_by_kernel,
                 waker,
             } => {
+                // https://man.archlinux.org/man/io_uring_prep_read.3.en
+                let res = if res < 0 {
+                    Err(std::io::Error::from_raw_os_error(-res))
+                } else {
+                    unsafe { buf_currently_owned_by_kernel.set_init(res as usize) };
+                    Ok(res as usize)
+                };
                 *state = PreadvCompletionFutStateInner::Done(DoneSubState::Ready((
                     file_currently_owned_by_kernel,
                     buf_currently_owned_by_kernel,
-                    // https://man.archlinux.org/man/io_uring_prep_read.3.en
-                    if res < 0 {
-                        Err(std::io::Error::from_raw_os_error(-res))
-                    } else {
-                        Ok(res as usize)
-                    },
+                    res,
                 )));
                 drop(state);
                 waker.wake();
@@ -308,9 +320,9 @@ impl SendSyncCompletionQueue {
         let cq = &mut self.cq;
         cq.sync();
         for cqe in &mut *cq {
-            trace!("got cqe: {:?}", cqe);
+            debug!("got cqe: {:?}", cqe);
             if cqe.user_data() == 0x80_00_00_00_00_00_00_00 {
-                trace!("got poison pill");
+                debug!("got poison pill");
                 self.seen_poison = true;
                 break;
             }
@@ -384,7 +396,10 @@ fn setup_poller_task(
         };
         let mut cq = Some(give_back_cq_on_drop(cq));
 
-        trace!("launching poller task");
+        info!(
+            "launching poller task on thread id {:?}",
+            std::thread::current().id()
+        );
 
         let fd = tokio::io::unix::AsyncFd::new(eventfd).unwrap();
         loop {
@@ -409,7 +424,7 @@ fn setup_poller_task(
                     Err(e) => panic!("{:?}", e),
                 }
             }
-            trace!("eventfd ready, processing completions");
+            debug!("eventfd ready, processing completions");
 
             let mut unprotected_cq = scopeguard::ScopeGuard::into_inner(cq.take().unwrap());
             let res = unprotected_cq.process_completions();
