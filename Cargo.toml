@@ -1,0 +1,18 @@
+[package]
+name = "tokio-io_uring-eventfd-bridge"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+eventfd = "0.2.0"
+io-uring = "0.6.0"
+libc = "0.2.147"
+tokio = { version = "1.29.1", features = ["io-std"] }
+tracing = "0.1.37"
+
+[dev-dependencies]
+tokio = { version = "1.29.1", features = ["full"] }
+tempfile = "3.6.0"
+tracing-subscriber = "*"
