@@ -13,7 +13,7 @@ enum ThreadLocalStateInner {
         submit_side: SubmitSide,
         rx_completion_queue_from_poller_task: std::sync::mpsc::Receiver<SendSyncCompletionQueue>,
     },
-    ShuttingDown,
+    Dropped,
 }
 struct ThreadLocalState(ThreadLocalStateInner);
 
@@ -21,50 +21,48 @@ thread_local! {
     static THREAD_LOCAL: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState(ThreadLocalStateInner::NotUsed));
 }
 
-fn get_this_executor_threads_submit_side() -> std::io::Result<SubmitSide> {
+fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f: F) -> R {
     THREAD_LOCAL.with(|local_state| {
         let mut local_state = local_state.borrow_mut();
-        Ok(match &local_state.0 {
-            ThreadLocalStateInner::NotUsed => {
-                let uring = Box::into_raw(Box::new(io_uring::IoUring::new(128).unwrap()));
-                let (mut submitter, sq, cq) = unsafe { (&mut *uring).split() };
-                let rx = setup_poller_task(
-                    &mut submitter,
-                    SendSyncCompletionQueue {
-                        cq,
-                        seen_poison: false,
-                    },
-                );
-                let submit_side = SubmitSide {
-                    inner: Arc::new(Mutex::new(SubmitSideInner { submitter, sq })),
-                };
-                *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
-                    split_uring: uring,
-                    rx_completion_queue_from_poller_task: rx,
-                    submit_side: submit_side.clone(),
-                });
-                submit_side
+        loop {
+            match &mut local_state.0 {
+                ThreadLocalStateInner::NotUsed => {
+                    let uring = Box::into_raw(Box::new(io_uring::IoUring::new(128).unwrap()));
+                    let (mut submitter, sq, cq) = unsafe { (&mut *uring).split() };
+                    let rx = setup_poller_task(
+                        &mut submitter,
+                        SendSyncCompletionQueue {
+                            cq,
+                            seen_poison: false,
+                        },
+                    );
+                    let submit_side = SubmitSide { submitter, sq };
+                    *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
+                        split_uring: uring,
+                        rx_completion_queue_from_poller_task: rx,
+                        submit_side,
+                    });
+                    continue;
+                }
+                // fast path
+                ThreadLocalStateInner::Used { submit_side, .. } => break f(submit_side),
+                ThreadLocalStateInner::Dropped => {
+                    unreachable!("threat-local can't be dropped while executing")
+                }
             }
-            ThreadLocalStateInner::Used { submit_side, .. } => submit_side.clone(),
-            ThreadLocalStateInner::ShuttingDown => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "thread local uring is shutting down",
-                ));
-            }
-        })
+        }
     })
 }
 
 impl Drop for ThreadLocalState {
     fn drop(&mut self) {
         let cur: ThreadLocalStateInner =
-            std::mem::replace(&mut self.0, ThreadLocalStateInner::ShuttingDown);
+            std::mem::replace(&mut self.0, ThreadLocalStateInner::Dropped);
         match cur {
             ThreadLocalStateInner::NotUsed => {}
             ThreadLocalStateInner::Used {
                 split_uring,
-                submit_side,
+                mut submit_side,
                 rx_completion_queue_from_poller_task,
             } => {
                 // case (1) current thread is getting stopped but poller is still running; it'll exit once it sees the poison.
@@ -109,10 +107,7 @@ impl Drop for ThreadLocalState {
                 }
                 assert!(cq.seen_poison);
 
-                let inner = Arc::try_unwrap(submit_side.inner)
-                    .ok()
-                    .expect("thread locals should never be shared");
-                let SubmitSideInner { submitter, mut sq } = Mutex::into_inner(inner).ok().unwrap();
+                let SubmitSide { submitter, mut sq } = submit_side;
                 // the band of submitter, sq, and cq is back together; some final assertions, then drop them all.
                 // the last one to drop will close the io_ring fd.
                 cq.cq.sync();
@@ -130,8 +125,8 @@ impl Drop for ThreadLocalState {
                     std::thread::current().id()
                 );
             }
-            ThreadLocalStateInner::ShuttingDown => {
-                panic!("ThreadLocalState::drop() called twice");
+            ThreadLocalStateInner::Dropped => {
+                unreachable!("ThreadLocalState::drop() had already been called in the past");
             }
         }
     }
@@ -200,14 +195,6 @@ impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
                 offset,
                 mut buf,
             } => {
-                let submit_side = match get_this_executor_threads_submit_side() {
-                    Ok(local) => local,
-                    Err(e) => {
-                        *state = PreadvCompletionFutStateInner::Done(DoneSubState::Taken);
-                        return std::task::Poll::Ready((file, buf, Err(e)));
-                    }
-                };
-
                 let completion = Box::new(Completion {
                     op_future_state: Arc::clone(&self.state) as Arc<dyn OpFuture>,
                 });
@@ -231,27 +218,27 @@ impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
                 .build()
                 .user_data(user_data);
 
-                match submit_side.submit(&sqe) {
-                    Ok(()) => (),
-                    Err(e) => {
-                        *state = PreadvCompletionFutStateInner::Done(DoneSubState::Taken);
-                        let err = match e {
-                            SubmitError::QueueFull => {
-                                todo!()
-                            }
-                        };
-                        return std::task::Poll::Ready((file, buf, Err(err)));
+                with_this_executor_threads_submit_side(|submit_side| {
+                    match submit_side.submit(&sqe) {
+                        Ok(()) => {
+                            *state = PreadvCompletionFutStateInner::Pending {
+                                waker: cx.waker().clone(),
+                                buf_currently_owned_by_kernel: buf,
+                                file_currently_owned_by_kernel: file,
+                            };
+                            return std::task::Poll::Pending;
+                        }
+                        Err(e) => {
+                            *state = PreadvCompletionFutStateInner::Done(DoneSubState::Taken);
+                            let err = match e {
+                                SubmitError::QueueFull => {
+                                    todo!()
+                                }
+                            };
+                            return std::task::Poll::Ready((file, buf, Err(err)));
+                        }
                     }
-                }
-
-                *state = PreadvCompletionFutStateInner::Pending {
-                    waker: cx.waker().clone(),
-                    buf_currently_owned_by_kernel: buf,
-                    file_currently_owned_by_kernel: file,
-                };
-                drop(state);
-
-                std::task::Poll::Pending
+                })
             }
             x @ PreadvCompletionFutStateInner::Pending { .. } => {
                 *state = x;
@@ -351,41 +338,28 @@ impl SendSyncCompletionQueue {
     }
 }
 
-struct SubmitSideInner {
+struct SubmitSide {
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
 }
 
-struct SubmitSide {
-    inner: Arc<Mutex<SubmitSideInner>>,
-}
-
 unsafe impl Send for SubmitSide {}
 unsafe impl Sync for SubmitSide {}
-
-impl Clone for SubmitSide {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
 
 enum SubmitError {
     QueueFull,
 }
 
 impl SubmitSide {
-    fn submit(&self, sqe: &io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
-        let mut submit_side = self.inner.try_lock().unwrap();
-        match unsafe { submit_side.sq.push(&sqe) } {
+    fn submit(&mut self, sqe: &io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
+        match unsafe { self.sq.push(&sqe) } {
             Ok(()) => {}
             Err(_queue_full) => {
                 return Err(SubmitError::QueueFull);
             }
         }
-        submit_side.sq.sync();
-        submit_side.submitter.submit().unwrap();
+        self.sq.sync();
+        self.submitter.submit().unwrap();
         Ok(())
     }
 }
