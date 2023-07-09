@@ -93,8 +93,8 @@ impl Drop for ThreadLocalState {
                         }
                     }
                 }
-                let cq =
-                    cq.get_or_insert_with(|| rx_completion_queue_from_poller_task.recv().unwrap());
+                let mut cq =
+                    cq.unwrap_or_else(|| rx_completion_queue_from_poller_task.recv().unwrap());
 
                 if !cq.seen_poison {
                     // this is case (2)
@@ -107,14 +107,18 @@ impl Drop for ThreadLocalState {
                 }
                 assert!(cq.seen_poison);
 
-                let SubmitSide { submitter, mut sq } = submit_side;
-                // the band of submitter, sq, and cq is back together; some final assertions, then drop them all.
-                // the last one to drop will close the io_ring fd.
-                cq.cq.sync();
-                assert_eq!(cq.cq.len(), 0, "cqe: {:?}", cq.cq.next());
+                let SubmitSide { submitter, sq } = submit_side;
+                let SendSyncCompletionQueue { seen_poison: _, cq } = cq;
+                let submitter: Submitter<'_> = submitter;
+                let mut sq: SubmissionQueue<'_> = sq;
+                let mut cq: CompletionQueue<'_> = cq;
+                // We now own all the parts from the IoUring::split() again.
+                // Some final assertions, then drop them all, unleak the IoUring, and drop it as well.
+                // That cleans up the SQ, CQs, registrations, etc.
+                cq.sync();
+                assert_eq!(cq.len(), 0, "cqe: {:?}", cq.next());
                 sq.sync();
                 assert_eq!(sq.len(), 0);
-                let SendSyncCompletionQueue { seen_poison: _, cq } = cq;
                 drop(cq);
                 drop(sq);
                 drop(submitter);
