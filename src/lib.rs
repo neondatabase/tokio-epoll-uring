@@ -4,35 +4,48 @@ use std::{
 };
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
-use tracing::info;
+use tracing::{info, instrument, trace};
 
-enum ThreadLocalState {
+enum ThreadLocalStateInner {
     NotUsed,
-    Used(SubmitSide),
+    Used {
+        submit_side: SubmitSide,
+        rx_completion_queue_from_poller_task: std::sync::mpsc::Receiver<SendSyncCompletionQueue>,
+    },
     ShuttingDown,
 }
+struct ThreadLocalState(ThreadLocalStateInner);
 
 thread_local! {
-    static THREAD_LOCAL: std::cell::RefCell<Arc<Mutex<ThreadLocalState>>> = std::cell::RefCell::new(Arc::new(Mutex::new(ThreadLocalState::NotUsed)));
+    static THREAD_LOCAL: std::cell::RefCell<Arc<Mutex<ThreadLocalState>>> = std::cell::RefCell::new(Arc::new(Mutex::new(ThreadLocalState(ThreadLocalStateInner::NotUsed))));
 }
 
 fn get_this_executor_threads_submit_side() -> std::io::Result<SubmitSide> {
     THREAD_LOCAL.with(|local_state| {
         let local_state = local_state.borrow_mut();
         let mut local_state = local_state.lock().unwrap();
-        Ok(match &*local_state {
-            ThreadLocalState::NotUsed => {
+        Ok(match &local_state.0 {
+            ThreadLocalStateInner::NotUsed => {
                 let uring = Box::leak(Box::new(io_uring::IoUring::new(128).unwrap()));
                 let (mut submitter, sq, cq) = uring.split();
-                setup_poller_task(&mut submitter, SendSyncCompletionQueue { cq });
+                let rx = setup_poller_task(
+                    &mut submitter,
+                    SendSyncCompletionQueue {
+                        cq,
+                        seen_poison: false,
+                    },
+                );
                 let submit_side = SubmitSide {
                     inner: Arc::new(Mutex::new(SubmitSideInner { submitter, sq })),
                 };
-                *local_state = ThreadLocalState::Used(submit_side.clone());
+                *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
+                    rx_completion_queue_from_poller_task: rx,
+                    submit_side: submit_side.clone(),
+                });
                 submit_side
             }
-            ThreadLocalState::Used(submit_side) => submit_side.clone(),
-            ThreadLocalState::ShuttingDown => {
+            ThreadLocalStateInner::Used { submit_side, .. } => submit_side.clone(),
+            ThreadLocalStateInner::ShuttingDown => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "thread local uring is shutting down",
@@ -40,6 +53,78 @@ fn get_this_executor_threads_submit_side() -> std::io::Result<SubmitSide> {
             }
         })
     })
+}
+
+impl Drop for ThreadLocalState {
+    fn drop(&mut self) {
+        let cur: ThreadLocalStateInner =
+            std::mem::replace(&mut self.0, ThreadLocalStateInner::ShuttingDown);
+        match cur {
+            ThreadLocalStateInner::NotUsed => {}
+            ThreadLocalStateInner::Used {
+                submit_side,
+                rx_completion_queue_from_poller_task,
+            } => {
+                // case (1) current thread is getting stopped but poller is still running; it'll exit once it sees the poison.
+                // case (2) poller got stopped, e.g., because the executor is shutting down; we'll wait for the poison.
+                //
+                // in both cases,
+
+                let mut cq = None;
+                loop {
+                    let entry = io_uring::opcode::Nop::new()
+                        .build()
+                        // drain existing ops before scheduling the poison
+                        .flags(io_uring::squeue::Flags::IO_DRAIN)
+                        .user_data(0x80_00_00_00_00_00_00_00);
+                    match submit_side.submit(&entry) {
+                        Ok(()) => break,
+                        Err(SubmitError::QueueFull) => {
+                            // poller may be stopping
+                            let cq = cq.get_or_insert_with(|| {
+                                rx_completion_queue_from_poller_task.recv().unwrap()
+                            });
+                            match cq.process_completions() {
+                                Ok(()) => continue, // retry submit poison
+                                Err(ProcessCompletionsErr::PoisonPill) => {
+                                    unreachable!("only we send poison pills")
+                                }
+                            }
+                        }
+                    }
+                }
+                let cq =
+                    cq.get_or_insert_with(|| rx_completion_queue_from_poller_task.recv().unwrap());
+
+                if !cq.seen_poison {
+                    // this is case (2)
+                    loop {
+                        match cq.process_completions() {
+                            Ok(()) => continue,
+                            Err(ProcessCompletionsErr::PoisonPill) => break,
+                        }
+                    }
+                }
+
+                let inner = Arc::try_unwrap(submit_side.inner)
+                    .ok()
+                    .expect("thread locals should never be shared");
+                let SubmitSideInner { submitter, mut sq } = Mutex::into_inner(inner).ok().unwrap();
+                // the band of submitter, sq, and cq is back together; some final assertions, then drop them all.
+                // the last one to drop will close the io_ring fd.
+                cq.cq.sync();
+                assert_eq!(cq.cq.len(), 0, "cqe: {:?}", cq.cq.next());
+                sq.sync();
+                assert_eq!(sq.len(), 0);
+                drop(cq);
+                drop(sq);
+                drop(submitter);
+            }
+            ThreadLocalStateInner::ShuttingDown => {
+                panic!("ThreadLocalState::drop() called twice");
+            }
+        }
+    }
 }
 
 type PreadvOutput<F> = (F, Vec<u8>, std::io::Result<usize>);
@@ -104,6 +189,11 @@ impl<F: AsRawFd + 'static> std::future::Future for PreadvCompletionFut<F> {
                 let completion = Box::new(Completion {
                     op_future_state: Arc::clone(&self.state) as Arc<dyn OpFuture>,
                 });
+                let user_data = Box::into_raw(completion) as u64;
+                assert!(
+                    user_data & 0x80_00_00_00_00_00_00_00 == 0,
+                    "highest bit is reserved for posion pill"
+                );
 
                 let iov = libc::iovec {
                     iov_base: buf.as_ptr() as *mut libc::c_void,
@@ -117,7 +207,20 @@ impl<F: AsRawFd + 'static> std::future::Future for PreadvCompletionFut<F> {
                 )
                 .offset(offset)
                 .build()
-                .user_data(Box::into_raw(completion) as u64);
+                .user_data(user_data);
+
+                match submit_side.submit(&sqe) {
+                    Ok(()) => (),
+                    Err(e) => {
+                        *state = PreadvCompletionFutStateInner::Done(DoneSubState::Taken);
+                        let err = match e {
+                            SubmitError::QueueFull => {
+                                todo!()
+                            }
+                        };
+                        return std::task::Poll::Ready((file, buf, Err(err)));
+                    }
+                }
 
                 *state = PreadvCompletionFutStateInner::Pending {
                     waker: cx.waker().clone(),
@@ -125,17 +228,6 @@ impl<F: AsRawFd + 'static> std::future::Future for PreadvCompletionFut<F> {
                     file_currently_owned_by_kernel: file,
                 };
                 drop(state);
-
-                let mut submit_side = submit_side.inner.try_lock().unwrap();
-                match unsafe { submit_side.sq.push(&sqe) } {
-                    Ok(()) => {}
-                    Err(_queue_full) => {
-                        // TODO: unleak
-                        return std::task::Poll::Pending;
-                    }
-                }
-                submit_side.sq.sync();
-                submit_side.submitter.submit().unwrap();
 
                 std::task::Poll::Pending
             }
@@ -200,11 +292,40 @@ impl<F: AsRawFd> OpFuture for PreadvCompletionFutState<F> {
 }
 
 struct SendSyncCompletionQueue {
+    seen_poison: bool,
     cq: CompletionQueue<'static>,
 }
 
 unsafe impl Send for SendSyncCompletionQueue {}
 unsafe impl Sync for SendSyncCompletionQueue {}
+
+enum ProcessCompletionsErr {
+    PoisonPill,
+}
+
+impl SendSyncCompletionQueue {
+    fn process_completions(&mut self) -> std::result::Result<(), ProcessCompletionsErr> {
+        let cq = &mut self.cq;
+        cq.sync();
+        for cqe in &mut *cq {
+            trace!("got cqe: {:?}", cqe);
+            if cqe.user_data() == 0x80_00_00_00_00_00_00_00 {
+                trace!("got poison pill");
+                self.seen_poison = true;
+                break;
+            }
+            process_completion(cqe.user_data(), cqe.result());
+        }
+        cq.sync();
+        if self.seen_poison {
+            assert_eq!(cq.len(), 0);
+            assert!(cq.next().is_none());
+            Err(ProcessCompletionsErr::PoisonPill)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 struct SubmitSideInner {
     submitter: Submitter<'static>,
@@ -226,20 +347,48 @@ impl Clone for SubmitSide {
     }
 }
 
-fn setup_poller_task(submitter: &Submitter<'_>, cq: SendSyncCompletionQueue) {
+enum SubmitError {
+    QueueFull,
+}
+
+impl SubmitSide {
+    fn submit(&self, sqe: &io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
+        let mut submit_side = self.inner.try_lock().unwrap();
+        match unsafe { submit_side.sq.push(&sqe) } {
+            Ok(()) => {}
+            Err(_queue_full) => {
+                return Err(SubmitError::QueueFull);
+            }
+        }
+        submit_side.sq.sync();
+        submit_side.submitter.submit().unwrap();
+        Ok(())
+    }
+}
+
+fn setup_poller_task(
+    submitter: &Submitter<'_>,
+    cq: SendSyncCompletionQueue,
+) -> std::sync::mpsc::Receiver<SendSyncCompletionQueue> {
     let eventfd = eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_NONBLOCK).unwrap();
 
     submitter.register_eventfd(eventfd.as_raw_fd()).unwrap();
 
-    tokio::task::spawn(tokio::task::unconstrained(async move {
-        let mut cq = cq;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
-        info!("launching poller task");
+    tokio::task::spawn(tokio::task::unconstrained(async move {
+        let give_back_cq_on_drop = |cq| {
+            scopeguard::guard(cq, |cq| {
+                tx.send(cq).unwrap();
+            })
+        };
+        let mut cq = Some(give_back_cq_on_drop(cq));
+
+        trace!("launching poller task");
 
         let fd = tokio::io::unix::AsyncFd::new(eventfd).unwrap();
         loop {
-            // info!("Reaper waiting for eventfd");
-            // See read() API docs for recipe for this code block.
+            // See fd.read() API docs for recipe for this code block.
             loop {
                 let mut guard = fd.ready(tokio::io::Interest::READABLE).await.unwrap();
                 if !guard.ready().is_readable() {
@@ -260,14 +409,20 @@ fn setup_poller_task(submitter: &Submitter<'_>, cq: SendSyncCompletionQueue) {
                     Err(e) => panic!("{:?}", e),
                 }
             }
-            info!("eventfd ready");
+            trace!("eventfd ready, processing completions");
 
-            cq.cq.sync();
-            for cqe in &mut cq.cq {
-                info!("got cqe: {:?}", cqe);
-                process_completion(cqe.user_data(), cqe.result());
+            let mut unprotected_cq = scopeguard::ScopeGuard::into_inner(cq.take().unwrap());
+            let res = unprotected_cq.process_completions();
+            cq = Some(give_back_cq_on_drop(unprotected_cq));
+            match res {
+                Ok(()) => {}
+                Err(ProcessCompletionsErr::PoisonPill) => {
+                    info!("poller observed poison pill");
+                    break; // drops the cq
+                }
             }
-            cq.cq.sync();
         }
     }));
+
+    rx
 }
