@@ -11,7 +11,8 @@ enum ThreadLocalStateInner {
     Used {
         split_uring: *mut io_uring::IoUring,
         submit_side: SubmitSide,
-        rx_completion_queue_from_poller_task: std::sync::mpsc::Receiver<SendSyncCompletionQueue>,
+        rx_completion_queue_from_poller_task:
+            std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>>,
     },
     Dropped,
 }
@@ -27,20 +28,29 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
         loop {
             match &mut local_state.0 {
                 ThreadLocalStateInner::NotUsed => {
-                    let uring = Box::into_raw(Box::new(io_uring::IoUring::new(128).unwrap()));
+                    let preallocated_completions = Arc::new(Mutex::new(PreallocatedCompletions {
+                        storage: array_macro::array![_ => None; RING_SIZE as usize],
+                        unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
+                    }));
+                    let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
                     let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
-                    let rx = setup_poller_task(
-                        uring_fd,
-                        SendSyncCompletionQueue {
-                            cq,
-                            seen_poison: false,
-                        },
-                    );
-                    let submit_side = SubmitSide { submitter, sq };
+                    let cq = Arc::new(Mutex::new(SendSyncCompletionQueue {
+                        cq,
+                        seen_poison: false,
+                        preallocated_completions: preallocated_completions.clone(),
+                    }));
+                    let rx_completion_queue_from_poller_task =
+                        setup_poller_task(uring_fd, Arc::clone(&cq));
+                    let submit_side = SubmitSide {
+                        submitter,
+                        sq,
+                        cq,
+                        preallocated_completions,
+                    };
                     *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
                         split_uring: uring,
-                        rx_completion_queue_from_poller_task: rx,
+                        rx_completion_queue_from_poller_task,
                         submit_side,
                     });
                     continue;
@@ -77,15 +87,15 @@ impl Drop for ThreadLocalState {
                         .build()
                         // drain existing ops before scheduling the poison
                         .flags(io_uring::squeue::Flags::IO_DRAIN)
-                        .user_data(0x80_00_00_00_00_00_00_00);
-                    match submit_side.submit(&entry) {
-                        Ok(()) => break,
-                        Err(SubmitError::QueueFull) => {
+                        .user_data(u64::MAX);
+                    match submit_side.submit(entry, None) {
+                        Ok(_preallocated_submission_idx) => break,
+                        Err(SubmitError::QueueFull(_sqe)) => {
                             // poller may be stopping
                             let cq = cq.get_or_insert_with(|| {
                                 rx_completion_queue_from_poller_task.recv().unwrap()
                             });
-                            match cq.process_completions() {
+                            match cq.lock().unwrap().process_completions() {
                                 Ok(()) => continue, // retry submit poison
                                 Err(ProcessCompletionsErr::PoisonPill) => {
                                     unreachable!("only we send poison pills")
@@ -94,22 +104,42 @@ impl Drop for ThreadLocalState {
                         }
                     }
                 }
-                let mut cq =
+                let cq =
                     cq.unwrap_or_else(|| rx_completion_queue_from_poller_task.recv().unwrap());
-
-                if !cq.seen_poison {
+                let mut cq_locked = cq.lock().unwrap();
+                if !cq_locked.seen_poison {
                     // this is case (2)
                     loop {
-                        match cq.process_completions() {
+                        match cq_locked.process_completions() {
                             Ok(()) => continue,
                             Err(ProcessCompletionsErr::PoisonPill) => break,
                         }
                     }
                 }
-                assert!(cq.seen_poison);
+                assert!(cq_locked.seen_poison);
+                drop(cq_locked);
+                let SubmitSide {
+                    submitter,
+                    sq,
+                    preallocated_completions,
+                    cq: cq_arc_from_submit_side,
+                } = submit_side;
+                assert!(Arc::ptr_eq(&cq_arc_from_submit_side, &cq)); // ptr_eq is safe because these are not trait objects
+                drop(cq_arc_from_submit_side);
+                // cq can have at most refcount 3 at a time:
+                // - the poller thread
+                // - the thread-local storage
+                // - the thread that's currently in PreadvCompletion::poll, helping the executor thread with completion processing
+                let cq = Arc::try_unwrap(cq)
+                    .ok()
+                    .expect("at this point, cq is not referenced by anything else anymore");
+                let cq = Mutex::into_inner(cq).unwrap();
+                let SendSyncCompletionQueue {
+                    seen_poison: _,
+                    cq,
+                    preallocated_completions: _,
+                } = cq;
 
-                let SubmitSide { submitter, sq } = submit_side;
-                let SendSyncCompletionQueue { seen_poison: _, cq } = cq;
                 let submitter: Submitter<'_> = submitter;
                 let mut sq: SubmissionQueue<'_> = sq;
                 let mut cq: CompletionQueue<'_> = cq;
@@ -120,6 +150,14 @@ impl Drop for ThreadLocalState {
                 assert_eq!(cq.len(), 0, "cqe: {:?}", cq.next());
                 sq.sync();
                 assert_eq!(sq.len(), 0);
+                assert_eq!(
+                    preallocated_completions
+                        .try_lock()
+                        .unwrap()
+                        .unused_indices
+                        .len(),
+                    RING_SIZE.try_into().unwrap()
+                );
                 drop(cq);
                 drop(sq);
                 drop(submitter);
@@ -155,6 +193,7 @@ enum DoneSubState<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
 struct PreadvCompletionFutState<T: AsRawFd, B: tokio_uring::buf::IoBufMut>(
     Mutex<PreadvCompletionFutStateInner<T, B>>,
 );
+
 enum PreadvCompletionFutStateInner<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
     Undefined,
     TrySubmission {
@@ -191,32 +230,27 @@ impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
                 file,
                 offset,
                 mut buf,
-            } => {
-                let completion = Box::new(Completion {
-                    op_future_state: Arc::clone(&self.state) as Arc<dyn OpFuture>,
-                });
-                let user_data = Box::into_raw(completion) as u64;
-                assert!(
-                    user_data & 0x80_00_00_00_00_00_00_00 == 0,
-                    "highest bit is reserved for posion pill"
-                );
-
+            } => with_this_executor_threads_submit_side(|submit_side| {
                 let iov = libc::iovec {
                     iov_base: buf.stable_mut_ptr() as *mut libc::c_void,
                     iov_len: buf.bytes_total(),
                 };
 
-                let sqe = io_uring::opcode::Readv::new(
-                    io_uring::types::Fd(file.as_raw_fd()),
-                    &iov as *const _,
-                    1,
-                )
-                .offset(offset)
-                .build()
-                .user_data(user_data);
+                let mut sqe = Some(
+                    io_uring::opcode::Readv::new(
+                        io_uring::types::Fd(file.as_raw_fd()),
+                        &iov as *const _,
+                        1,
+                    )
+                    .offset(offset)
+                    .build(),
+                );
 
-                with_this_executor_threads_submit_side(|submit_side| {
-                    match submit_side.submit(&sqe) {
+                loop {
+                    match submit_side.submit(
+                        sqe.take().unwrap(),
+                        Some(Arc::clone(&self.state) as Arc<dyn OpFuture>),
+                    ) {
                         Ok(()) => {
                             *state = PreadvCompletionFutStateInner::Pending {
                                 waker: cx.waker().clone(),
@@ -226,17 +260,23 @@ impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
                             return std::task::Poll::Pending;
                         }
                         Err(e) => {
-                            *state = PreadvCompletionFutStateInner::Done(DoneSubState::Taken);
-                            let err = match e {
-                                SubmitError::QueueFull => {
-                                    todo!()
+                            match e {
+                                SubmitError::QueueFull(got_back_sqe) => {
+                                    sqe = Some(got_back_sqe);
+                                    // help the executor by polling the completion queue
+                                    let mut cq = submit_side.cq.lock().unwrap();
+                                    match cq.process_completions() {
+                                        Ok(()) => continue, // retry submit
+                                        Err(ProcessCompletionsErr::PoisonPill) => {
+                                            unreachable!("only destructor of ThreadLocalState can send poison pills, but we're using thread-local state (submit_side is part of it)");
+                                        }
+                                    }
                                 }
-                            };
-                            return std::task::Poll::Ready((file, buf, Err(err)));
+                            }
                         }
                     }
-                })
-            }
+                }
+            }),
             x @ PreadvCompletionFutStateInner::Pending { .. } => {
                 *state = x;
                 std::task::Poll::Pending
@@ -250,19 +290,6 @@ impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
             }
         }
     }
-}
-
-trait OpFuture {
-    fn on_completion(&self, res: i32);
-}
-
-struct Completion {
-    op_future_state: Arc<dyn OpFuture>,
-}
-
-fn process_completion(user_data: u64, res: i32) {
-    let completion: Box<Completion> = unsafe { Box::from_raw(std::mem::transmute(user_data)) };
-    completion.op_future_state.on_completion(res);
 }
 
 impl<F: AsRawFd, B: tokio_uring::buf::IoBufMut> OpFuture for PreadvCompletionFutState<F, B> {
@@ -287,6 +314,7 @@ impl<F: AsRawFd, B: tokio_uring::buf::IoBufMut> OpFuture for PreadvCompletionFut
                     unsafe { buf_currently_owned_by_kernel.set_init(res as usize) };
                     Ok(res as usize)
                 };
+
                 *state = PreadvCompletionFutStateInner::Done(DoneSubState::Ready((
                     file_currently_owned_by_kernel,
                     buf_currently_owned_by_kernel,
@@ -302,12 +330,20 @@ impl<F: AsRawFd, B: tokio_uring::buf::IoBufMut> OpFuture for PreadvCompletionFut
 struct SendSyncCompletionQueue {
     seen_poison: bool,
     cq: CompletionQueue<'static>,
+    preallocated_completions: Arc<Mutex<PreallocatedCompletions>>,
 }
 
 unsafe impl Send for SendSyncCompletionQueue {}
 
 enum ProcessCompletionsErr {
     PoisonPill,
+}
+trait OpFuture {
+    fn on_completion(&self, res: i32);
+}
+
+struct Completion {
+    op_future_state: Arc<dyn OpFuture>,
 }
 
 impl SendSyncCompletionQueue {
@@ -316,12 +352,18 @@ impl SendSyncCompletionQueue {
         cq.sync();
         for cqe in &mut *cq {
             debug!("got cqe: {:?}", cqe);
-            if cqe.user_data() == 0x80_00_00_00_00_00_00_00 {
-                debug!("got poison pill");
+            let idx: u64 = unsafe { std::mem::transmute(cqe.user_data()) };
+            if idx == u64::MAX {
                 self.seen_poison = true;
-                break;
+                continue;
             }
-            process_completion(cqe.user_data(), cqe.result());
+            let mut preallocated_completions = self.preallocated_completions.lock().unwrap();
+            let completion: Completion = preallocated_completions.storage[idx as usize]
+                .take()
+                .unwrap();
+            preallocated_completions.unused_indices.push(idx as usize);
+            drop(preallocated_completions);
+            completion.op_future_state.on_completion(cqe.result());
         }
         cq.sync();
         if self.seen_poison {
@@ -334,23 +376,59 @@ impl SendSyncCompletionQueue {
     }
 }
 
+struct PreallocatedCompletions {
+    storage: [Option<Completion>; RING_SIZE as usize],
+    unused_indices: Vec<usize>,
+}
+
+const RING_SIZE: u32 = 128;
+
 struct SubmitSide {
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
+    preallocated_completions: Arc<Mutex<PreallocatedCompletions>>,
+    // wake_poller_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+    cq: Arc<Mutex<SendSyncCompletionQueue>>,
 }
 
 unsafe impl Send for SubmitSide {}
 
 enum SubmitError {
-    QueueFull,
+    QueueFull(io_uring::squeue::Entry),
 }
 
 impl SubmitSide {
-    fn submit(&mut self, sqe: &io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
+    fn submit(
+        &mut self,
+        sqe: io_uring::squeue::Entry,
+        future_state: Option<Arc<dyn OpFuture>>,
+    ) -> std::result::Result<(), SubmitError> {
+        let idx = if let Some(future_state) = future_state {
+            let idx = match self
+                .preallocated_completions
+                .lock()
+                .unwrap()
+                .unused_indices
+                .pop()
+            {
+                Some(idx) => idx,
+                None => return Err(SubmitError::QueueFull(sqe)),
+            };
+            let completion: &mut Option<Completion> =
+                &mut self.preallocated_completions.lock().unwrap().storage[idx];
+            assert!(completion.is_none());
+            *completion = Some(Completion {
+                op_future_state: future_state,
+            });
+            idx as u64
+        } else {
+            u64::MAX // poison pill; XXX: model as OpFuture
+        };
+        let sqe = sqe.user_data(idx);
         match unsafe { self.sq.push(&sqe) } {
             Ok(()) => {}
             Err(_queue_full) => {
-                return Err(SubmitError::QueueFull);
+                unreachable!("queue full should be handled by unused_completion_indices")
             }
         }
         self.sq.sync();
@@ -361,8 +439,8 @@ impl SubmitSide {
 
 fn setup_poller_task(
     uring_fd: std::os::fd::RawFd,
-    cq: SendSyncCompletionQueue,
-) -> std::sync::mpsc::Receiver<SendSyncCompletionQueue> {
+    cq: Arc<Mutex<SendSyncCompletionQueue>>,
+) -> std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
     tokio::task::spawn(tokio::task::unconstrained(async move {
@@ -391,9 +469,11 @@ fn setup_poller_task(
                 break;
             }
 
-            let mut unprotected_cq = scopeguard::ScopeGuard::into_inner(cq.take().unwrap());
-            let res = unprotected_cq.process_completions();
-            cq = Some(give_back_cq_on_drop(unprotected_cq));
+            let unprotected_cq_arc = scopeguard::ScopeGuard::into_inner(cq.take().unwrap());
+            let mut unprotected_cq = unprotected_cq_arc.lock().unwrap();
+            let res = unprotected_cq.process_completions(); // todo: catch_unwind?
+            drop(unprotected_cq);
+            cq = Some(give_back_cq_on_drop(unprotected_cq_arc));
             match res {
                 Ok(()) => {}
                 Err(ProcessCompletionsErr::PoisonPill) => {
