@@ -28,9 +28,10 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
             match &mut local_state.0 {
                 ThreadLocalStateInner::NotUsed => {
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(128).unwrap()));
-                    let (mut submitter, sq, cq) = unsafe { (&mut *uring).split() };
+                    let uring_fd = unsafe { (*uring).as_raw_fd() };
+                    let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
                     let rx = setup_poller_task(
-                        &mut submitter,
+                        uring_fd,
                         SendSyncCompletionQueue {
                             cq,
                             seen_poison: false,
@@ -361,13 +362,9 @@ impl SubmitSide {
 }
 
 fn setup_poller_task(
-    submitter: &Submitter<'_>,
+    uring_fd: std::os::fd::RawFd,
     cq: SendSyncCompletionQueue,
 ) -> std::sync::mpsc::Receiver<SendSyncCompletionQueue> {
-    let eventfd = eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_NONBLOCK).unwrap();
-
-    submitter.register_eventfd(eventfd.as_raw_fd()).unwrap();
-
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
     tokio::task::spawn(tokio::task::unconstrained(async move {
@@ -383,7 +380,7 @@ fn setup_poller_task(
             std::thread::current().id()
         );
 
-        let fd = tokio::io::unix::AsyncFd::new(eventfd).unwrap();
+        let fd = tokio::io::unix::AsyncFd::new(uring_fd).unwrap();
         loop {
             // See fd.read() API docs for recipe for this code block.
             loop {
@@ -392,21 +389,9 @@ fn setup_poller_task(
                     info!("spurious wakeup");
                     continue;
                 }
-                match fd.get_ref().read() {
-                    Ok(val) => {
-                        assert!(val > 0);
-                        // info!("read: {val:?}");
-                        continue;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // info!("would block");
-                        guard.clear_ready_matching(tokio::io::Ready::READABLE);
-                        break;
-                    }
-                    Err(e) => panic!("{:?}", e),
-                }
+                guard.clear_ready_matching(tokio::io::Ready::READABLE);
+                break;
             }
-            debug!("eventfd ready, processing completions");
 
             let mut unprotected_cq = scopeguard::ScopeGuard::into_inner(cq.take().unwrap());
             let res = unprotected_cq.process_completions();
