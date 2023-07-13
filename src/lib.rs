@@ -305,7 +305,6 @@ struct SendSyncCompletionQueue {
 }
 
 unsafe impl Send for SendSyncCompletionQueue {}
-unsafe impl Sync for SendSyncCompletionQueue {}
 
 enum ProcessCompletionsErr {
     PoisonPill,
@@ -341,7 +340,6 @@ struct SubmitSide {
 }
 
 unsafe impl Send for SubmitSide {}
-unsafe impl Sync for SubmitSide {}
 
 enum SubmitError {
     QueueFull,
