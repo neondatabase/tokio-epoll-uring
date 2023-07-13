@@ -124,10 +124,6 @@ impl Drop for ThreadLocalState {
                 drop(submitter);
                 let uring = unsafe { Box::from_raw(split_uring) };
                 drop(uring);
-                info!(
-                    "thread-local uring shut down for thread {:?}",
-                    std::thread::current().id()
-                );
             }
             ThreadLocalStateInner::Dropped => {
                 unreachable!("ThreadLocalState::drop() had already been called in the past");
@@ -186,10 +182,6 @@ impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        info!(
-            "polling preadv future on thread id {:?}",
-            std::thread::current().id()
-        );
         let mut state = self.state.0.lock().unwrap();
         let cur = std::mem::replace(&mut *state, PreadvCompletionFutStateInner::Undefined);
         match cur {
