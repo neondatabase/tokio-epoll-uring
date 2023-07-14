@@ -1,10 +1,10 @@
 use std::{
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, OwnedFd},
     sync::{Arc, Mutex},
 };
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
-use tracing::{debug, info};
+use tracing::{info, trace};
 
 enum ThreadLocalStateInner {
     NotUsed,
@@ -28,7 +28,7 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
         loop {
             match &mut local_state.0 {
                 ThreadLocalStateInner::NotUsed => {
-                    let preallocated_completions = Arc::new(Mutex::new(PreallocatedCompletions {
+                    let preallocated_completions = Arc::new(Mutex::new(Ops {
                         storage: array_macro::array![_ => None; RING_SIZE as usize],
                         unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
                     }));
@@ -38,7 +38,7 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
                     let cq = Arc::new(Mutex::new(SendSyncCompletionQueue {
                         cq,
                         seen_poison: false,
-                        preallocated_completions: preallocated_completions.clone(),
+                        ops: preallocated_completions.clone(),
                     }));
                     let rx_completion_queue_from_poller_task =
                         setup_poller_task(uring_fd, Arc::clone(&cq));
@@ -46,7 +46,7 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
                         submitter,
                         sq,
                         cq,
-                        preallocated_completions,
+                        ops: preallocated_completions,
                     };
                     *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
                         split_uring: uring,
@@ -88,14 +88,15 @@ impl Drop for ThreadLocalState {
                         // drain existing ops before scheduling the poison
                         .flags(io_uring::squeue::Flags::IO_DRAIN)
                         .user_data(u64::MAX);
-                    match submit_side.submit(entry, None) {
+                    match submit_side.submit(entry) {
                         Ok(_preallocated_submission_idx) => break,
-                        Err(SubmitError::QueueFull(_sqe)) => {
+                        Err(SubmitError::QueueFull) => {
                             // poller may be stopping
                             let cq = cq.get_or_insert_with(|| {
                                 rx_completion_queue_from_poller_task.recv().unwrap()
                             });
                             match cq.lock().unwrap().process_completions() {
+                                // TODO should we submit() first? Is this just busy-waiting?
                                 Ok(()) => continue, // retry submit poison
                                 Err(ProcessCompletionsErr::PoisonPill) => {
                                     unreachable!("only we send poison pills")
@@ -104,8 +105,7 @@ impl Drop for ThreadLocalState {
                         }
                     }
                 }
-                let cq =
-                    cq.unwrap_or_else(|| rx_completion_queue_from_poller_task.recv().unwrap());
+                let cq = cq.unwrap_or_else(|| rx_completion_queue_from_poller_task.recv().unwrap());
                 let mut cq_locked = cq.lock().unwrap();
                 if !cq_locked.seen_poison {
                     // this is case (2)
@@ -121,7 +121,7 @@ impl Drop for ThreadLocalState {
                 let SubmitSide {
                     submitter,
                     sq,
-                    preallocated_completions,
+                    ops: preallocated_completions,
                     cq: cq_arc_from_submit_side,
                 } = submit_side;
                 assert!(Arc::ptr_eq(&cq_arc_from_submit_side, &cq)); // ptr_eq is safe because these are not trait objects
@@ -137,7 +137,7 @@ impl Drop for ThreadLocalState {
                 let SendSyncCompletionQueue {
                     seen_poison: _,
                     cq,
-                    preallocated_completions: _,
+                    ops: _,
                 } = cq;
 
                 let submitter: Submitter<'_> = submitter;
@@ -171,157 +171,221 @@ impl Drop for ThreadLocalState {
     }
 }
 
-type PreadvOutput<F, B> = (F, B, std::io::Result<usize>);
+type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
 
-pub fn preadv<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut>(
-    file: F,
+pub fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
+    file: OwnedFd,
     offset: u64,
-    buf: B,
-) -> impl std::future::Future<Output = PreadvOutput<F, B>> {
-    PreadvCompletionFut {
-        state: Arc::new(PreadvCompletionFutState(Mutex::new(
-            PreadvCompletionFutStateInner::TrySubmission { file, offset, buf },
-        ))),
-    }
-}
-
-enum DoneSubState<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
-    Ready(PreadvOutput<F, B>),
-    Taken,
-}
-
-struct PreadvCompletionFutState<T: AsRawFd, B: tokio_uring::buf::IoBufMut>(
-    Mutex<PreadvCompletionFutStateInner<T, B>>,
-);
-
-enum PreadvCompletionFutStateInner<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
-    Undefined,
-    TrySubmission {
-        file: F,
-        offset: u64,
-        buf: B,
-    },
-    Pending {
-        file_currently_owned_by_kernel: F,
-        buf_currently_owned_by_kernel: B,
-        waker: std::task::Waker,
-    },
-    Done(DoneSubState<F, B>),
-}
-
-struct PreadvCompletionFut<F: AsRawFd, B: tokio_uring::buf::IoBufMut> {
-    state: Arc<PreadvCompletionFutState<F, B>>,
-}
-
-impl<F: AsRawFd + 'static, B: tokio_uring::buf::IoBufMut> std::future::Future
-    for PreadvCompletionFut<F, B>
-{
-    type Output = PreadvOutput<F, B>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let mut state = self.state.0.lock().unwrap();
-        let cur = std::mem::replace(&mut *state, PreadvCompletionFutStateInner::Undefined);
-        match cur {
-            PreadvCompletionFutStateInner::Undefined => panic!("future is in undefined state"),
-            PreadvCompletionFutStateInner::TrySubmission {
-                file,
-                offset,
-                mut buf,
-            } => with_this_executor_threads_submit_side(|submit_side| {
-                let iov = libc::iovec {
-                    iov_base: buf.stable_mut_ptr() as *mut libc::c_void,
-                    iov_len: buf.bytes_total(),
-                };
-
-                let mut sqe = Some(
-                    io_uring::opcode::Readv::new(
-                        io_uring::types::Fd(file.as_raw_fd()),
-                        &iov as *const _,
-                        1,
-                    )
-                    .offset(offset)
-                    .build(),
-                );
-
-                loop {
-                    match submit_side.submit(
-                        sqe.take().unwrap(),
-                        Some(Arc::clone(&self.state) as Arc<dyn OpFuture>),
-                    ) {
-                        Ok(()) => {
-                            *state = PreadvCompletionFutStateInner::Pending {
-                                waker: cx.waker().clone(),
-                                buf_currently_owned_by_kernel: buf,
-                                file_currently_owned_by_kernel: file,
-                            };
-                            return std::task::Poll::Pending;
-                        }
-                        Err(e) => {
-                            match e {
-                                SubmitError::QueueFull(got_back_sqe) => {
-                                    sqe = Some(got_back_sqe);
-                                    // help the executor by polling the completion queue
-                                    let mut cq = submit_side.cq.lock().unwrap();
-                                    match cq.process_completions() {
-                                        Ok(()) => continue, // retry submit
-                                        Err(ProcessCompletionsErr::PoisonPill) => {
-                                            unreachable!("only destructor of ThreadLocalState can send poison pills, but we're using thread-local state (submit_side is part of it)");
-                                        }
-                                    }
-                                }
-                            }
+    mut buf: B,
+) -> impl std::future::Future<Output = PreadvOutput<B>> + Send {
+    with_this_executor_threads_submit_side(move |submit_side| {
+        let (mut ops_guard, idx) = loop {
+            let mut ops_guard = submit_side.ops.lock().unwrap();
+            match ops_guard.unused_indices.pop() {
+                Some(idx) => break (ops_guard, idx),
+                None => {
+                    drop(ops_guard); // so that  process_completions() can take it
+                                     // submit_side.submitter.submit().unwrap();
+                    match submit_side.cq.lock().unwrap().process_completions() {
+                        Ok(()) => {}
+                        Err(ProcessCompletionsErr::PoisonPill) => {
+                            unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent")
                         }
                     }
+                    continue;
                 }
-            }),
-            x @ PreadvCompletionFutStateInner::Pending { .. } => {
-                *state = x;
-                std::task::Poll::Pending
             }
-            PreadvCompletionFutStateInner::Done(DoneSubState::Ready(res)) => {
-                *state = PreadvCompletionFutStateInner::Done(DoneSubState::Taken);
-                std::task::Poll::Ready(res)
+        };
+
+        let iov = libc::iovec {
+            iov_base: buf.stable_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.bytes_total(),
+        };
+
+        let sqe = io_uring::opcode::Readv::new(
+            io_uring::types::Fd(file.as_raw_fd()),
+            &iov as *const _,
+            1,
+        )
+        .offset(offset)
+        .build()
+        .user_data(idx.try_into().unwrap());
+
+        ops_guard.storage[idx] = Some(OpState(Mutex::new(OpStateInner::Pending {
+            waker: None,
+            file_currently_owned_by_kernel: file,
+        })));
+
+        drop(ops_guard); // to remove mut borrow on submit_side, needed for .submit()
+        match submit_side.submit(sqe) {
+            Ok(()) => {}
+            Err(SubmitError::QueueFull) => {
+                unreachable!("the preallocated_completions has same size as the SQ")
             }
-            PreadvCompletionFutStateInner::Done(DoneSubState::Taken) => {
-                panic!("polled after completion")
+        }
+
+        match submit_side.cq.lock().unwrap().process_completions() {
+            Ok(()) => {}
+            Err(ProcessCompletionsErr::PoisonPill) => {
+                unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+            }
+        }
+
+        PreadvCompletionFut {
+            buf: Some(buf),
+            _types: std::marker::PhantomData,
+            state: PreadvCompletionFutState::NotReadyPolledYet {
+                ops: Arc::clone(&submit_side.ops),
+
+                idx,
+            },
+        }
+    })
+}
+
+enum PreadvCompletionFutState {
+    NotReadyPolledYet {
+        ops: Arc<Mutex<Ops>>,
+        idx: usize, // into the preallocated_completions
+    },
+    ReadyPolled,
+    Undefined,
+}
+struct PreadvCompletionFut<B: tokio_uring::buf::IoBufMut + Send> {
+    state: PreadvCompletionFutState,
+    buf: Option<B>, // beocmes None in `drop()`, Some otherwise
+    // make it !Send because the `idx` is thread-local
+    _types: std::marker::PhantomData<B>,
+}
+
+struct OpState(Mutex<OpStateInner>);
+
+enum OpStateInner {
+    Undefined,
+    Pending {
+        file_currently_owned_by_kernel: OwnedFd,
+        waker: Option<std::task::Waker>, // None if it hasn't been polled yet
+    },
+    PendingButFutureDropped {
+        _buffer_owned: Box<dyn std::any::Any + Send>,
+    },
+    ReadyButFutureDropped,
+    Ready {
+        file_ready_to_be_taken_back: OwnedFd,
+        result: i32,
+    },
+}
+
+impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvCompletionFut<B> {
+    type Output = PreadvOutput<B>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
+        match cur {
+            PreadvCompletionFutState::Undefined => {
+                unreachable!("future is in undefined state")
+            }
+            PreadvCompletionFutState::ReadyPolled => {
+                panic!("must not poll future after observing ready")
+            }
+            PreadvCompletionFutState::NotReadyPolledYet { ops, idx } => {
+                let mut ops_guard = ops.lock().unwrap();
+                let op_state = &mut ops_guard.storage[idx];
+                let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
+
+                let cur: OpStateInner =
+                    std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
+                match cur {
+                    OpStateInner::Undefined => panic!("future is in undefined state"),
+                    OpStateInner::Pending {
+                        file_currently_owned_by_kernel,
+                        waker,
+                    } => {
+                        *op_state_inner = OpStateInner::Pending {
+                            file_currently_owned_by_kernel,
+                            waker: Some(waker.unwrap_or_else(|| cx.waker().clone())),
+                        };
+                        drop(op_state_inner);
+                        drop(op_state);
+                        drop(ops_guard);
+                        self.state = PreadvCompletionFutState::NotReadyPolledYet { ops, idx };
+                        std::task::Poll::Pending
+                    }
+                    OpStateInner::PendingButFutureDropped { .. } => {
+                        unreachable!("if it's dropped, it's not pollable")
+                    }
+                    OpStateInner::ReadyButFutureDropped => {
+                        unreachable!("if it's dropped, it's not pollable")
+                    }
+                    OpStateInner::Ready {
+                        result: res,
+                        file_ready_to_be_taken_back,
+                    } => {
+                        drop(op_state_inner);
+                        *op_state = None;
+                        ops_guard.unused_indices.push(idx);
+                        drop(ops_guard);
+                        let mut buf_mut =
+                            unsafe { self.as_mut().map_unchecked_mut(|myself| &mut myself.buf) };
+                        let mut buf = buf_mut.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
+                        drop(buf_mut);
+                        // https://man.archlinux.org/man/io_uring_prep_read.3.en
+                        let res = if res < 0 {
+                            Err(std::io::Error::from_raw_os_error(-res))
+                        } else {
+                            unsafe { buf.set_init(res as usize) };
+                            Ok(res as usize)
+                        };
+                        self.state = PreadvCompletionFutState::ReadyPolled;
+                        std::task::Poll::Ready((file_ready_to_be_taken_back, buf, res))
+                    }
+                }
             }
         }
     }
 }
 
-impl<F: AsRawFd, B: tokio_uring::buf::IoBufMut> OpFuture for PreadvCompletionFutState<F, B> {
-    fn on_completion(&self, res: i32) {
-        let mut state = self.0.lock().unwrap();
-        let cur = std::mem::replace(&mut *state, PreadvCompletionFutStateInner::Undefined);
+impl<B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<B> {
+    fn drop(&mut self) {
+        let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
         match cur {
-            PreadvCompletionFutStateInner::Undefined => panic!("future is in undefined state"),
-            PreadvCompletionFutStateInner::TrySubmission { .. } => {
-                panic!("future is in try submission state")
-            }
-            PreadvCompletionFutStateInner::Done(_) => panic!("future is in done state"),
-            PreadvCompletionFutStateInner::Pending {
-                file_currently_owned_by_kernel,
-                mut buf_currently_owned_by_kernel,
-                waker,
-            } => {
-                // https://man.archlinux.org/man/io_uring_prep_read.3.en
-                let res = if res < 0 {
-                    Err(std::io::Error::from_raw_os_error(-res))
-                } else {
-                    unsafe { buf_currently_owned_by_kernel.set_init(res as usize) };
-                    Ok(res as usize)
-                };
+            PreadvCompletionFutState::Undefined => unreachable!("future is in undefined state"),
+            PreadvCompletionFutState::ReadyPolled => (),
+            PreadvCompletionFutState::NotReadyPolledYet { ops, idx } => {
+                let mut ops_guard = ops.lock().unwrap();
+                let op_state = &mut ops_guard.storage[idx];
+                let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
 
-                *state = PreadvCompletionFutStateInner::Done(DoneSubState::Ready((
-                    file_currently_owned_by_kernel,
-                    buf_currently_owned_by_kernel,
-                    res,
-                )));
-                drop(state);
-                waker.wake();
+                let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
+                match cur {
+                    OpStateInner::Undefined => {
+                        unreachable!("future is in undefined state")
+                    }
+                    OpStateInner::Ready { .. } => {
+                        drop(op_state_inner);
+                        *op_state = None;
+                        ops_guard.unused_indices.push(idx);
+                    }
+                    OpStateInner::Pending { .. } => {
+                        // keep the buffer alive by storing it in the preallocated_completions.
+                        let buf = self
+                            .buf
+                            .take()
+                            .expect("we only take() during drop, which is here");
+                        // we can't have B as a type parameter in the preallocated_completions, drop it
+                        let _buffer_owned: Box<dyn std::any::Any + Send> = Box::new(buf);
+                        *op_state_inner = OpStateInner::PendingButFutureDropped { _buffer_owned };
+                    }
+                    OpStateInner::PendingButFutureDropped { .. } => {
+                        unreachable!("future is being dropped right now")
+                    }
+                    OpStateInner::ReadyButFutureDropped => {
+                        unreachable!("we are only dropping now, completion handler can't ahve observed us in PendingButFutureDropped state")
+                    }
+                }
             }
         }
     }
@@ -330,7 +394,7 @@ impl<F: AsRawFd, B: tokio_uring::buf::IoBufMut> OpFuture for PreadvCompletionFut
 struct SendSyncCompletionQueue {
     seen_poison: bool,
     cq: CompletionQueue<'static>,
-    preallocated_completions: Arc<Mutex<PreallocatedCompletions>>,
+    ops: Arc<Mutex<Ops>>,
 }
 
 unsafe impl Send for SendSyncCompletionQueue {}
@@ -338,32 +402,47 @@ unsafe impl Send for SendSyncCompletionQueue {}
 enum ProcessCompletionsErr {
     PoisonPill,
 }
-trait OpFuture {
-    fn on_completion(&self, res: i32);
-}
-
-struct Completion {
-    op_future_state: Arc<dyn OpFuture>,
-}
 
 impl SendSyncCompletionQueue {
     fn process_completions(&mut self) -> std::result::Result<(), ProcessCompletionsErr> {
         let cq = &mut self.cq;
         cq.sync();
         for cqe in &mut *cq {
-            debug!("got cqe: {:?}", cqe);
+            trace!("got cqe: {:?}", cqe);
             let idx: u64 = unsafe { std::mem::transmute(cqe.user_data()) };
             if idx == u64::MAX {
                 self.seen_poison = true;
-                continue;
+                continue; // TODO assert it's the last one and break?
             }
-            let mut preallocated_completions = self.preallocated_completions.lock().unwrap();
-            let completion: Completion = preallocated_completions.storage[idx as usize]
-                .take()
-                .unwrap();
-            preallocated_completions.unused_indices.push(idx as usize);
-            drop(preallocated_completions);
-            completion.op_future_state.on_completion(cqe.result());
+            let mut ops_guard = self.ops.lock().unwrap();
+            let op_state: &mut OpState = ops_guard.storage[idx as usize].as_mut().unwrap();
+            let mut op_state_inner = op_state.0.lock().unwrap();
+            let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
+            match cur {
+                OpStateInner::Undefined => unreachable!("implementation error"),
+                OpStateInner::Pending {
+                    file_currently_owned_by_kernel,
+                    waker,
+                } => {
+                    *op_state_inner = OpStateInner::Ready {
+                        result: cqe.result(),
+                        file_ready_to_be_taken_back: file_currently_owned_by_kernel,
+                    };
+                    drop(op_state_inner);
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }
+                OpStateInner::PendingButFutureDropped { _buffer_owned } => {
+                    *op_state_inner = OpStateInner::ReadyButFutureDropped;
+                }
+                OpStateInner::ReadyButFutureDropped => {
+                    unreachable!("can't be ready twice")
+                }
+                OpStateInner::Ready { .. } => {
+                    unreachable!("can't be ready twice")
+                }
+            }
         }
         cq.sync();
         if self.seen_poison {
@@ -376,8 +455,8 @@ impl SendSyncCompletionQueue {
     }
 }
 
-struct PreallocatedCompletions {
-    storage: [Option<Completion>; RING_SIZE as usize],
+struct Ops {
+    storage: [Option<OpState>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
 }
 
@@ -386,7 +465,7 @@ const RING_SIZE: u32 = 128;
 struct SubmitSide {
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
-    preallocated_completions: Arc<Mutex<PreallocatedCompletions>>,
+    ops: Arc<Mutex<Ops>>,
     // wake_poller_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     cq: Arc<Mutex<SendSyncCompletionQueue>>,
 }
@@ -394,41 +473,16 @@ struct SubmitSide {
 unsafe impl Send for SubmitSide {}
 
 enum SubmitError {
-    QueueFull(io_uring::squeue::Entry),
+    QueueFull,
 }
 
 impl SubmitSide {
-    fn submit(
-        &mut self,
-        sqe: io_uring::squeue::Entry,
-        future_state: Option<Arc<dyn OpFuture>>,
-    ) -> std::result::Result<(), SubmitError> {
-        let idx = if let Some(future_state) = future_state {
-            let idx = match self
-                .preallocated_completions
-                .lock()
-                .unwrap()
-                .unused_indices
-                .pop()
-            {
-                Some(idx) => idx,
-                None => return Err(SubmitError::QueueFull(sqe)),
-            };
-            let completion: &mut Option<Completion> =
-                &mut self.preallocated_completions.lock().unwrap().storage[idx];
-            assert!(completion.is_none());
-            *completion = Some(Completion {
-                op_future_state: future_state,
-            });
-            idx as u64
-        } else {
-            u64::MAX // poison pill; XXX: model as OpFuture
-        };
-        let sqe = sqe.user_data(idx);
+    fn submit(&mut self, sqe: io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
+        self.sq.sync();
         match unsafe { self.sq.push(&sqe) } {
             Ok(()) => {}
             Err(_queue_full) => {
-                unreachable!("queue full should be handled by unused_completion_indices")
+                return Err(SubmitError::QueueFull);
             }
         }
         self.sq.sync();

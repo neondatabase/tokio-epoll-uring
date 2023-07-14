@@ -15,7 +15,12 @@ async fn main() {
         // print tokio runtime metrics every second
         loop {
             let metrics = tokio::runtime::Handle::current().metrics();
-            tracing::info!("num workers: {:?} idle_blocking: {:?} blocking: {:?}", metrics.num_workers(), metrics.num_idle_blocking_threads(), metrics.num_blocking_threads());
+            tracing::info!(
+                "num workers: {:?} idle_blocking: {:?} blocking: {:?}",
+                metrics.num_workers(),
+                metrics.num_idle_blocking_threads(),
+                metrics.num_blocking_threads()
+            );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
@@ -31,7 +36,8 @@ async fn main() {
             }
 
             let buf = vec![0; 2048];
-            let (_file, buf, res) = tokio_io_uring_eventfd_bridge::preadv(file, 512, buf).await;
+            let (_file, buf, res) =
+                tokio_io_uring_eventfd_bridge::preadv(file.into(), 512, buf).await;
             let read = res.unwrap();
             assert_eq!(read, 2048, "not expecting short read");
             assert_eq!(&buf[0..512], &[23u8; 512]);
@@ -74,7 +80,8 @@ async fn main() {
             }
 
             let buf = vec![0; 2048];
-            let (_file, buf, res) = tokio_io_uring_eventfd_bridge::preadv(file, 512, buf).await;
+            let (_file, buf, res) =
+                tokio_io_uring_eventfd_bridge::preadv(file.into(), 512, buf).await;
             let read = res.unwrap();
             assert_eq!(read, 2048, "not expecting short read");
             assert_eq!(&buf[0..512], &[23u8; 512]);
