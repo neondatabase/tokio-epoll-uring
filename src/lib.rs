@@ -251,9 +251,6 @@ enum OpStateInner {
 }
 
 impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
-    fn assert_not_undefined(&self) {
-        assert!(!matches!(self.state, PreadvCompletionFutState::Undefined));
-    }
     fn ty_get_ops_slot(&mut self) -> bool {
         let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
         let PreadvCompletionFutState::WaitingForOpSlot { file, offset , wakeup } = cur  else {
