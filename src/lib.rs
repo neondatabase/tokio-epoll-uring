@@ -353,9 +353,11 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                     file,
                     offset,
                 } => match wakeup.take() {
-                    Some(wakeup) => {
-                        tokio::pin!(wakeup);
-                        match wakeup.poll(cx) {
+                    Some(mut wakeup) => {
+                        match {
+                            let wakeup = std::pin::Pin::new(&mut wakeup);
+                            wakeup.poll(cx)
+                        } {
                             std::task::Poll::Ready(res) => {
                                 match res {
                                     Ok(()) => {}
@@ -381,7 +383,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                                 self.state = PreadvCompletionFutState::WaitingForOpSlot {
                                     file,
                                     offset,
-                                    wakeup: None,
+                                    wakeup: Some(wakeup),
                                 };
                                 continue;
                             }
