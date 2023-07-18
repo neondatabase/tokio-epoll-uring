@@ -355,13 +355,14 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
             }
         }
         // opportunistically process completion immediately
+        // this appears to be worse for fairness
         // TODO do it during poll as well?
-        // match submit_side.cq.lock().unwrap().process_completions() {
-        //     Ok(()) => {}
-        //     Err(ProcessCompletionsErr::PoisonPill) => {
-        //         unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
-        //     }
-        // }
+        match submit_side.cq.lock().unwrap().process_completions() {
+            Ok(()) => {}
+            Err(ProcessCompletionsErr::PoisonPill) => {
+                unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+            }
+        }
 
         self.state = PreadvCompletionFutState::Submitted {
             sq: Weak::upgrade(&submit_side.myself).expect("we're executing on myself"),
