@@ -415,11 +415,11 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                         OpStateInner::Undefined => panic!("future is in undefined state"),
                         OpStateInner::Pending {
                             file_currently_owned_by_kernel,
-                            waker,
+                            waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
                         } => {
                             *op_state_inner = OpStateInner::Pending {
                                 file_currently_owned_by_kernel,
-                                waker: Some(waker.unwrap_or_else(|| cx.waker().clone())),
+                                waker: Some(cx.waker().clone()),
                             };
                             drop(op_state_inner);
                             drop(op_state);
