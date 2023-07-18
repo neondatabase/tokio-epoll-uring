@@ -487,7 +487,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<B> {
                         ops_guard.return_slot_and_wake(idx);
                     }
                     OpStateInner::Pending { .. } => {
-                        // keep the buffer alive by storing it in the preallocated_completions.
+                        // keep the buffer alive by storing it in `ops`
                         let buf = self
                             .buf
                             .take()
