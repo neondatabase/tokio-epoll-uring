@@ -80,6 +80,7 @@ impl Drop for ThreadLocalState {
                 mut submit_side,
                 rx_completion_queue_from_poller_task,
             } => {
+                trace!("start dropping thread-local state");
                 // case (1) current thread is getting stopped but poller is still running; it'll exit once it sees the poison.
                 // case (2) poller got stopped, e.g., because the executor is shutting down; we'll wait for the poison.
                 //
@@ -208,6 +209,22 @@ enum PreadvCompletionFutState {
     Undefined,
     Dropped,
 }
+
+impl PreadvCompletionFutState {
+    fn discriminant_str(&self) -> &'static str {
+        match self {
+            PreadvCompletionFutState::WaitingForOpSlot { wakeup, .. } => match wakeup {
+                Some(_) => "waiting_for_op_slot(Some)",
+                None => "waiting_for_op_slot(None)",
+            },
+            PreadvCompletionFutState::Submitted { .. } => "submitted",
+            PreadvCompletionFutState::ReadyPolled => "ready_polled",
+            PreadvCompletionFutState::Undefined => "undefined",
+            PreadvCompletionFutState::Dropped => "dropped",
+        }
+    }
+}
+
 struct PreadvCompletionFut<B: tokio_uring::buf::IoBufMut + Send> {
     state: PreadvCompletionFutState,
     buf: Option<B>, // beocmes None in `drop()`, Some otherwise
@@ -334,6 +351,10 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        trace!(
+            "polling future in state {:?}",
+            self.state.discriminant_str()
+        );
         loop {
             let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
             match cur {
@@ -357,6 +378,8 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                             wakeup.poll(cx)
                         } {
                             std::task::Poll::Ready(res) => {
+                                // TODO: recv the op slot in the `res` to ensure fairness and avoid polling
+                                trace!("was woken up to check for an available op slot, trying to get it");
                                 match res {
                                     Ok(()) => {}
                                     Err(_sender_dropped) => {
@@ -387,6 +410,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                                 }
                             }
                             std::task::Poll::Pending => {
+                                trace!("not woken up to check for an available op slot yet");
                                 self.state = PreadvCompletionFutState::WaitingForOpSlot {
                                     file,
                                     offset,
@@ -421,6 +445,8 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                     }
                 },
                 PreadvCompletionFutState::Submitted { ops, idx } => {
+                    trace!("checking op state to see if it's ready, storing waker in it if not");
+
                     let mut ops_guard = ops.lock().unwrap();
                     let op_state = &mut ops_guard.storage[idx];
                     let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
@@ -433,6 +459,8 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                             file_currently_owned_by_kernel,
                             waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
                         } => {
+                            trace!("op is still pending, storing waker in it");
+
                             *op_state_inner = OpStateInner::Pending {
                                 file_currently_owned_by_kernel,
                                 waker: Some(cx.waker().clone()),
@@ -453,6 +481,8 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                             result: res,
                             file_ready_to_be_taken_back,
                         } => {
+                            trace!("op is ready, returning file and buffer to user");
+
                             drop(op_state_inner);
                             *op_state = None;
                             ops_guard.return_slot_and_wake(idx);
