@@ -534,8 +534,8 @@ impl SendSyncCompletionQueue {
                 continue; // TODO assert it's the last one and break?
             }
             let mut ops_guard = self.ops.lock().unwrap();
-            let op_state: &mut OpState = ops_guard.storage[idx as usize].as_mut().unwrap();
-            let mut op_state_inner = op_state.0.lock().unwrap();
+            let op_state = &mut ops_guard.storage[idx as usize];
+            let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
             let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
             match cur {
                 OpStateInner::Undefined => unreachable!("implementation error"),
@@ -554,6 +554,10 @@ impl SendSyncCompletionQueue {
                 }
                 OpStateInner::PendingButFutureDropped { _buffer_owned } => {
                     *op_state_inner = OpStateInner::ReadyButFutureDropped;
+                    drop(op_state_inner);
+                    *op_state = None;
+                    drop(op_state);
+                    ops_guard.return_slot_and_wake(idx as usize);
                 }
                 OpStateInner::ReadyButFutureDropped => {
                     unreachable!("can't be ready twice")
