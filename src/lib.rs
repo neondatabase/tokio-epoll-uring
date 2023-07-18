@@ -33,7 +33,7 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
                     let preallocated_completions = Arc::new(Mutex::new(Ops {
                         storage: array_macro::array![_ => None; RING_SIZE as usize],
                         unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
-                        waiters: waiters_rx,
+                        waiters_rx,
                     }));
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
@@ -50,7 +50,7 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
                         sq,
                         cq,
                         ops: preallocated_completions,
-                        wait_tx: waiters_tx,
+                        waiters_tx,
                     };
                     *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
                         split_uring: uring,
@@ -126,7 +126,7 @@ impl Drop for ThreadLocalState {
                     sq,
                     ops: preallocated_completions,
                     cq: cq_arc_from_submit_side,
-                    wait_tx: _,
+                    waiters_tx: _,
                 } = submit_side;
                 assert!(Arc::ptr_eq(&cq_arc_from_submit_side, &cq)); // ptr_eq is safe because these are not trait objects
                 drop(cq_arc_from_submit_side);
@@ -192,6 +192,7 @@ pub fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
         },
     };
     fut.ty_get_ops_slot();
+    fut.assert_not_undefined();
     fut
 }
 
@@ -207,6 +208,7 @@ enum PreadvCompletionFutState {
     },
     ReadyPolled,
     Undefined,
+    Dropped,
 }
 struct PreadvCompletionFut<B: tokio_uring::buf::IoBufMut + Send> {
     state: PreadvCompletionFutState,
@@ -234,6 +236,9 @@ enum OpStateInner {
 }
 
 impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
+    fn assert_not_undefined(&self) {
+        assert!(!matches!(self.state, PreadvCompletionFutState::Undefined));
+    }
     fn ty_get_ops_slot(&mut self) -> bool {
         let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
         let PreadvCompletionFutState::WaitingForOpSlot { file, offset , wakeup } = cur  else {
@@ -263,7 +268,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
                         }
 
                         let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
-                        match submit_side.wait_tx.send(wake_up_tx) {
+                        match submit_side.waiters_tx.send(wake_up_tx) {
                             Ok(()) => (),
                             Err(tokio::sync::mpsc::error::SendError(_)) => {
                                 todo!("can this happen? poller would be dead")
@@ -337,6 +342,9 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                 PreadvCompletionFutState::Undefined => {
                     unreachable!("future is in undefined state")
                 }
+                PreadvCompletionFutState::Dropped => {
+                    unreachable!("future is in dropped state, but we're in poll() right now, so, can't be dropped")
+                }
                 PreadvCompletionFutState::ReadyPolled => {
                     panic!("must not poll future after observing ready")
                 }
@@ -351,8 +359,9 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                             std::task::Poll::Ready(res) => {
                                 match res {
                                     Ok(()) => {}
-                                    Err(_) => {
-                                        panic!("poller task died?")
+                                    Err(_sender_dropped) => {
+                                        // the waiters_rx got dropped, or, our wakeup request got dropped
+                                        todo!("can the poller task die before a future?")
                                     }
                                 }
                                 self.state = PreadvCompletionFutState::WaitingForOpSlot {
@@ -361,13 +370,20 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                                     wakeup: None,
                                 };
                                 if self.ty_get_ops_slot() {
+                                    self.assert_not_undefined();
                                     continue;
                                 } else {
+                                    self.assert_not_undefined();
                                     return std::task::Poll::Pending;
                                 }
                             }
                             std::task::Poll::Pending => {
-                                return std::task::Poll::Pending;
+                                self.state = PreadvCompletionFutState::WaitingForOpSlot {
+                                    file,
+                                    offset,
+                                    wakeup: None,
+                                };
+                                continue;
                             }
                         }
                     }
@@ -378,8 +394,10 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                             wakeup: None,
                         };
                         if self.ty_get_ops_slot() {
+                            self.assert_not_undefined();
                             continue;
                         } else {
+                            self.assert_not_undefined();
                             return std::task::Poll::Pending;
                         }
                     }
@@ -419,16 +437,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                         } => {
                             drop(op_state_inner);
                             *op_state = None;
-                            ops_guard.unused_indices.push(idx);
-                            match ops_guard.waiters.try_recv() {
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => (),
-                                Ok(waiter) => {
-                                    drop(waiter); // use drop as wake-up
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    todo!()
-                                }
-                            }
+                            ops_guard.return_slot_and_wake(idx);
                             drop(ops_guard);
                             let mut buf_mut = unsafe {
                                 self.as_mut().map_unchecked_mut(|myself| &mut myself.buf)
@@ -454,9 +463,12 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
 
 impl<B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<B> {
     fn drop(&mut self) {
-        let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
+        let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Dropped);
         match cur {
             PreadvCompletionFutState::Undefined => unreachable!("future is in undefined state"),
+            PreadvCompletionFutState::Dropped => {
+                unreachable!("future is in dropped state, but we're in drop() right now")
+            }
             PreadvCompletionFutState::WaitingForOpSlot { .. } => (),
             PreadvCompletionFutState::ReadyPolled => (),
             PreadvCompletionFutState::Submitted { ops, idx } => {
@@ -467,12 +479,12 @@ impl<B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<B> {
                 let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
                 match cur {
                     OpStateInner::Undefined => {
-                        unreachable!("future is in undefined state")
+                        unreachable!("operation is in undefined state")
                     }
                     OpStateInner::Ready { .. } => {
                         drop(op_state_inner);
                         *op_state = None;
-                        ops_guard.unused_indices.push(idx);
+                        ops_guard.return_slot_and_wake(idx);
                     }
                     OpStateInner::Pending { .. } => {
                         // keep the buffer alive by storing it in the preallocated_completions.
@@ -563,7 +575,35 @@ impl SendSyncCompletionQueue {
 struct Ops {
     storage: [Option<OpState>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
-    waiters: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
+    waiters_rx: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Ops {
+    fn return_slot_and_wake(&mut self, idx: usize) {
+        assert!(self.storage[idx].is_none());
+        self.unused_indices.push(idx);
+        loop {
+            match self.waiters_rx.try_recv() {
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    break;
+                }
+                Ok(waiter) => {
+                    match waiter.send(()) {
+                        Ok(()) => {
+                            break;
+                        }
+                        Err(()) => {
+                            // the future requesting wakeup got dropped. wake up next one
+                            continue;
+                        }
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("SubmitSide got dropped while there were pending ops; we drain it, this shouldn't happen")
+                }
+            }
+        }
+    }
 }
 
 const RING_SIZE: u32 = 128;
@@ -574,7 +614,7 @@ struct SubmitSide {
     ops: Arc<Mutex<Ops>>,
     // wake_poller_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     cq: Arc<Mutex<SendSyncCompletionQueue>>,
-    wait_tx: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+    waiters_tx: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
 }
 
 unsafe impl Send for SubmitSide {}
@@ -602,12 +642,15 @@ fn setup_poller_task(
     uring_fd: std::os::fd::RawFd,
     cq: Arc<Mutex<SendSyncCompletionQueue>>,
 ) -> std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (giveback_cq_tx, giveback_cq_rx) = std::sync::mpsc::sync_channel(1);
 
     tokio::task::spawn(tokio::task::unconstrained(async move {
+        scopeguard::defer!({
+            info!("poller task is exiting");
+        });
         let give_back_cq_on_drop = |cq| {
             scopeguard::guard(cq, |cq| {
-                tx.send(cq).unwrap();
+                giveback_cq_tx.send(cq).unwrap();
             })
         };
         let mut cq = Some(give_back_cq_on_drop(cq));
@@ -639,11 +682,11 @@ fn setup_poller_task(
                 Ok(()) => {}
                 Err(ProcessCompletionsErr::PoisonPill) => {
                     info!("poller observed poison pill");
-                    break; // drops the cq
+                    break;
                 }
             }
         }
     }));
 
-    rx
+    giveback_cq_rx
 }
