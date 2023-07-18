@@ -313,12 +313,12 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
             }
             // opportunistically process completion immediately
             // TODO do it during poll as well?
-            match submit_side.cq.lock().unwrap().process_completions() {
-                Ok(()) => {}
-                Err(ProcessCompletionsErr::PoisonPill) => {
-                    unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
-                }
-            }
+            // match submit_side.cq.lock().unwrap().process_completions() {
+            //     Ok(()) => {}
+            //     Err(ProcessCompletionsErr::PoisonPill) => {
+            //         unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+            //     }
+            // }
 
             self.state = PreadvCompletionFutState::Submitted {
                 ops: Arc::clone(&submit_side.ops),
@@ -385,7 +385,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                                     offset,
                                     wakeup: Some(wakeup),
                                 };
-                                continue;
+                                return std::task::Poll::Pending;
                             }
                         }
                     }
@@ -650,7 +650,7 @@ fn setup_poller_task(
 ) -> std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>> {
     let (giveback_cq_tx, giveback_cq_rx) = std::sync::mpsc::sync_channel(1);
 
-    tokio::task::spawn(tokio::task::unconstrained(async move {
+    tokio::task::spawn(async move {
         scopeguard::defer!({
             info!("poller task is exiting");
         });
@@ -692,7 +692,7 @@ fn setup_poller_task(
                 }
             }
         }
-    }));
+    });
 
     giveback_cq_rx
 }
