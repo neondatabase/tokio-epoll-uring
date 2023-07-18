@@ -182,7 +182,7 @@ pub fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
     offset: u64,
     buf: B,
 ) -> impl std::future::Future<Output = PreadvOutput<B>> + Send {
-    let mut fut = PreadvCompletionFut {
+    let fut = PreadvCompletionFut {
         buf: Some(buf),
         _types: std::marker::PhantomData,
         state: PreadvCompletionFutState::WaitingForOpSlot {
@@ -191,8 +191,6 @@ pub fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
             wakeup: None,
         },
     };
-    fut.ty_get_ops_slot();
-    fut.assert_not_undefined();
     fut
 }
 
@@ -372,11 +370,20 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                                     wakeup: None,
                                 };
                                 if self.ty_get_ops_slot() {
-                                    self.assert_not_undefined();
-                                    continue;
+                                    assert!(matches!(
+                                        self.state,
+                                        PreadvCompletionFutState::Submitted { .. }
+                                    ));
+                                    continue; // So we opportunistically poll for Submitted
                                 } else {
-                                    self.assert_not_undefined();
-                                    return std::task::Poll::Pending;
+                                    assert!(matches!(
+                                        self.state,
+                                        PreadvCompletionFutState::WaitingForOpSlot {
+                                            wakeup: Some(_),
+                                            ..
+                                        }
+                                    ));
+                                    continue; // So we poll the wakeup, and get the right waker if it's not done by the time we poll
                                 }
                             }
                             std::task::Poll::Pending => {
@@ -396,11 +403,20 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                             wakeup: None,
                         };
                         if self.ty_get_ops_slot() {
-                            self.assert_not_undefined();
-                            continue;
+                            assert!(matches!(
+                                self.state,
+                                PreadvCompletionFutState::Submitted { .. }
+                            ));
+                            continue; // So we opportunistically poll for Submitted
                         } else {
-                            self.assert_not_undefined();
-                            return std::task::Poll::Pending;
+                            assert!(matches!(
+                                self.state,
+                                PreadvCompletionFutState::WaitingForOpSlot {
+                                    wakeup: Some(_),
+                                    ..
+                                }
+                            ));
+                            continue; // So we poll the wakeup, and get the right waker if it's not done by the time we poll
                         }
                     }
                 },
