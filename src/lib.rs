@@ -755,7 +755,7 @@ fn setup_poller_task(
 ) -> std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>> {
     let (giveback_cq_tx, giveback_cq_rx) = std::sync::mpsc::sync_channel(1);
 
-    tokio::task::spawn(async move {
+    let fut = async move {
         scopeguard::defer!({
             info!("poller task is exiting");
         });
@@ -797,7 +797,21 @@ fn setup_poller_task(
                 }
             }
         }
-    });
+    };
+
+    lazy_static::lazy_static! {
+        static ref POLLER_TASK_UNCONSTRAINED: bool = std::env::var("POLLER_TASK_UNCONSTRAINED")
+            .map(|v| v == "1")
+            .unwrap_or_else(|e| match e {
+                std::env::VarError::NotPresent => false,
+                std::env::VarError::NotUnicode(_) => panic!("POLLER_TASK_UNCONSTRAINED must be a unicode string"),
+            });
+    }
+    if *POLLER_TASK_UNCONSTRAINED {
+        tokio::task::spawn(tokio::task::unconstrained(fut));
+    } else {
+        tokio::task::spawn(fut);
+    }
 
     giveback_cq_rx
 }
