@@ -777,7 +777,7 @@ fn setup_poller_task(
             loop {
                 let mut guard = fd.ready(tokio::io::Interest::READABLE).await.unwrap();
                 if !guard.ready().is_readable() {
-                    info!("spurious wakeup");
+                    trace!("spurious wakeup");
                     continue;
                 }
                 guard.clear_ready_matching(tokio::io::Ready::READABLE);
