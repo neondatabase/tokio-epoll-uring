@@ -222,6 +222,11 @@ enum PreadvCompletionFutState {
         sq: Arc<Mutex<SubmitSide>>,
         ops: Arc<Mutex<Ops>>,
         idx: usize, // into the preallocated_completions
+        poll_count: usize,
+    },
+    ReadyButYieldingToExecutorForFairness {
+        file: OwnedFd,
+        result: std::io::Result<usize>,
     },
     ReadyPolled,
     Undefined,
@@ -236,6 +241,9 @@ impl PreadvCompletionFutState {
                 None => "waiting_for_op_slot(None)",
             },
             PreadvCompletionFutState::Submitted { .. } => "submitted",
+            PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness { .. } => {
+                "ready_but_yielding_to_executor_for_fairness"
+            }
             PreadvCompletionFutState::ReadyPolled => "ready_polled",
             PreadvCompletionFutState::Undefined => "undefined",
             PreadvCompletionFutState::Dropped => "dropped",
@@ -358,12 +366,6 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
             file_currently_owned_by_kernel: file,
         })));
         drop(ops_guard); // to remove mut borrow on submit_side, needed for .submit()
-        match submit_side.submit(sqe) {
-            Ok(()) => {}
-            Err(SubmitError::QueueFull) => {
-                unreachable!("the preallocated_completions has same size as the SQ")
-            }
-        }
 
         lazy_static::lazy_static! {
             static ref PROCESS_URING_ON_SUBMIT: bool =
@@ -374,14 +376,39 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
                         std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_SUBMIT must be a unicode string"),
                     });
         }
-        if *PROCESS_URING_ON_SUBMIT {
-            // opportunistically process completion immediately
-            // TODO do it during ::poll() as well?
-            match submit_side.cq.lock().unwrap().process_completions() {
+
+        // if we're going to process completions immediately, get the lock on the CQ so that
+        // we are guaranteed to process completions before the poller task
+        {
+            let mut cq_owned = None;
+            let cq_guard = if *PROCESS_URING_ON_SUBMIT {
+                let cq = Arc::clone(&submit_side.cq);
+                cq_owned = Some(cq);
+                Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
+            } else {
+                None
+            };
+            assert_eq!(cq_owned.is_none(), cq_guard.is_none());
+
+            match submit_side.submit(sqe) {
                 Ok(()) => {}
-                Err(ProcessCompletionsErr::PoisonPill) => {
-                    unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+                Err(SubmitError::QueueFull) => {
+                    unreachable!("the preallocated_completions has same size as the SQ")
                 }
+            }
+
+            if let Some(mut cq) = cq_guard {
+                assert!(*PROCESS_URING_ON_SUBMIT);
+                // opportunistically process completion immediately
+                // TODO do it during ::poll() as well?
+                match cq.process_completions() {
+                    Ok(()) => {}
+                    Err(ProcessCompletionsErr::PoisonPill) => {
+                        unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+                    }
+                }
+            } else {
+                assert!(!*PROCESS_URING_ON_SUBMIT);
             }
         }
 
@@ -389,6 +416,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
             sq: Weak::upgrade(&submit_side.myself).expect("we're executing on myself"),
             ops: Arc::clone(&submit_side.ops),
             idx,
+            poll_count: 0,
         };
         return true;
     }
@@ -485,7 +513,12 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                         }
                     }
                 },
-                PreadvCompletionFutState::Submitted { sq, ops, idx } => {
+                PreadvCompletionFutState::Submitted {
+                    sq,
+                    ops,
+                    idx,
+                    poll_count,
+                } => {
                     trace!("checking op state to see if it's ready, storing waker in it if not");
 
                     let mut ops_guard = ops.lock().unwrap();
@@ -509,7 +542,12 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                             drop(op_state_inner);
                             drop(op_state);
                             drop(ops_guard);
-                            self.state = PreadvCompletionFutState::Submitted { sq, ops, idx };
+                            self.state = PreadvCompletionFutState::Submitted {
+                                sq,
+                                ops,
+                                idx,
+                                poll_count: poll_count + 1,
+                            };
                             return std::task::Poll::Pending;
                         }
                         OpStateInner::PendingButFutureDropped { .. } => {
@@ -540,10 +578,46 @@ impl<B: tokio_uring::buf::IoBufMut + Send> std::future::Future for PreadvComplet
                                 unsafe { buf.set_init(res as usize) };
                                 Ok(res as usize)
                             };
+
+                            lazy_static::lazy_static! {
+                                static ref YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: bool =
+                                    std::env::var("YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL")
+                                        .map(|v| v == "1")
+                                        .unwrap_or_else(|e| match e {
+                                            std::env::VarError::NotPresent => false,
+                                            std::env::VarError::NotUnicode(_) => panic!("YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL must be a unicode string"),
+                                        });
+                            }
+
+                            if poll_count == 0 && *YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
+                                let fut = tokio::task::yield_now();
+                                tokio::pin!(fut);
+                                match fut.poll(cx) {
+                                    std::task::Poll::Pending => {
+                                        self.state = PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness {
+                                            file: file_ready_to_be_taken_back,
+                                            result: res,
+                                        };
+                                        let replaced = self.buf.replace(buf);
+                                        assert!(replaced.is_none(), "we just took it above");
+                                        return std::task::Poll::Pending;
+                                    }
+                                    std::task::Poll::Ready(()) => {
+                                        // fallthrough
+                                    }
+                                }
+                            }
                             self.state = PreadvCompletionFutState::ReadyPolled;
                             return std::task::Poll::Ready((file_ready_to_be_taken_back, buf, res));
                         }
                     }
+                }
+                PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness {
+                    file,
+                    result,
+                } => {
+                    self.state = PreadvCompletionFutState::ReadyPolled;
+                    return std::task::Poll::Ready((file, self.buf.take().unwrap(), result));
                 }
             }
         }
@@ -560,7 +634,13 @@ impl<B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<B> {
             }
             PreadvCompletionFutState::WaitingForOpSlot { .. } => (),
             PreadvCompletionFutState::ReadyPolled => (),
-            PreadvCompletionFutState::Submitted { sq, ops, idx } => {
+            PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness { .. } => (),
+            PreadvCompletionFutState::Submitted {
+                sq,
+                ops,
+                idx,
+                poll_count: _,
+            } => {
                 let mut ops_guard = ops.lock().unwrap();
                 let op_state = &mut ops_guard.storage[idx];
                 let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
