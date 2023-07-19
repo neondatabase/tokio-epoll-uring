@@ -289,14 +289,24 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
                         // then yield to executor
                         drop(ops_guard); // so that  process_completions() can take it
 
-                        submit_side.submitter.submit().unwrap();
-                        match submit_side.cq.lock().unwrap().process_completions() {
-                            Ok(()) => (),
-                            Err(ProcessCompletionsErr::PoisonPill) => {
-                                unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent")
+                        lazy_static::lazy_static! {
+                            static ref PROCESS_URING_ON_QUEUE_FULL: bool =
+                                std::env::var("PROCESS_URING_ON_QUEUE_FULL")
+                                    .map(|v| v == "1")
+                                    .unwrap_or_else(|e| match e {
+                                        std::env::VarError::NotPresent => false,
+                                        std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
+                                    });
+                        }
+                        if *PROCESS_URING_ON_QUEUE_FULL {
+                            submit_side.submitter.submit().unwrap();
+                            match submit_side.cq.lock().unwrap().process_completions() {
+                                Ok(()) => (),
+                                Err(ProcessCompletionsErr::PoisonPill) => {
+                                    unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent")
+                                }
                             }
                         }
-
                         let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
                         match submit_side.waiters_tx.send(wake_up_tx) {
                             Ok(()) => (),
@@ -354,13 +364,24 @@ impl<B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<B> {
                 unreachable!("the preallocated_completions has same size as the SQ")
             }
         }
-        // opportunistically process completion immediately
-        // this appears to be worse for fairness
-        // TODO do it during poll as well?
-        match submit_side.cq.lock().unwrap().process_completions() {
-            Ok(()) => {}
-            Err(ProcessCompletionsErr::PoisonPill) => {
-                unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+
+        lazy_static::lazy_static! {
+            static ref PROCESS_URING_ON_SUBMIT: bool =
+                std::env::var("PROCESS_URING_ON_SUBMIT")
+                    .map(|v| v == "1")
+                    .unwrap_or_else(|e| match e {
+                        std::env::VarError::NotPresent => false,
+                        std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_SUBMIT must be a unicode string"),
+                    });
+        }
+        if *PROCESS_URING_ON_SUBMIT {
+            // opportunistically process completion immediately
+            // TODO do it during ::poll() as well?
+            match submit_side.cq.lock().unwrap().process_completions() {
+                Ok(()) => {}
+                Err(ProcessCompletionsErr::PoisonPill) => {
+                    unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+                }
             }
         }
 
