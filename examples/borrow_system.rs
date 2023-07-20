@@ -22,4 +22,8 @@ async fn main() {
     assert_eq!(&buf[0..512], &[23u8; 512]);
     assert_eq!(&buf[512..512 + 1024], &[42u8; 1024]);
     assert_eq!(&buf[512 + 1024..512 + 1024 + 512], &[67u8; 512]);
+
+    // won't compile: borrow of moved value: `system`
+    // drop(system);
+    // let (_, buf, res) = system.preadv(file.into(), 512, buf).await;
 }

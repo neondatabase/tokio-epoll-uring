@@ -1,4 +1,4 @@
-//! Artificially limits futures lifetime to ensure overall lifetimes.
+//! Artificially limits futures lifetime to ensure we don't shutdown system before all futures are gone.
 
 use std::{
     os::fd::OwnedFd,
