@@ -8,18 +8,20 @@ use tracing::{info, trace};
 
 enum ThreadLocalStateInner {
     NotUsed,
-    Used {
-        split_uring: *mut io_uring::IoUring,
-        submit_side: Arc<Mutex<SubmitSide>>,
-        rx_completion_queue_from_poller_task:
-            std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>>,
-    },
+    Used(System),
     Dropped,
 }
 struct ThreadLocalState(ThreadLocalStateInner);
 
 thread_local! {
     static THREAD_LOCAL: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState(ThreadLocalStateInner::NotUsed));
+}
+
+struct System {
+    split_uring: *mut io_uring::IoUring,
+    submit_side: Arc<Mutex<SubmitSide>>,
+    rx_completion_queue_from_poller_task:
+        std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>>,
 }
 
 fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f: F) -> R {
@@ -58,15 +60,15 @@ fn with_this_executor_threads_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(f:
                             myself: Weak::clone(myself),
                         })
                     });
-                    *local_state = ThreadLocalState(ThreadLocalStateInner::Used {
+                    *local_state = ThreadLocalState(ThreadLocalStateInner::Used(System {
                         split_uring: uring,
                         rx_completion_queue_from_poller_task,
                         submit_side,
-                    });
+                    }));
                     continue;
                 }
                 // fast path
-                ThreadLocalStateInner::Used { submit_side, .. } => {
+                ThreadLocalStateInner::Used(System { submit_side, .. }) => {
                     break f(&mut *submit_side.lock().unwrap())
                 }
                 ThreadLocalStateInner::Dropped => {
@@ -83,11 +85,11 @@ impl Drop for ThreadLocalState {
             std::mem::replace(&mut self.0, ThreadLocalStateInner::Dropped);
         match cur {
             ThreadLocalStateInner::NotUsed => {}
-            ThreadLocalStateInner::Used {
+            ThreadLocalStateInner::Used(System {
                 split_uring,
                 submit_side,
                 rx_completion_queue_from_poller_task,
-            } => {
+            }) => {
                 trace!("start dropping thread-local state");
                 // case (1) current thread is getting stopped but poller is still running; it'll exit once it sees the poison.
                 // case (2) poller got stopped, e.g., because the executor is shutting down; we'll wait for the poison.
