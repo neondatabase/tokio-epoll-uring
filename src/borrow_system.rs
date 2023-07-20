@@ -11,9 +11,6 @@ pub struct BorrowSystem {
     system: Arc<Mutex<Option<System>>>,
 }
 
-unsafe impl Send for BorrowSystem {}
-unsafe impl Sync for BorrowSystem {}
-
 impl SystemTrait for &'_ BorrowSystem {
     fn with_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(self, f: F) -> R {
         f(&mut *self

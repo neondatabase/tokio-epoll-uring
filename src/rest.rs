@@ -52,6 +52,11 @@ pub(crate) struct System {
         std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>>,
 }
 
+// SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
+unsafe impl Send for System {}
+// SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
+unsafe impl Sync for System {}
+
 impl System {
     pub(crate) fn new() -> Self {
         // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
