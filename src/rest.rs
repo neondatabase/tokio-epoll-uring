@@ -167,7 +167,7 @@ impl System {
     }
 }
 
-pub(crate) trait SystemTrait: Unpin + Copy {
+pub(crate) trait SystemLifecycleManager: Unpin + Copy {
     fn with_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(self, f: F) -> R;
 }
 

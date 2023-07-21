@@ -6,7 +6,7 @@ use std::{
 
 use tracing::trace;
 
-use crate::rest::{GetOpsSlotFut, InflightOpHandle, ResourcesOwnedByKernel, SystemTrait};
+use crate::rest::{GetOpsSlotFut, InflightOpHandle, ResourcesOwnedByKernel, SystemLifecycleManager};
 
 enum PreadvCompletionFutState<B>
 where
@@ -31,12 +31,12 @@ where
     Dropped,
 }
 
-pub(crate) struct PreadvCompletionFut<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> {
+pub(crate) struct PreadvCompletionFut<S: SystemLifecycleManager, B: tokio_uring::buf::IoBufMut + Send> {
     system: S,
     state: PreadvCompletionFutState<B>,
 }
 
-impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<S, B> {
+impl<S: SystemLifecycleManager, B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<S, B> {
     pub fn new(system: S, file: OwnedFd, offset: u64, buf: B) -> Self {
         PreadvCompletionFut {
             system,
@@ -75,7 +75,7 @@ pub(crate) type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
 
 impl<S, B> std::future::Future for PreadvCompletionFut<S, B>
 where
-    S: SystemTrait,
+    S: SystemLifecycleManager,
     B: tokio_uring::buf::IoBufMut + Send,
 {
     type Output = PreadvOutput<B>;
@@ -171,7 +171,7 @@ where
     }
 }
 
-impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<S, B> {
+impl<S: SystemLifecycleManager, B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<S, B> {
     fn drop(&mut self) {
         let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Dropped);
         match cur {

@@ -2,7 +2,7 @@ use std::os::fd::OwnedFd;
 
 use crate::{
     preadv::{PreadvCompletionFut, PreadvOutput},
-    rest::{SubmitSide, System, SystemTrait},
+    rest::{SubmitSide, System, SystemLifecycleManager},
 };
 
 #[derive(Clone, Copy)]
@@ -19,7 +19,7 @@ thread_local! {
     static THREAD_LOCAL: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState(ThreadLocalStateInner::NotUsed));
 }
 
-impl SystemTrait for ThreadLocalSystem {
+impl SystemLifecycleManager for ThreadLocalSystem {
     fn with_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(self, f: F) -> R {
         THREAD_LOCAL.with(|local_state| {
             let mut local_state = local_state.borrow_mut();

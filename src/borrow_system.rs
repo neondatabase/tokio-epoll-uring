@@ -7,13 +7,13 @@ use std::{
 
 use crate::preadv::{PreadvCompletionFut, PreadvOutput};
 
-use crate::rest::{SubmitSide, System, SystemTrait};
+use crate::rest::{SubmitSide, System, SystemLifecycleManager};
 
 pub struct BorrowSystem {
     system: Arc<Mutex<Option<System>>>,
 }
 
-impl SystemTrait for &'_ BorrowSystem {
+impl SystemLifecycleManager for &'_ BorrowSystem {
     fn with_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(self, f: F) -> R {
         f(&mut *self
             .system
