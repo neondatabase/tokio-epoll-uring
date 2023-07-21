@@ -436,8 +436,8 @@ impl Future for GetOpsSlotFut {
     }
 }
 
-pub(crate) struct InflightOpHandle<B: ResourcesOwnedByOp + Send + 'static> {
-    buf: Option<B>, // beocmes None in `drop()`, Some otherwise
+pub(crate) struct InflightOpHandle<R: ResourcesOwnedByOp + Send + 'static> {
+    buf: Option<R>, // beocmes None in `drop()`, Some otherwise
     state: InflightOpHandleState,
 }
 
@@ -455,10 +455,10 @@ enum InflightOpHandleState {
 }
 
 impl NotInflightSlotHandle {
-    pub(crate) fn submit<B, MakeSqe>(mut self, buf: B, make_sqe: MakeSqe) -> InflightOpHandle<B>
+    pub(crate) fn submit<R, MakeSqe>(mut self, buf: R, make_sqe: MakeSqe) -> InflightOpHandle<R>
     where
-        B: ResourcesOwnedByOp + Send + 'static,
-        MakeSqe: FnOnce(&mut B) -> io_uring::squeue::Entry,
+        R: ResourcesOwnedByOp + Send + 'static,
+        MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
     {
         let cur = std::mem::replace(&mut self.state, NotInflightSlotHandleState::Used);
         match cur {
@@ -470,10 +470,10 @@ impl NotInflightSlotHandle {
 }
 
 impl UnsafeOpsSlotHandle {
-    fn submit<B, MakeSqe>(self, mut buf: B, make_sqe: MakeSqe) -> InflightOpHandle<B>
+    fn submit<R, MakeSqe>(self, mut buf: R, make_sqe: MakeSqe) -> InflightOpHandle<R>
     where
-        B: ResourcesOwnedByOp + Send + 'static,
-        MakeSqe: FnOnce(&mut B) -> io_uring::squeue::Entry,
+        R: ResourcesOwnedByOp + Send + 'static,
+        MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
     {
         let sqe = make_sqe(&mut buf);
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
@@ -639,8 +639,8 @@ pub(crate) trait ResourcesOwnedByOp {
     fn on_op_completion(self, res: i32) -> Self::OpResult;
 }
 
-impl<B: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<B> {
-    type Output = B::OpResult;
+impl<R: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<R> {
+    type Output = R::OpResult;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -709,9 +709,9 @@ impl<B: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<B> {
     }
 }
 
-impl<B> Drop for InflightOpHandle<B>
+impl<R> Drop for InflightOpHandle<R>
 where
-    B: ResourcesOwnedByOp + Send + 'static,
+    R: ResourcesOwnedByOp + Send + 'static,
 {
     fn drop(&mut self) {
         let cur = std::mem::replace(&mut self.state, InflightOpHandleState::Dropped);
@@ -738,9 +738,9 @@ where
 }
 
 impl UnsafeOpsSlotHandle {
-    fn move_buf_and_slot_ownership_to_system<B>(self, buf: B)
+    fn move_buf_and_slot_ownership_to_system<R>(self, buf: R)
     where
-        B: ResourcesOwnedByOp + Send + 'static,
+        R: ResourcesOwnedByOp + Send + 'static,
     {
         let _buffer_owned: Box<dyn std::any::Any + Send> = Box::new(buf);
         let submit_side = self.submit_side.lock().unwrap();
