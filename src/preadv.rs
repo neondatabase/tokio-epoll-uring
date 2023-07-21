@@ -89,11 +89,11 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        trace!(
-            "polling future in state {:?}",
-            self.state.discriminant_str()
-        );
         loop {
+            trace!(
+                "polling future in state {:?}",
+                self.state.discriminant_str()
+            );
             let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
             match cur {
                 PreadvCompletionFutState::Undefined => {

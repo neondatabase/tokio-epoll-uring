@@ -381,15 +381,23 @@ impl Future for GetOpsSlotFut {
                         }
                     }
                 }
-                GetOpsSlotFutState::EnqueuedWaiter(waiter) => {
-                    tokio::pin!(waiter);
-                    match ready!(waiter.poll(cx)) {
-                    Ok(slot_handle) => {
-                        self.state = GetOpsSlotFutState::ReadyPolled;
-                        return std::task::Poll::Ready(NotInflightSlotHandle { state: NotInflightSlotHandleState::Usable { slot: slot_handle }});
+                GetOpsSlotFutState::EnqueuedWaiter(mut waiter) => {
+                    match {
+                        let waiter = std::pin::Pin::new(&mut waiter);
+                        waiter.poll(cx)
+                    }{
+                        std::task::Poll::Ready(res) => match res {
+                            Ok(slot_handle) => {
+                                self.state = GetOpsSlotFutState::ReadyPolled;
+                                return std::task::Poll::Ready(NotInflightSlotHandle { state: NotInflightSlotHandleState::Usable { slot: slot_handle }});
+                            }
+                            Err(_waiter_dropped) => unreachable!("system dropped before all GetOpsSlotFut were dropped; type system should prevent this"),
+                        },
+                        std::task::Poll::Pending => {
+                            self.state = GetOpsSlotFutState::EnqueuedWaiter(waiter);
+                            return std::task::Poll::Pending;
+                        },
                     }
-                    Err(_waiter_dropped) => unreachable!("system dropped before all GetOpsSlotFut were dropped; type system should prevent this"),
-                }
                 }
                 GetOpsSlotFutState::ReadyPolled => {
                     panic!("must not poll future after observing ready")
