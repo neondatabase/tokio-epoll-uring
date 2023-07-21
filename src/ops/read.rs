@@ -4,7 +4,7 @@ use crate::system::{ResourcesOwnedByKernel, SystemLifecycleManager};
 
 pub(crate) type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
 
-pub(crate) async fn preadv<S, B>(system: S, file: OwnedFd, offset: u64, buf: B) -> PreadvOutput<B>
+pub(crate) async fn read<S, B>(system: S, file: OwnedFd, offset: u64, buf: B) -> PreadvOutput<B>
 where
     S: SystemLifecycleManager,
     B: tokio_uring::buf::IoBufMut + Send,
@@ -16,7 +16,7 @@ where
             submit_side.get_ops_slot()
         })
         .await;
-    let inflight_op_handle = slot_handle.submit(Preadv { file, buf }, |preadv| {
+    let inflight_op_handle = slot_handle.submit(Read { file, buf }, |preadv| {
         io_uring::opcode::Read::new(
             io_uring::types::Fd(preadv.file.as_raw_fd()),
             preadv.buf.stable_mut_ptr(),
@@ -28,7 +28,7 @@ where
     inflight_op_handle.await
 }
 
-struct Preadv<B>
+struct Read<B>
 where
     B: tokio_uring::buf::IoBufMut + Send,
 {
@@ -36,7 +36,7 @@ where
     buf: B,
 }
 
-impl<B> ResourcesOwnedByKernel for Preadv<B>
+impl<B> ResourcesOwnedByKernel for Read<B>
 where
     B: tokio_uring::buf::IoBufMut + Send,
 {

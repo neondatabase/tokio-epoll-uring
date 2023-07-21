@@ -8,11 +8,11 @@ use std::{
 use crate::system::{SubmitSide, SystemHandle};
 use crate::system::{System, SystemLifecycleManager};
 
-pub struct BorrowSystem {
+pub struct SystemLifecycle {
     system_handle: Arc<Mutex<Option<SystemHandle>>>,
 }
 
-impl SystemLifecycleManager for &'_ BorrowSystem {
+impl SystemLifecycleManager for &'_ SystemLifecycle {
     fn with_submit_side<F: FnOnce(Arc<Mutex<SubmitSide>>) -> R, R>(self, f: F) -> R {
         f({
             let guard = self.system_handle.lock().unwrap();
@@ -22,7 +22,7 @@ impl SystemLifecycleManager for &'_ BorrowSystem {
     }
 }
 
-impl Drop for BorrowSystem {
+impl Drop for SystemLifecycle {
     fn drop(&mut self) {
         self.system_handle
             .lock()
@@ -33,7 +33,7 @@ impl Drop for BorrowSystem {
     }
 }
 
-impl BorrowSystem {
+impl SystemLifecycle {
     pub fn new() -> Self {
         Self {
             system_handle: Arc::new(Mutex::new(Some(System::new()))),
@@ -45,6 +45,6 @@ impl BorrowSystem {
         offset: u64,
         buf: B,
     ) -> crate::ops::PreadvOutput<B> {
-        crate::ops::preadv(self, file, offset, buf).await
+        crate::ops::read(self, file, offset, buf).await
     }
 }

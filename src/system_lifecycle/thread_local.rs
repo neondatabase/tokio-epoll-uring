@@ -4,12 +4,12 @@ use std::{
 };
 
 use crate::{
-    ops::{preadv, PreadvOutput},
+    ops::{read, PreadvOutput},
     system::{SubmitSide, SystemHandle, SystemLifecycleManager},
 };
 
 #[derive(Clone, Copy)]
-pub struct ThreadLocalSystem;
+pub struct SystemLifecycle;
 
 enum ThreadLocalStateInner {
     NotUsed,
@@ -22,7 +22,7 @@ thread_local! {
     static THREAD_LOCAL: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState(ThreadLocalStateInner::NotUsed));
 }
 
-impl SystemLifecycleManager for ThreadLocalSystem {
+impl SystemLifecycleManager for SystemLifecycle {
     fn with_submit_side<F: FnOnce(Arc<Mutex<SubmitSide>>) -> R, R>(self, f: F) -> R {
         THREAD_LOCAL.with(|local_state| {
             let mut local_state = local_state.borrow_mut();
@@ -60,12 +60,12 @@ impl Drop for ThreadLocalState {
     }
 }
 
-impl ThreadLocalSystem {
+impl SystemLifecycle {
     pub async fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
         file: OwnedFd,
         offset: u64,
         buf: B,
     ) -> PreadvOutput<B> {
-        preadv(ThreadLocalSystem, file, offset, buf).await
+        read(SystemLifecycle, file, offset, buf).await
     }
 }
