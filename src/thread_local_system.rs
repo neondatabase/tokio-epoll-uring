@@ -1,8 +1,11 @@
-use std::os::fd::OwnedFd;
+use std::{
+    os::fd::OwnedFd,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     preadv::{PreadvCompletionFut, PreadvOutput},
-    rest::{SubmitSide, System, SystemLifecycleManager},
+    rest::{SubmitSide, SystemHandle, SystemLifecycleManager},
 };
 
 #[derive(Clone, Copy)]
@@ -10,7 +13,7 @@ pub struct ThreadLocalSystem;
 
 enum ThreadLocalStateInner {
     NotUsed,
-    Used(System),
+    Used(SystemHandle),
     Dropped,
 }
 struct ThreadLocalState(ThreadLocalStateInner);
@@ -20,7 +23,7 @@ thread_local! {
 }
 
 impl SystemLifecycleManager for ThreadLocalSystem {
-    fn with_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(self, f: F) -> R {
+    fn with_submit_side<F: FnOnce(Arc<Mutex<SubmitSide>>) -> R, R>(self, f: F) -> R {
         THREAD_LOCAL.with(|local_state| {
             let mut local_state = local_state.borrow_mut();
             loop {
@@ -31,9 +34,7 @@ impl SystemLifecycleManager for ThreadLocalSystem {
                         ));
                     }
                     // fast path
-                    ThreadLocalStateInner::Used(system) => {
-                        break f(&mut *system.submit_side.lock().unwrap())
-                    }
+                    ThreadLocalStateInner::Used(system) => break f(system.submit_side.clone()),
                     ThreadLocalStateInner::Dropped => {
                         unreachable!("threat-local can't be dropped while executing")
                     }

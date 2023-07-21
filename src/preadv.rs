@@ -110,9 +110,11 @@ where
                         file,
                         offset,
                         buf,
-                        wakeup: self
-                            .system
-                            .with_submit_side(|submit_side| submit_side.get_ops_slot()),
+                        wakeup: self.system.with_submit_side(|submit_side| {
+                            let mut submit_side_guard = submit_side.lock().unwrap();
+                            let submit_side = submit_side_guard.must_open();
+                            submit_side.get_ops_slot()
+                        }),
                     };
                     continue;
                 }

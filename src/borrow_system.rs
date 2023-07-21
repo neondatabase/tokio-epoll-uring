@@ -5,38 +5,42 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::preadv::{PreadvCompletionFut, PreadvOutput};
+use crate::{
+    preadv::{PreadvCompletionFut, PreadvOutput},
+    rest::{SubmitSide, SystemHandle},
+};
 
-use crate::rest::{SubmitSide, System, SystemLifecycleManager};
+use crate::rest::{System, SystemLifecycleManager};
 
 pub struct BorrowSystem {
-    system: Arc<Mutex<Option<System>>>,
+    system_handle: Arc<Mutex<Option<SystemHandle>>>,
 }
 
 impl SystemLifecycleManager for &'_ BorrowSystem {
-    fn with_submit_side<F: FnOnce(&mut SubmitSide) -> R, R>(self, f: F) -> R {
-        f(&mut *self
-            .system
-            .lock()
-            .unwrap()
-            .as_mut()
-            .expect("not Drop'ed yet")
-            .submit_side
-            .lock()
-            .unwrap())
+    fn with_submit_side<F: FnOnce(Arc<Mutex<SubmitSide>>) -> R, R>(self, f: F) -> R {
+        f({
+            let guard = self.system_handle.lock().unwrap();
+            let guard = guard.as_ref().unwrap();
+            guard.submit_side.clone()
+        })
     }
 }
 
 impl Drop for BorrowSystem {
     fn drop(&mut self) {
-        self.system.lock().unwrap().take().unwrap().shutdown();
+        self.system_handle
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .shutdown();
     }
 }
 
 impl BorrowSystem {
     pub fn new() -> Self {
         Self {
-            system: Arc::new(Mutex::new(Some(System::new()))),
+            system_handle: Arc::new(Mutex::new(Some(System::new()))),
         }
     }
     pub fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
