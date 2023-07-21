@@ -34,12 +34,15 @@ impl System {
 
         // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
         let (waiters_tx, waiters_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ops = Arc::new(Mutex::new(Ops {
-            id,
-            storage: array_macro::array![_ => None; RING_SIZE as usize],
-            unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
-            waiters_rx,
-        }));
+        let ops = Arc::new_cyclic(|myself| {
+            Mutex::new(Ops {
+                id,
+                storage: array_macro::array![_ => None; RING_SIZE as usize],
+                unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
+                waiters_rx,
+                myself: Weak::clone(&myself),
+            })
+        });
         let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
         let uring_fd = unsafe { (*uring).as_raw_fd() };
         let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
@@ -207,9 +210,11 @@ struct Ops {
     unused_indices: Vec<usize>,
     waiters_rx:
         tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
+    myself: Weak<Mutex<Ops>>,
 }
 
 impl Ops {
+    // TODO: why do we need the submit_side here?
     fn return_slot_and_wake(&mut self, submit_side: Arc<Mutex<SubmitSideInner>>, idx: usize) {
         assert!(self.storage[idx].is_none());
         loop {
@@ -220,6 +225,7 @@ impl Ops {
                 Ok(waiter) => {
                     match waiter.send(UnsafeOpsSlotHandle {
                         submit_side: Arc::clone(&submit_side),
+                        ops: Weak::upgrade(&self.myself).expect("we're executing on myself"),
                         idx,
                     }) {
                         Ok(()) => {
@@ -233,7 +239,8 @@ impl Ops {
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    panic!("SubmitSide got dropped while there were pending ops; we drain it, this shouldn't happen")
+                    // submit side is plugged already
+                    break;
                 }
             }
         }
@@ -315,8 +322,10 @@ pub struct NotInflightSlotHandle {
 }
 
 struct UnsafeOpsSlotHandle {
-    submit_side: Arc<Mutex<SubmitSideInner>>,
+    ops: Arc<Mutex<Ops>>,
     idx: usize,
+    // only used in some modes
+    submit_side: Arc<Mutex<SubmitSideInner>>,
 }
 
 enum NotInflightSlotHandleState {
@@ -365,12 +374,17 @@ impl Future for GetOpsSlotFut {
                     match ops_guard.unused_indices.pop() {
                         Some(idx) => {
                             drop(ops_guard);
+                            let ops = Arc::clone(&submit_side_open.ops);
                             drop(submit_side_open);
                             drop(submit_side_guard);
                             self.state = GetOpsSlotFutState::ReadyPolled;
                             return std::task::Poll::Ready(NotInflightSlotHandle {
                                 state: NotInflightSlotHandleState::Usable {
-                                    slot: UnsafeOpsSlotHandle { submit_side, idx },
+                                    slot: UnsafeOpsSlotHandle {
+                                        submit_side,
+                                        ops,
+                                        idx,
+                                    },
                                 },
                             });
                         }
@@ -545,13 +559,15 @@ impl UnsafeOpsSlotHandle {
 
 impl UnsafeOpsSlotHandle {
     fn return_slot_and_wake(self) {
-        let UnsafeOpsSlotHandle { submit_side, idx } = self;
-        let mut submit_side_guard = submit_side.lock().unwrap();
-        let submit_side_open = submit_side_guard.must_open();
-        let mut ops_guard = submit_side_open.ops.lock().unwrap();
+        let UnsafeOpsSlotHandle {
+            submit_side,
+            ops,
+            idx,
+        } = self;
+        let mut ops_guard = ops.lock().unwrap();
         assert!(ops_guard.storage[idx].is_some());
         ops_guard.storage[idx] = None;
-        ops_guard.return_slot_and_wake(Arc::clone(&submit_side), self.idx);
+        ops_guard.return_slot_and_wake(submit_side, self.idx);
         drop(ops_guard);
     }
 }
@@ -591,9 +607,7 @@ enum OwnedSlotPollResult {
 
 impl UnsafeOpsSlotHandle {
     fn poll(self, cx: &mut std::task::Context<'_>) -> OwnedSlotPollResult {
-        let mut submit_side_guard = self.submit_side.lock().unwrap();
-        let submit_side_open = submit_side_guard.must_open();
-        let mut ops_guard = submit_side_open.ops.lock().unwrap();
+        let mut ops_guard = self.ops.lock().unwrap();
         let op_state = &mut ops_guard.storage[self.idx];
         let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
 
@@ -611,8 +625,6 @@ impl UnsafeOpsSlotHandle {
                 drop(op_state_inner);
                 drop(op_state);
                 drop(ops_guard);
-                drop(submit_side_open);
-                drop(submit_side_guard);
                 return OwnedSlotPollResult::Pending(self);
             }
             OpStateInner::PendingButFutureDropped { .. } => {
@@ -625,8 +637,6 @@ impl UnsafeOpsSlotHandle {
                 trace!("op is ready, returning resources to user");
                 drop(op_state_inner);
                 drop(ops_guard);
-                drop(submit_side_open);
-                drop(submit_side_guard);
                 // important to drop the ops_guard to avoid deadlock in return_slot_and_wake
                 self.return_slot_and_wake();
                 return OwnedSlotPollResult::Ready(res);
