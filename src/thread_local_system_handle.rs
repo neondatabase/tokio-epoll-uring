@@ -1,8 +1,7 @@
-
 use crate::system::{SubmitSide, SubmitSideProvider, SystemHandle};
 
 #[derive(Clone, Copy)]
-pub struct SystemLifecycle;
+pub struct ThreadLocalSystemHandle;
 
 enum ThreadLocalStateInner {
     NotUsed,
@@ -15,7 +14,7 @@ thread_local! {
     static THREAD_LOCAL: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState(ThreadLocalStateInner::NotUsed));
 }
 
-impl SubmitSideProvider for SystemLifecycle {
+impl SubmitSideProvider for ThreadLocalSystemHandle {
     fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
         THREAD_LOCAL.with(|local_state| {
             let mut local_state = local_state.borrow_mut();
@@ -23,7 +22,7 @@ impl SubmitSideProvider for SystemLifecycle {
                 match &mut local_state.0 {
                     ThreadLocalStateInner::NotUsed => {
                         *local_state = ThreadLocalState(ThreadLocalStateInner::Used(
-                            crate::system::System::new(),
+                            crate::system::System::launch(),
                         ));
                     }
                     // fast path
@@ -52,3 +51,4 @@ impl Drop for ThreadLocalState {
         }
     }
 }
+

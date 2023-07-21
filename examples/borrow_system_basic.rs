@@ -13,10 +13,11 @@ async fn main() {
         file.write_all(&[42u8].repeat(1024)).unwrap();
         file.write_all(&[67u8].repeat(1024)).unwrap();
     }
-    let system = tokio_io_uring_eventfd_bridge::system_lifecycle::BorrowBased::new();
+    let system_handle = tokio_io_uring_eventfd_bridge::launch_owned();
 
     let buf = vec![0; 2048];
-    let (_, buf, res) = tokio_io_uring_eventfd_bridge::read(&system, file.into(), 512, buf).await;
+    let (_, buf, res) =
+        tokio_io_uring_eventfd_bridge::read(&system_handle, file.into(), 512, buf).await;
     let read = res.unwrap();
     assert_eq!(read, 2048, "not expecting short read");
     assert_eq!(&buf[0..512], &[23u8; 512]);

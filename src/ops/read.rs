@@ -2,9 +2,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::system::{ResourcesOwnedByKernel, SubmitSideProvider};
 
-pub type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
-
-pub async fn read<S, B>(submit_provider: S, file: OwnedFd, offset: u64, buf: B) -> PreadvOutput<B>
+pub async fn read<S, B>(submit_provider: S, file: OwnedFd, offset: u64, buf: B) -> (OwnedFd, B, std::io::Result<usize>)
 where
     S: SubmitSideProvider,
     B: tokio_uring::buf::IoBufMut + Send,

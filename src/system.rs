@@ -21,13 +21,13 @@ unsafe impl Send for System {}
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
 unsafe impl Sync for System {}
 
-pub(crate) struct SystemHandle {
+pub struct SystemHandle {
     pub(crate) submit_side: SubmitSide,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl System {
-    pub(crate) fn new() -> SystemHandle {
+    pub(crate) fn launch() -> SystemHandle {
         static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -84,23 +84,34 @@ impl System {
 
 impl SystemHandle {
     // TODO: use compile-time tricks to ensure the system is always `shutdown()` and never Dropped.
-    pub fn shutdown(self) {
+    pub fn shutdown(self) -> tokio::sync::oneshot::Receiver<()> {
         let SystemHandle {
             submit_side,
             shutdown_tx,
         } = self;
         drop(submit_side);
-        drop(shutdown_tx); // this will cause the poller task to shut down
+        let (shutdown_done_tx, shutdown_done_rx) = tokio::sync::oneshot::channel();
+        shutdown_tx
+            .send(shutdown_done_tx)
+            .expect("poller task already dead, shouldn't happen");
+        shutdown_done_rx
     }
 }
 
-mod private {
-    pub trait Sealed {}
-    impl Sealed for &'_ crate::system_lifecycle::BorrowBased {}
-    impl Sealed for crate::system_lifecycle::ThreadLocal {}
+// mod private {
+//     pub trait Sealed {}
+//     impl Sealed for &'_ crate::system_lifecycle::BorrowBased {}
+//     impl Sealed for crate::system_lifecycle::ThreadLocal {}
+//     impl Sealed for &'_ super::SystemHandle {}
+// }
+
+impl SubmitSideProvider for &'_ SystemHandle {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
+        f(self.submit_side.clone())
+    }
 }
 
-pub trait SubmitSideProvider: private::Sealed + Unpin + Copy {
+pub trait SubmitSideProvider: Unpin {
     fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R;
 }
 
@@ -779,15 +790,15 @@ fn setup_poller_task(
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
-    shutdown: tokio::sync::oneshot::Receiver<()>,
+    shutdown: tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>,
 ) {
     let _ = tokio::task::spawn(async move {
         scopeguard::defer!({
             info!("poller task is exiting");
         });
-        let give_back_cq_on_drop = {
-            |system, cq| {
-                scopeguard::guard((system, cq), move |(system, completion_side)| {
+        let give_back_completion_side_on_drop = {
+            |system, cq, shutdown_done_tx| {
+                scopeguard::guard((system, cq, shutdown_done_tx), move |(system, completion_side, shutdown_done_tx)| {
                     tracing::info!("poller task shutdown guard spawning shutdown thread");
                     std::thread::Builder::new().name("shutdown-thread".to_owned()).spawn(move || {
                         tracing::info!("poller task shutdown thread start");
@@ -872,11 +883,14 @@ fn setup_poller_task(
 
                         // Drop the IoUring struct, cleaning up the underlying kernel resources.
                         drop(uring);
+
+                        drop(shutdown_done_tx);
                     }).unwrap();
                 })
             }
         };
-        let mut cq = Some(give_back_cq_on_drop(system, completion_side));
+        #[allow(unused_assignments)]
+        let mut shutdown_guard = Some(give_back_completion_side_on_drop(system, completion_side, None));
 
         info!(
             "launching poller task on thread id {:?}",
@@ -894,9 +908,24 @@ fn setup_poller_task(
                     ready_res = fd.ready(tokio::io::Interest::READABLE) => {
                         ready_res.unwrap()
                     }
-                    _ = &mut shutdown  => {
+                    shutdown_done_tx = &mut shutdown  => {
+                        let shutdown_done_tx = match shutdown_done_tx {
+                            Ok(shutdown_done_tx) => Some(shutdown_done_tx),
+                            Err(_no_intereset) =>None,
+                        };
                         trace!("poller task got shutdown signal");
-                        return; // shutdown_guard will do the cleanup
+                        let (system, unprotected_cq_arc, x) =
+                            scopeguard::ScopeGuard::into_inner(shutdown_guard.take().unwrap());
+                        #[allow(unused_assignments)]
+                        if x.is_some() {
+                            // this branch should never be taken because we only receive shutdown signal once.
+                            // But, just in case, restore the shutdown guard first
+                            shutdown_guard = Some(give_back_completion_side_on_drop(system, unprotected_cq_arc, x));
+                            panic!("implementation error");
+                        } else {
+                            shutdown_guard = Some(give_back_completion_side_on_drop(system, unprotected_cq_arc, Some(shutdown_done_tx)));
+                            return;
+                        }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                         is_timeout_wakeup = true;
@@ -911,8 +940,8 @@ fn setup_poller_task(
                 break;
             }
 
-            let (system, unprotected_cq_arc) =
-                scopeguard::ScopeGuard::into_inner(cq.take().unwrap());
+            let (system, unprotected_cq_arc, shutdown_done) =
+                scopeguard::ScopeGuard::into_inner(shutdown_guard.take().unwrap());
             let mut unprotected_cq = unprotected_cq_arc.lock().unwrap();
             unprotected_cq.process_completions(); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
             if is_timeout_wakeup {
@@ -940,7 +969,7 @@ fn setup_poller_task(
                 );
             }
             drop(unprotected_cq);
-            cq = Some(give_back_cq_on_drop(system, unprotected_cq_arc));
+            shutdown_guard = Some(give_back_completion_side_on_drop(system, unprotected_cq_arc, shutdown_done));
         }
     }.instrument(info_span!(parent: None, "poller_task", system=id )));
 }
@@ -959,5 +988,47 @@ impl SubmitSide {
         };
         let slot = slot_fut.await;
         slot.submit(rsrc, make_sqe).await
+    }
+}
+
+#[cfg(test)]
+mod submit_side_tests {
+    use crate::SubmitSideProvider;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_ongoing_ops() {
+        let system = crate::launch_shared();
+        let slot = system
+            .clone()
+            .with_submit_side(|submit_side| {
+                let mut guard = submit_side.0.lock().unwrap();
+                let guard = guard.must_open();
+                guard.get_ops_slot()
+            })
+            .await;
+
+        struct MockOp {}
+        impl super::ResourcesOwnedByKernel for MockOp {
+            type OpResult = ();
+            fn on_op_completion(self, _res: i32) -> Self::OpResult {}
+        }
+        let submit_fut = slot.submit(MockOp {}, |_| io_uring::opcode::Nop::new().build());
+        let shutdown_done = system.shutdown();
+        tokio::pin!(shutdown_done);
+        tokio::select! {
+            // TODO don't rely on timing
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            _ = &mut shutdown_done => {
+                panic!("shutdown should not complete until submit_fut is done");
+            }
+        }
+        let _: () = submit_fut.await;
+        tokio::select! {
+            // TODO don't rely on timing
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                panic!("shutdown should complete after submit_fut is done");
+            }
+            _ = &mut shutdown_done => { }
+        }
     }
 }
