@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+use either::Either;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use tracing::{debug, info, info_span, trace, Instrument};
 
@@ -22,6 +23,7 @@ unsafe impl Send for System {}
 unsafe impl Sync for System {}
 
 pub struct SystemHandle {
+    id: usize,
     pub(crate) submit_side: SubmitSide,
     shutdown_tx: tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>,
 }
@@ -79,6 +81,7 @@ impl System {
             shutdown_rx,
         );
         SystemHandle {
+            id,
             submit_side: SubmitSide(submit_side),
             shutdown_tx,
         }
@@ -89,14 +92,18 @@ impl SystemHandle {
     // TODO: use compile-time tricks to ensure the system is always `shutdown()` and never Dropped.
     pub fn shutdown(self) -> tokio::sync::oneshot::Receiver<()> {
         let SystemHandle {
+            id,
             submit_side,
             shutdown_tx,
         } = self;
-        drop(submit_side);
         let (shutdown_done_tx, shutdown_done_rx) = tokio::sync::oneshot::channel();
-        shutdown_tx
-            .send(shutdown_done_tx)
-            .expect("poller task already dead, shouldn't happen");
+        match shutdown_tx.send(shutdown_done_tx) {
+            Ok(()) => (),
+            Err(e) => {
+                panic!("poller task already dead, shouldn't happen (system={id}): {e:?}");
+            }
+        }
+        drop(submit_side);
         shutdown_done_rx
     }
 }
@@ -800,17 +807,14 @@ fn setup_poller_task(
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
-    shutdown: tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>,
+    mut shutdown: tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>,
 ) {
     let _ = tokio::task::spawn(async move {
-        scopeguard::defer!({
-            info!("poller task is exiting");
-        });
         let give_back_completion_side_on_drop = {
-            |system, cq, shutdown_done_tx| {
-                scopeguard::guard((system, cq, shutdown_done_tx), move |(system, completion_side, shutdown_done_tx)| {
-                    tracing::info!("poller task shutdown guard spawning shutdown thread");
+            |system, cq, shutdown: Option<Either<tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>, tokio::sync::oneshot::Sender<()>>>| {
+                scopeguard::guard((system, cq, shutdown), move |(system, completion_side, shutdown)| {
                     std::thread::Builder::new().name("shutdown-thread".to_owned()).spawn(move || {
+                        let _entered = info_span!("shutdown-thread", system=id).entered();
                         tracing::info!("poller task shutdown thread start");
                         scopeguard::defer_on_success! {tracing::info!("poller task shutdown thread end")};
                         scopeguard::defer_on_unwind! {tracing::error!("poller task shutdown thread panic")};
@@ -894,7 +898,20 @@ fn setup_poller_task(
                         // Drop the IoUring struct, cleaning up the underlying kernel resources.
                         drop(uring);
 
-                        drop(shutdown_done_tx);
+                        // We keep shutdown_rx alive until here so that users can subscribe to shutdown progress
+                        // until we've really torn down everything. In some situation, it's just nice to be able
+                        // to wait that everything is gone.
+                        match shutdown {
+                            Some(Either::Left(mut shutdown_rx)) => {
+                                if let Ok(signal) = shutdown_rx.try_recv() {
+                                    let _ = signal.send(());
+                                }
+                            }
+                            Some(Either::Right(shutdown_tx)) => {
+                                let _ = shutdown_tx.send(());
+                            },
+                            None => (),
+                        }
                     }).unwrap();
                 })
             }
@@ -902,12 +919,8 @@ fn setup_poller_task(
         #[allow(unused_assignments)]
         let mut shutdown_guard = Some(give_back_completion_side_on_drop(system, completion_side, None));
 
-        info!(
-            "launching poller task on thread id {:?}",
-            std::thread::current().id()
-        );
+        info!("launching poller task");
 
-        tokio::pin!(shutdown);
         let fd = tokio::io::unix::AsyncFd::new(uring_fd).unwrap();
         loop {
             let mut is_timeout_wakeup;
@@ -920,8 +933,8 @@ fn setup_poller_task(
                     }
                     shutdown_done_tx = &mut shutdown  => {
                         let shutdown_done_tx = match shutdown_done_tx {
-                            Ok(shutdown_done_tx) => Some(shutdown_done_tx),
-                            Err(_no_intereset) =>None,
+                            Ok(shutdown_done_tx) => Either::Right(shutdown_done_tx),
+                            Err(_no_intereset) => Either::Left(shutdown),
                         };
                         trace!("poller task got shutdown signal");
                         let (system, unprotected_cq_arc, x) =
