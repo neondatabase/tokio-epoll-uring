@@ -51,4 +51,3 @@ impl Drop for ThreadLocalState {
         }
     }
 }
-
