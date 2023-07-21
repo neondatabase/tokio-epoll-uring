@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     ops::{preadv, PreadvOutput},
-    rest::{SubmitSide, SystemHandle, SystemLifecycleManager},
+    system::{SubmitSide, SystemHandle, SystemLifecycleManager},
 };
 
 #[derive(Clone, Copy)]
@@ -30,7 +30,7 @@ impl SystemLifecycleManager for ThreadLocalSystem {
                 match &mut local_state.0 {
                     ThreadLocalStateInner::NotUsed => {
                         *local_state = ThreadLocalState(ThreadLocalStateInner::Used(
-                            crate::rest::System::new(),
+                            crate::system::System::new(),
                         ));
                     }
                     // fast path

@@ -5,8 +5,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::rest::{SubmitSide, SystemHandle};
-use crate::rest::{System, SystemLifecycleManager};
+use crate::system::{SubmitSide, SystemHandle};
+use crate::system::{System, SystemLifecycleManager};
 
 pub struct BorrowSystem {
     system_handle: Arc<Mutex<Option<SystemHandle>>>,

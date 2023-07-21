@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::rest::{ResourcesOwnedByKernel, SystemLifecycleManager};
+use crate::system::{ResourcesOwnedByKernel, SystemLifecycleManager};
 
 pub(crate) type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
 
