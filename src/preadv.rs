@@ -6,7 +6,7 @@ use std::{
 
 use tracing::trace;
 
-use crate::rest::{ResourcesOwnedByOp, GetOpsSlotFut, InflightOpHandle, SystemTrait};
+use crate::rest::{GetOpsSlotFut, InflightOpHandle, ResourcesOwnedByOp, SystemTrait};
 
 enum PreadvCompletionFutState<B>
 where
