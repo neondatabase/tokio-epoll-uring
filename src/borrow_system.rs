@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::preadv::{PreadvOutput, PreadvCompletionFut};
+use crate::preadv::{PreadvCompletionFut, PreadvOutput};
 
 use crate::rest::{SubmitSide, System, SystemTrait};
 

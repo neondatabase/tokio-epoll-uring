@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::AsRawFd,
     sync::{Arc, Mutex, Weak},
     task::ready,
 };
@@ -436,7 +436,7 @@ impl Future for GetOpsSlotFut {
     }
 }
 
-pub struct InflightOpHandle<B: tokio_uring::buf::IoBufMut + Send> {
+pub(crate) struct InflightOpHandle<B: ResourcesOwnedByOp + Send + 'static> {
     buf: Option<B>, // beocmes None in `drop()`, Some otherwise
     state: InflightOpHandleState,
 }
@@ -448,7 +448,7 @@ enum InflightOpHandleState {
         poll_count: usize,
     },
     ReadyButYieldingToExecutorForFairness {
-        result: std::io::Result<usize>,
+        result: i32,
     },
     ReadyPolled,
     Dropped,
@@ -457,7 +457,7 @@ enum InflightOpHandleState {
 impl NotInflightSlotHandle {
     pub(crate) fn submit<B, MakeSqe>(mut self, buf: B, make_sqe: MakeSqe) -> InflightOpHandle<B>
     where
-        B: tokio_uring::buf::IoBufMut + Send + 'static,
+        B: ResourcesOwnedByOp + Send + 'static,
         MakeSqe: FnOnce(&mut B) -> io_uring::squeue::Entry,
     {
         let cur = std::mem::replace(&mut self.state, NotInflightSlotHandleState::Used);
@@ -472,7 +472,7 @@ impl NotInflightSlotHandle {
 impl UnsafeOpsSlotHandle {
     fn submit<B, MakeSqe>(self, mut buf: B, make_sqe: MakeSqe) -> InflightOpHandle<B>
     where
-        B: tokio_uring::buf::IoBufMut + Send + 'static,
+        B: ResourcesOwnedByOp + Send + 'static,
         MakeSqe: FnOnce(&mut B) -> io_uring::squeue::Entry,
     {
         let sqe = make_sqe(&mut buf);
@@ -634,8 +634,13 @@ impl UnsafeOpsSlotHandle {
     }
 }
 
-impl<B: tokio_uring::buf::IoBufMut + Send> Future for InflightOpHandle<B> {
-    type Output = (B, std::io::Result<usize>);
+pub(crate) trait ResourcesOwnedByOp {
+    type OpResult;
+    fn on_op_completion(self, res: i32) -> Self::OpResult;
+}
+
+impl<B: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<B> {
+    type Output = B::OpResult;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -662,15 +667,8 @@ impl<B: tokio_uring::buf::IoBufMut + Send> Future for InflightOpHandle<B> {
 
                 let mut buf_mut =
                     unsafe { self.as_mut().map_unchecked_mut(|myself| &mut myself.buf) };
-                let mut buf = buf_mut.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
+                let buf = buf_mut.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
                 drop(buf_mut);
-                // https://man.archlinux.org/man/io_uring_prep_read.3.en
-                let res = if res < 0 {
-                    Err(std::io::Error::from_raw_os_error(-res))
-                } else {
-                    unsafe { buf.set_init(res as usize) };
-                    Ok(res as usize)
-                };
 
                 lazy_static::lazy_static! {
                     static ref YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: bool =
@@ -701,11 +699,11 @@ impl<B: tokio_uring::buf::IoBufMut + Send> Future for InflightOpHandle<B> {
                     }
                 }
                 self.state = InflightOpHandleState::ReadyPolled;
-                return std::task::Poll::Ready((buf, res));
+                return std::task::Poll::Ready(buf.on_op_completion(res));
             }
             InflightOpHandleState::ReadyButYieldingToExecutorForFairness { result } => {
                 self.state = InflightOpHandleState::ReadyPolled;
-                return std::task::Poll::Ready((self.buf.take().unwrap(), result));
+                return std::task::Poll::Ready(self.buf.take().unwrap().on_op_completion(result));
             }
         }
     }
@@ -713,7 +711,7 @@ impl<B: tokio_uring::buf::IoBufMut + Send> Future for InflightOpHandle<B> {
 
 impl<B> Drop for InflightOpHandle<B>
 where
-    B: tokio_uring::buf::IoBufMut + Send,
+    B: ResourcesOwnedByOp + Send + 'static,
 {
     fn drop(&mut self) {
         let cur = std::mem::replace(&mut self.state, InflightOpHandleState::Dropped);
@@ -742,7 +740,7 @@ where
 impl UnsafeOpsSlotHandle {
     fn move_buf_and_slot_ownership_to_system<B>(self, buf: B)
     where
-        B: tokio_uring::buf::IoBufMut + Send + 'static,
+        B: ResourcesOwnedByOp + Send + 'static,
     {
         let _buffer_owned: Box<dyn std::any::Any + Send> = Box::new(buf);
         let submit_side = self.submit_side.lock().unwrap();

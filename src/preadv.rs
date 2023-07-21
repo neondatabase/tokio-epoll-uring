@@ -6,7 +6,7 @@ use std::{
 
 use tracing::trace;
 
-use crate::rest::{GetOpsSlotFut, InflightOpHandle, SystemTrait};
+use crate::rest::{ResourcesOwnedByOp, GetOpsSlotFut, InflightOpHandle, SystemTrait};
 
 enum PreadvCompletionFutState<B>
 where
@@ -15,15 +15,16 @@ where
     Created {
         file: OwnedFd,
         offset: u64,
+        buf: B,
     },
     WaitingForOpSlot {
         file: OwnedFd,
         offset: u64,
+        buf: B,
         wakeup: GetOpsSlotFut,
     },
     Submitted {
-        file: OwnedFd,
-        inflight_op_handle: InflightOpHandle<B>,
+        inflight_op_handle: InflightOpHandle<Preadv<B>>,
     },
     ReadyPolled,
     Undefined,
@@ -33,26 +34,49 @@ where
 pub(crate) struct PreadvCompletionFut<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> {
     system: S,
     state: PreadvCompletionFutState<B>,
-    buf: Option<B>, // beocmes None in `drop()`, Some otherwise
-    // make it !Send because the `idx` is thread-local
-    _types: std::marker::PhantomData<B>,
 }
 
 impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<S, B> {
     pub fn new(system: S, file: OwnedFd, offset: u64, buf: B) -> Self {
         PreadvCompletionFut {
             system,
-            buf: Some(buf),
-            _types: std::marker::PhantomData,
-            state: PreadvCompletionFutState::Created { file, offset },
+            state: PreadvCompletionFutState::Created { file, offset, buf },
         }
+    }
+}
+
+struct Preadv<B>
+where
+    B: tokio_uring::buf::IoBufMut + Send,
+{
+    file: OwnedFd,
+    buf: B,
+}
+
+impl<B> ResourcesOwnedByOp for Preadv<B>
+where
+    B: tokio_uring::buf::IoBufMut + Send,
+{
+    type OpResult = (OwnedFd, B, std::io::Result<usize>);
+
+    fn on_op_completion(mut self, res: i32) -> Self::OpResult {
+        // https://man.archlinux.org/man/io_uring_prep_read.3.en
+        let res = if res < 0 {
+            Err(std::io::Error::from_raw_os_error(-res))
+        } else {
+            unsafe { tokio_uring::buf::IoBufMut::set_init(&mut self.buf, res as usize) };
+            Ok(res as usize)
+        };
+        (self.file, self.buf, res)
     }
 }
 
 pub(crate) type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
 
-impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
-    for PreadvCompletionFut<S, B>
+impl<S, B> std::future::Future for PreadvCompletionFut<S, B>
+where
+    S: SystemTrait,
+    B: tokio_uring::buf::IoBufMut + Send,
 {
     type Output = PreadvOutput<B>;
 
@@ -76,10 +100,11 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
                 PreadvCompletionFutState::ReadyPolled => {
                     panic!("must not poll future after observing ready")
                 }
-                PreadvCompletionFutState::Created { file, offset } => {
+                PreadvCompletionFutState::Created { file, offset, buf } => {
                     self.state = PreadvCompletionFutState::WaitingForOpSlot {
                         file,
                         offset,
+                        buf,
                         wakeup: self
                             .system
                             .with_submit_side(|submit_side| submit_side.get_ops_slot()),
@@ -88,6 +113,7 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
                 }
                 PreadvCompletionFutState::WaitingForOpSlot {
                     mut wakeup,
+                    buf,
                     file,
                     offset,
                 } => {
@@ -97,24 +123,17 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
                     } {
                         std::task::Poll::Ready(slot_handle) => {
                             trace!("was woken up from waiting for an available op slot");
-                            let mut buf = self.buf.take().unwrap();
-                            let iov = libc::iovec {
-                                iov_base: buf.stable_mut_ptr() as *mut libc::c_void,
-                                iov_len: buf.bytes_total(),
-                            };
-                            let inflight_op_handle = slot_handle.submit(buf, |buf| {
-                                io_uring::opcode::Readv::new(
-                                    io_uring::types::Fd(file.as_raw_fd()),
-                                    &iov as *const _,
-                                    1,
-                                )
-                                .offset(offset)
-                                .build()
-                            });
-                            self.state = PreadvCompletionFutState::Submitted {
-                                file,
-                                inflight_op_handle,
-                            };
+                            let inflight_op_handle =
+                                slot_handle.submit(Preadv { file, buf }, |preadv| {
+                                    io_uring::opcode::Read::new(
+                                        io_uring::types::Fd(preadv.file.as_raw_fd()),
+                                        preadv.buf.stable_mut_ptr(),
+                                        preadv.buf.bytes_total() as _,
+                                    )
+                                    .offset(offset)
+                                    .build()
+                                });
+                            self.state = PreadvCompletionFutState::Submitted { inflight_op_handle };
                             continue; // so we poll for Submitted
                         }
                         std::task::Poll::Pending => {
@@ -122,6 +141,7 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
                             self.state = PreadvCompletionFutState::WaitingForOpSlot {
                                 file,
                                 offset,
+                                buf,
                                 wakeup,
                             };
                             return std::task::Poll::Pending;
@@ -129,7 +149,6 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
                     }
                 }
                 PreadvCompletionFutState::Submitted {
-                    file,
                     mut inflight_op_handle,
                 } => {
                     trace!("checking op state to see if it's ready, storing waker in it if not");
@@ -137,15 +156,12 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
                         let pinned = Pin::new(&mut inflight_op_handle);
                         pinned.poll(cx)
                     } {
-                        std::task::Poll::Ready((buf, res)) => {
+                        std::task::Poll::Ready(output) => {
                             self.state = PreadvCompletionFutState::ReadyPolled;
-                            return std::task::Poll::Ready((file, buf, res));
+                            return std::task::Poll::Ready(output);
                         }
                         std::task::Poll::Pending => {
-                            self.state = PreadvCompletionFutState::Submitted {
-                                file,
-                                inflight_op_handle,
-                            };
+                            self.state = PreadvCompletionFutState::Submitted { inflight_op_handle };
                             return std::task::Poll::Pending;
                         }
                     }
