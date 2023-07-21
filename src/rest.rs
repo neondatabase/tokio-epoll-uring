@@ -179,7 +179,8 @@ enum OpStateInner {
         waker: Option<std::task::Waker>, // None if it hasn't been polled yet
     },
     PendingButFutureDropped {
-        _buffer_owned: Box<dyn std::any::Any + Send>,
+        /// When a future gets dropped while the Op is still running, it gets Box'ed  This is a Box'ed `ResourcesOwnedByKernel`
+        resources_owned_by_kernel: Box<dyn std::any::Any + Send>,
     },
     ReadyButFutureDropped,
     Ready {
@@ -226,11 +227,14 @@ impl SendSyncCompletionQueue {
                         waker.wake();
                     }
                 }
-                OpStateInner::PendingButFutureDropped { _buffer_owned } => {
+                OpStateInner::PendingButFutureDropped {
+                    resources_owned_by_kernel,
+                } => {
                     *op_state_inner = OpStateInner::ReadyButFutureDropped;
                     drop(op_state_inner);
                     *op_state = None;
                     drop(op_state);
+                    drop(resources_owned_by_kernel);
                     let submit_side = Weak::upgrade(&self.submit_side)
                         .expect("completion gets shut down after submission");
                     ops_guard.return_slot_and_wake(submit_side, idx as usize);
@@ -436,33 +440,33 @@ impl Future for GetOpsSlotFut {
     }
 }
 
-pub(crate) struct InflightOpHandle<R: ResourcesOwnedByOp + Send + 'static> {
-    buf: Option<R>, // beocmes None in `drop()`, Some otherwise
+pub(crate) struct InflightOpHandle<R: ResourcesOwnedByKernel + Send + 'static> {
+    resources_owned_by_kernel: Option<R>, // beocmes None in `drop()`, Some otherwise
     state: InflightOpHandleState,
 }
 
 enum InflightOpHandleState {
     Undefined,
-    Submitted {
+    Inflight {
         slot: UnsafeOpsSlotHandle,
         poll_count: usize,
     },
-    ReadyButYieldingToExecutorForFairness {
+    DoneButYieldingToExecutorForFairness {
         result: i32,
     },
-    ReadyPolled,
+    DoneAndPolled,
     Dropped,
 }
 
 impl NotInflightSlotHandle {
-    pub(crate) fn submit<R, MakeSqe>(mut self, buf: R, make_sqe: MakeSqe) -> InflightOpHandle<R>
+    pub(crate) fn submit<R, MakeSqe>(mut self, rsrc: R, make_sqe: MakeSqe) -> InflightOpHandle<R>
     where
-        R: ResourcesOwnedByOp + Send + 'static,
+        R: ResourcesOwnedByKernel + Send + 'static,
         MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
     {
         let cur = std::mem::replace(&mut self.state, NotInflightSlotHandleState::Used);
         match cur {
-            NotInflightSlotHandleState::Usable { slot } => slot.submit(buf, make_sqe),
+            NotInflightSlotHandleState::Usable { slot } => slot.submit(rsrc, make_sqe),
             NotInflightSlotHandleState::Used => unreachable!("implementation error"),
             NotInflightSlotHandleState::Dropped => unreachable!("implementation error"),
         }
@@ -470,12 +474,12 @@ impl NotInflightSlotHandle {
 }
 
 impl UnsafeOpsSlotHandle {
-    fn submit<R, MakeSqe>(self, mut buf: R, make_sqe: MakeSqe) -> InflightOpHandle<R>
+    fn submit<R, MakeSqe>(self, mut rsrc: R, make_sqe: MakeSqe) -> InflightOpHandle<R>
     where
-        R: ResourcesOwnedByOp + Send + 'static,
+        R: ResourcesOwnedByKernel + Send + 'static,
         MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
     {
-        let sqe = make_sqe(&mut buf);
+        let sqe = make_sqe(&mut rsrc);
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
 
         let mut submit_side_guard = self.submit_side.lock().unwrap();
@@ -538,8 +542,8 @@ impl UnsafeOpsSlotHandle {
         }
         drop(submit_side_guard);
         InflightOpHandle {
-            buf: Some(buf),
-            state: InflightOpHandleState::Submitted {
+            resources_owned_by_kernel: Some(rsrc),
+            state: InflightOpHandleState::Inflight {
                 slot: self,
                 poll_count: 0,
             },
@@ -623,7 +627,7 @@ impl UnsafeOpsSlotHandle {
                 unreachable!("if it's dropped, it's not pollable")
             }
             OpStateInner::Ready { result: res } => {
-                trace!("op is ready, returning file and buffer to user");
+                trace!("op is ready, returning resources to user");
                 drop(op_state_inner);
                 drop(ops_guard);
                 drop(submit_side);
@@ -634,12 +638,12 @@ impl UnsafeOpsSlotHandle {
     }
 }
 
-pub(crate) trait ResourcesOwnedByOp {
+pub(crate) trait ResourcesOwnedByKernel {
     type OpResult;
     fn on_op_completion(self, res: i32) -> Self::OpResult;
 }
 
-impl<R: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<R> {
+impl<R: ResourcesOwnedByKernel + Send + Unpin> Future for InflightOpHandle<R> {
     type Output = R::OpResult;
 
     fn poll(
@@ -649,15 +653,15 @@ impl<R: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<R> {
         let cur = std::mem::replace(&mut self.state, InflightOpHandleState::Undefined);
         match cur {
             InflightOpHandleState::Undefined => unreachable!("implementation error"),
-            InflightOpHandleState::ReadyPolled => {
+            InflightOpHandleState::DoneAndPolled => {
                 panic!("must not poll future after observing ready")
             }
             InflightOpHandleState::Dropped => unreachable!("implementation error"),
-            InflightOpHandleState::Submitted { slot, poll_count } => {
+            InflightOpHandleState::Inflight { slot, poll_count } => {
                 let res = match slot.poll(cx) {
                     OwnedSlotPollResult::Ready(res) => res,
                     OwnedSlotPollResult::Pending(slot) => {
-                        self.state = InflightOpHandleState::Submitted {
+                        self.state = InflightOpHandleState::Inflight {
                             slot,
                             poll_count: poll_count + 1,
                         };
@@ -665,10 +669,12 @@ impl<R: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<R> {
                     }
                 };
 
-                let mut buf_mut =
-                    unsafe { self.as_mut().map_unchecked_mut(|myself| &mut myself.buf) };
-                let buf = buf_mut.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
-                drop(buf_mut);
+                let mut rsrc_mut = unsafe {
+                    self.as_mut()
+                        .map_unchecked_mut(|myself| &mut myself.resources_owned_by_kernel)
+                };
+                let rsrc = rsrc_mut.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
+                drop(rsrc_mut);
 
                 lazy_static::lazy_static! {
                     static ref YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: bool =
@@ -686,10 +692,10 @@ impl<R: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<R> {
                     match fut.poll(cx) {
                         std::task::Poll::Pending => {
                             self.state =
-                                InflightOpHandleState::ReadyButYieldingToExecutorForFairness {
+                                InflightOpHandleState::DoneButYieldingToExecutorForFairness {
                                     result: res,
                                 };
-                            let replaced = self.buf.replace(buf);
+                            let replaced = self.resources_owned_by_kernel.replace(rsrc);
                             assert!(replaced.is_none(), "we just took it above");
                             return std::task::Poll::Pending;
                         }
@@ -698,12 +704,17 @@ impl<R: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<R> {
                         }
                     }
                 }
-                self.state = InflightOpHandleState::ReadyPolled;
-                return std::task::Poll::Ready(buf.on_op_completion(res));
+                self.state = InflightOpHandleState::DoneAndPolled;
+                return std::task::Poll::Ready(rsrc.on_op_completion(res));
             }
-            InflightOpHandleState::ReadyButYieldingToExecutorForFairness { result } => {
-                self.state = InflightOpHandleState::ReadyPolled;
-                return std::task::Poll::Ready(self.buf.take().unwrap().on_op_completion(result));
+            InflightOpHandleState::DoneButYieldingToExecutorForFairness { result } => {
+                self.state = InflightOpHandleState::DoneAndPolled;
+                return std::task::Poll::Ready(
+                    self.resources_owned_by_kernel
+                        .take()
+                        .unwrap()
+                        .on_op_completion(result),
+                );
             }
         }
     }
@@ -711,7 +722,7 @@ impl<R: ResourcesOwnedByOp + Send + Unpin> Future for InflightOpHandle<R> {
 
 impl<R> Drop for InflightOpHandle<R>
 where
-    R: ResourcesOwnedByOp + Send + 'static,
+    R: ResourcesOwnedByKernel + Send + 'static,
 {
     fn drop(&mut self) {
         let cur = std::mem::replace(&mut self.state, InflightOpHandleState::Dropped);
@@ -720,48 +731,47 @@ where
             InflightOpHandleState::Dropped => {
                 unreachable!("future is in dropped state, but we're in drop() right now")
             }
-            InflightOpHandleState::ReadyPolled => (),
-            InflightOpHandleState::ReadyButYieldingToExecutorForFairness { .. } => (),
-            InflightOpHandleState::Submitted {
+            InflightOpHandleState::DoneAndPolled => (),
+            InflightOpHandleState::DoneButYieldingToExecutorForFairness { .. } => (),
+            InflightOpHandleState::Inflight {
                 slot,
                 poll_count: _,
             } => {
-                // buffer must be kept alive until the operation is complete, even if we lose interest
-                let buf = self
-                    .buf
-                    .take()
-                    .expect("we only take() during drop, which is here");
-                slot.move_buf_and_slot_ownership_to_system(buf);
-            }
-        }
-    }
-}
-
-impl UnsafeOpsSlotHandle {
-    fn move_buf_and_slot_ownership_to_system<R>(self, buf: R)
-    where
-        R: ResourcesOwnedByOp + Send + 'static,
-    {
-        let _buffer_owned: Box<dyn std::any::Any + Send> = Box::new(buf);
-        let submit_side = self.submit_side.lock().unwrap();
-        let mut ops_guard = submit_side.ops.lock().unwrap();
-        let op_state = &mut ops_guard.storage[self.idx];
-        let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
-        let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
-        match cur {
-            OpStateInner::Undefined => unreachable!("implementation error"),
-            OpStateInner::Pending { .. } => {
-                *op_state_inner = OpStateInner::PendingButFutureDropped { _buffer_owned };
-                drop(op_state_inner);
-            }
-            OpStateInner::PendingButFutureDropped { .. } => {
-                unreachable!("implementation error")
-            }
-            OpStateInner::Ready { .. } => {
-                unreachable!("implementation error")
-            }
-            OpStateInner::ReadyButFutureDropped => {
-                unreachable!("implementation error")
+                let submit_side = slot.submit_side.lock().unwrap();
+                let mut ops_guard = submit_side.ops.lock().unwrap();
+                let op_state = &mut ops_guard.storage[slot.idx];
+                let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
+                let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
+                match cur {
+                    OpStateInner::Undefined => unreachable!("implementation error"),
+                    OpStateInner::Pending { .. } => {
+                        // Up until now, Self held the resources that the uring op is operating on.
+                        // Now Self is getting dropped, but the uring op is still ongoing.
+                        // We must prevent the resources from getting dropped, otherwise the kernel will operate on the dropped resource.
+                        // NB: the most concerning resource is the memory buffer into which a read-style uring op will write / from which a write-style uring will read.
+                        let rsrc = self
+                            .resources_owned_by_kernel
+                            .take()
+                            .expect("we only take() during drop, which is here");
+                        // Use Box for type erasure.
+                        // Type erasure is necessary because the ResourcesOwnedByKernel trait has an associated type "OpResult",
+                        // and we don't want the system to be generic over it.
+                        // Since dropping of inflight IOs is generally rare, the allocations should be fine.
+                        // Could optimize by making erause a trait method on ResourcesOwnedByKernel; it could then use a slab allcoator or similar.
+                        let rsrc: Box<dyn std::any::Any + Send> = Box::new(rsrc);
+                        *op_state_inner = OpStateInner::PendingButFutureDropped {
+                            resources_owned_by_kernel: rsrc,
+                        };
+                        drop(op_state_inner);
+                    }
+                    OpStateInner::Ready { .. } => {} // drop the work on the floor
+                    OpStateInner::PendingButFutureDropped { .. } => {
+                        unreachable!("above is the only transition into this state, and this function only runs once")
+                    }
+                    OpStateInner::ReadyButFutureDropped => {
+                        unreachable!("this is the future, and it's dropping, but not yet dropped");
+                    }
+                }
             }
         }
     }

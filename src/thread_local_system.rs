@@ -1,6 +1,9 @@
 use std::os::fd::OwnedFd;
 
-use crate::{rest::{SubmitSide, System, SystemTrait}, preadv::{PreadvOutput, PreadvCompletionFut}};
+use crate::{
+    preadv::{PreadvCompletionFut, PreadvOutput},
+    rest::{SubmitSide, System, SystemTrait},
+};
 
 #[derive(Clone, Copy)]
 pub struct ThreadLocalSystem;

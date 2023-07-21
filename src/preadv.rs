@@ -6,7 +6,7 @@ use std::{
 
 use tracing::trace;
 
-use crate::rest::{GetOpsSlotFut, InflightOpHandle, ResourcesOwnedByOp, SystemTrait};
+use crate::rest::{GetOpsSlotFut, InflightOpHandle, ResourcesOwnedByKernel, SystemTrait};
 
 enum PreadvCompletionFutState<B>
 where
@@ -53,7 +53,7 @@ where
     buf: B,
 }
 
-impl<B> ResourcesOwnedByOp for Preadv<B>
+impl<B> ResourcesOwnedByKernel for Preadv<B>
 where
     B: tokio_uring::buf::IoBufMut + Send,
 {
