@@ -1,43 +1,58 @@
 use std::{
+    future::Future,
     os::fd::{AsRawFd, OwnedFd},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    pin::Pin,
+    sync::{Arc, Mutex, Weak},
+    task::ready,
 };
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use tracing::{info, trace};
 
-enum PreadvCompletionFutState {
+enum PreadvCompletionFutState<B>
+where
+    B: tokio_uring::buf::IoBufMut + Send,
+{
+    Created {
+        file: OwnedFd,
+        offset: u64,
+    },
     WaitingForOpSlot {
         file: OwnedFd,
         offset: u64,
-        wakeup: Option<tokio::sync::oneshot::Receiver<(Weak<Mutex<SubmitSide>>, usize)>>,
+        wakeup: GetOpsSlotFut,
     },
     Submitted {
-        sq: Arc<Mutex<SubmitSide>>,
-        ops: Arc<Mutex<Ops>>,
-        idx: usize, // into the preallocated_completions
-        poll_count: usize,
-    },
-    ReadyButYieldingToExecutorForFairness {
         file: OwnedFd,
-        result: std::io::Result<usize>,
+        inflight_op_handle: InflightOpHandle<B>,
     },
     ReadyPolled,
     Undefined,
     Dropped,
 }
 
-impl PreadvCompletionFutState {
+impl<B> PreadvCompletionFutState<B>
+where
+    B: tokio_uring::buf::IoBufMut + Send,
+{
     fn discriminant_str(&self) -> &'static str {
         match self {
             PreadvCompletionFutState::WaitingForOpSlot { wakeup, .. } => match wakeup {
-                Some(_) => "waiting_for_op_slot(Some)",
-                None => "waiting_for_op_slot(None)",
+                GetOpsSlotFut {
+                    state: GetOpsSlotFutState::Undefined,
+                } => "waiting_for_op_slot(Undefined)",
+                GetOpsSlotFut {
+                    state: GetOpsSlotFutState::NotPolled { .. },
+                } => "waiting_for_op_slot(NotPolled)",
+                GetOpsSlotFut {
+                    state: GetOpsSlotFutState::EnqueuedWaiter(_),
+                } => "waiting_for_op_slot(EnqueuedWaiter)",
+                GetOpsSlotFut {
+                    state: GetOpsSlotFutState::ReadyPolled,
+                } => "waiting_for_op_slot(ReadyPolled)",
             },
+            PreadvCompletionFutState::Created { .. } => "created",
             PreadvCompletionFutState::Submitted { .. } => "submitted",
-            PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness { .. } => {
-                "ready_but_yielding_to_executor_for_fairness"
-            }
             PreadvCompletionFutState::ReadyPolled => "ready_polled",
             PreadvCompletionFutState::Undefined => "undefined",
             PreadvCompletionFutState::Dropped => "dropped",
@@ -117,7 +132,7 @@ impl System {
                 .user_data(u64::MAX);
             match {
                 let submit_side = &mut *submit_side.lock().unwrap();
-                submit_side.submit(entry)
+                submit_side.submit_raw(entry)
             } {
                 Ok(_) => break,
                 Err(SubmitError::QueueFull) => {
@@ -210,7 +225,7 @@ pub(crate) trait SystemTrait: Unpin + Copy {
 
 pub(crate) struct PreadvCompletionFut<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> {
     system: S,
-    state: PreadvCompletionFutState,
+    state: PreadvCompletionFutState<B>,
     buf: Option<B>, // beocmes None in `drop()`, Some otherwise
     // make it !Send because the `idx` is thread-local
     _types: std::marker::PhantomData<B>,
@@ -221,7 +236,6 @@ struct OpState(Mutex<OpStateInner>);
 enum OpStateInner {
     Undefined,
     Pending {
-        file_currently_owned_by_kernel: OwnedFd,
         waker: Option<std::task::Waker>, // None if it hasn't been polled yet
     },
     PendingButFutureDropped {
@@ -229,7 +243,6 @@ enum OpStateInner {
     },
     ReadyButFutureDropped,
     Ready {
-        file_ready_to_be_taken_back: OwnedFd,
         result: i32,
     },
 }
@@ -240,155 +253,8 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> PreadvCompletionFut<S
             system,
             buf: Some(buf),
             _types: std::marker::PhantomData,
-            state: PreadvCompletionFutState::WaitingForOpSlot {
-                file,
-                offset,
-                wakeup: None,
-            },
+            state: PreadvCompletionFutState::Created { file, offset },
         }
-    }
-    fn ty_get_ops_slot(&mut self) -> bool {
-        let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Undefined);
-        let PreadvCompletionFutState::WaitingForOpSlot { file, offset , wakeup } = cur  else {
-            panic!("implementation error");
-        };
-        assert!(
-            wakeup.is_none(),
-            "if wakeup is Some, we should be polling this future"
-        );
-        self.system.with_submit_side(move |mut submit_side| {
-            let (ops_guard, idx) = loop {
-                let mut ops_guard = submit_side.ops();
-                match ops_guard.unused_indices.pop() {
-                    Some(idx) => break (ops_guard, idx),
-                    None => {
-                        // all slots are taken.
-                        // do some opportunistic completion processing to wake up futures that will release ops slots
-                        // then yield to executor
-                        drop(ops_guard); // so that  process_completions() can take it
-
-                        lazy_static::lazy_static! {
-                            static ref PROCESS_URING_ON_QUEUE_FULL: bool =
-                                std::env::var("PROCESS_URING_ON_QUEUE_FULL")
-                                    .map(|v| v == "1")
-                                    .unwrap_or_else(|e| match e {
-                                        std::env::VarError::NotPresent => false,
-                                        std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
-                                    });
-                        }
-                        if *PROCESS_URING_ON_QUEUE_FULL {
-                            submit_side.submitter.submit().unwrap();
-                            match submit_side.cq.lock().unwrap().process_completions() {
-                                Ok(()) => (),
-                                Err(ProcessCompletionsErr::PoisonPill) => {
-                                    unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent")
-                                }
-                            }
-                        }
-                        let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
-                        match submit_side.waiters_tx.send(wake_up_tx) {
-                            Ok(()) => (),
-                            Err(tokio::sync::mpsc::error::SendError(_)) => {
-                                todo!("can this happen? poller would be dead")
-                            }
-                        }
-                        self.state = PreadvCompletionFutState::WaitingForOpSlot {
-                            file,
-                            offset,
-                            wakeup: Some(wake_up_rx),
-                        };
-                        return false;
-                    }
-                }
-            };
-            drop(ops_guard);
-            self.got_ops_slot(idx, &mut submit_side, file, offset);
-            return true;
-        })
-    }
-    fn got_ops_slot(
-        &mut self,
-        idx: usize,
-        submit_side: &mut SubmitSide,
-        file: OwnedFd,
-        offset: u64,
-    ) -> bool {
-        let buf = self.buf.as_mut().unwrap();
-
-        let iov = libc::iovec {
-            iov_base: buf.stable_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.bytes_total(),
-        };
-
-        let sqe = io_uring::opcode::Readv::new(
-            io_uring::types::Fd(file.as_raw_fd()),
-            &iov as *const _,
-            1,
-        )
-        .offset(offset)
-        .build()
-        .user_data(idx.try_into().unwrap());
-
-        let mut ops_guard = submit_side.ops();
-        assert!(ops_guard.storage[idx].is_none());
-        ops_guard.storage[idx] = Some(OpState(Mutex::new(OpStateInner::Pending {
-            waker: None,
-            file_currently_owned_by_kernel: file,
-        })));
-        drop(ops_guard); // to remove mut borrow on submit_side, needed for .submit()
-
-        lazy_static::lazy_static! {
-            static ref PROCESS_URING_ON_SUBMIT: bool =
-                std::env::var("PROCESS_URING_ON_SUBMIT")
-                    .map(|v| v == "1")
-                    .unwrap_or_else(|e| match e {
-                        std::env::VarError::NotPresent => false,
-                        std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_SUBMIT must be a unicode string"),
-                    });
-        }
-
-        // if we're going to process completions immediately, get the lock on the CQ so that
-        // we are guaranteed to process completions before the poller task
-        {
-            let mut cq_owned = None;
-            let cq_guard = if *PROCESS_URING_ON_SUBMIT {
-                let cq = Arc::clone(&submit_side.cq);
-                cq_owned = Some(cq);
-                Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
-            } else {
-                None
-            };
-            assert_eq!(cq_owned.is_none(), cq_guard.is_none());
-
-            match submit_side.submit(sqe) {
-                Ok(()) => {}
-                Err(SubmitError::QueueFull) => {
-                    unreachable!("the preallocated_completions has same size as the SQ")
-                }
-            }
-
-            if let Some(mut cq) = cq_guard {
-                assert!(*PROCESS_URING_ON_SUBMIT);
-                // opportunistically process completion immediately
-                // TODO do it during ::poll() as well?
-                match cq.process_completions() {
-                    Ok(()) => {}
-                    Err(ProcessCompletionsErr::PoisonPill) => {
-                        unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
-                    }
-                }
-            } else {
-                assert!(!*PROCESS_URING_ON_SUBMIT);
-            }
-        }
-
-        self.state = PreadvCompletionFutState::Submitted {
-            sq: Weak::upgrade(&submit_side.myself).expect("we're executing on myself"),
-            ops: Arc::clone(&submit_side.ops),
-            idx,
-            poll_count: 0,
-        };
-        return true;
     }
 }
 
@@ -419,179 +285,80 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> std::future::Future
                 PreadvCompletionFutState::ReadyPolled => {
                     panic!("must not poll future after observing ready")
                 }
+                PreadvCompletionFutState::Created { file, offset } => {
+                    self.state = PreadvCompletionFutState::WaitingForOpSlot {
+                        file,
+                        offset,
+                        wakeup: self
+                            .system
+                            .with_submit_side(|submit_side| submit_side.get_ops_slot()),
+                    };
+                    continue;
+                }
                 PreadvCompletionFutState::WaitingForOpSlot {
                     mut wakeup,
                     file,
                     offset,
-                } => match wakeup.take() {
-                    Some(mut wakeup) => {
-                        match {
-                            let wakeup = std::pin::Pin::new(&mut wakeup);
-                            wakeup.poll(cx)
-                        } {
-                            std::task::Poll::Ready(res) => {
-                                trace!("was woken up from waiting for an available op slot");
-                                match res {
-                                    Ok((submit_side, idx)) => {
-                                        let submit_side = Weak::upgrade(&submit_side).unwrap(); // TODO: verify unwrap?
-                                        self.got_ops_slot(
-                                            idx,
-                                            &mut submit_side.lock().unwrap(),
-                                            file,
-                                            offset,
-                                        );
-                                        assert!(matches!(
-                                            self.state,
-                                            PreadvCompletionFutState::Submitted { .. }
-                                        ));
-                                        continue; // So we opportunistically poll for Submitted
-                                    }
-                                    Err(_sender_dropped) => {
-                                        // the waiters_rx got dropped, or, our wakeup request got dropped
-                                        todo!("can the poller task die before a future?")
-                                    }
-                                }
-                            }
-                            std::task::Poll::Pending => {
-                                trace!("not woken up to check for an available op slot yet");
-                                self.state = PreadvCompletionFutState::WaitingForOpSlot {
-                                    file,
-                                    offset,
-                                    wakeup: Some(wakeup),
-                                };
-                                return std::task::Poll::Pending;
-                            }
-                        }
-                    }
-                    None => {
-                        self.state = PreadvCompletionFutState::WaitingForOpSlot {
-                            file,
-                            offset,
-                            wakeup: None,
-                        };
-                        if self.ty_get_ops_slot() {
-                            assert!(matches!(
-                                self.state,
-                                PreadvCompletionFutState::Submitted { .. }
-                            ));
-                            continue; // So we opportunistically poll for Submitted
-                        } else {
-                            assert!(matches!(
-                                self.state,
-                                PreadvCompletionFutState::WaitingForOpSlot {
-                                    wakeup: Some(_),
-                                    ..
-                                }
-                            ));
-                            continue; // So we poll the wakeup, and get the right waker if it's not done by the time we poll
-                        }
-                    }
-                },
-                PreadvCompletionFutState::Submitted {
-                    sq,
-                    ops,
-                    idx,
-                    poll_count,
                 } => {
-                    trace!("checking op state to see if it's ready, storing waker in it if not");
-
-                    let mut ops_guard = ops.lock().unwrap();
-                    let op_state = &mut ops_guard.storage[idx];
-                    let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
-
-                    let cur: OpStateInner =
-                        std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
-                    match cur {
-                        OpStateInner::Undefined => panic!("future is in undefined state"),
-                        OpStateInner::Pending {
-                            file_currently_owned_by_kernel,
-                            waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
-                        } => {
-                            trace!("op is still pending, storing waker in it");
-
-                            *op_state_inner = OpStateInner::Pending {
-                                file_currently_owned_by_kernel,
-                                waker: Some(cx.waker().clone()),
+                    match {
+                        let wakeup = std::pin::Pin::new(&mut wakeup);
+                        wakeup.poll(cx)
+                    } {
+                        std::task::Poll::Ready(slot_handle) => {
+                            trace!("was woken up from waiting for an available op slot");
+                            let mut buf = self.buf.take().unwrap();
+                            let iov = libc::iovec {
+                                iov_base: buf.stable_mut_ptr() as *mut libc::c_void,
+                                iov_len: buf.bytes_total(),
                             };
-                            drop(op_state_inner);
-                            drop(op_state);
-                            drop(ops_guard);
+                            let inflight_op_handle =
+                                slot_handle.submit(buf, |buf| {
+                                    io_uring::opcode::Readv::new(
+                                        io_uring::types::Fd(file.as_raw_fd()),
+                                        &iov as *const _,
+                                        1,
+                                    )
+                                    .offset(offset)
+                                    .build()
+                                });
                             self.state = PreadvCompletionFutState::Submitted {
-                                sq,
-                                ops,
-                                idx,
-                                poll_count: poll_count + 1,
+                                file,
+                                inflight_op_handle,
+                            };
+                            continue; // so we poll for Submitted
+                        }
+                        std::task::Poll::Pending => {
+                            trace!("not woken up to check for an available op slot yet");
+                            self.state = PreadvCompletionFutState::WaitingForOpSlot {
+                                file,
+                                offset,
+                                wakeup,
                             };
                             return std::task::Poll::Pending;
                         }
-                        OpStateInner::PendingButFutureDropped { .. } => {
-                            unreachable!("if it's dropped, it's not pollable")
-                        }
-                        OpStateInner::ReadyButFutureDropped => {
-                            unreachable!("if it's dropped, it's not pollable")
-                        }
-                        OpStateInner::Ready {
-                            result: res,
-                            file_ready_to_be_taken_back,
-                        } => {
-                            trace!("op is ready, returning file and buffer to user");
-
-                            drop(op_state_inner);
-                            *op_state = None;
-                            ops_guard.return_slot_and_wake(Arc::downgrade(&sq), idx);
-                            drop(ops_guard);
-                            let mut buf_mut = unsafe {
-                                self.as_mut().map_unchecked_mut(|myself| &mut myself.buf)
-                            };
-                            let mut buf = buf_mut.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
-                            drop(buf_mut);
-                            // https://man.archlinux.org/man/io_uring_prep_read.3.en
-                            let res = if res < 0 {
-                                Err(std::io::Error::from_raw_os_error(-res))
-                            } else {
-                                unsafe { buf.set_init(res as usize) };
-                                Ok(res as usize)
-                            };
-
-                            lazy_static::lazy_static! {
-                                static ref YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: bool =
-                                    std::env::var("YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL")
-                                        .map(|v| v == "1")
-                                        .unwrap_or_else(|e| match e {
-                                            std::env::VarError::NotPresent => false,
-                                            std::env::VarError::NotUnicode(_) => panic!("YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL must be a unicode string"),
-                                        });
-                            }
-
-                            if poll_count == 0 && *YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
-                                let fut = tokio::task::yield_now();
-                                tokio::pin!(fut);
-                                match fut.poll(cx) {
-                                    std::task::Poll::Pending => {
-                                        self.state = PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness {
-                                            file: file_ready_to_be_taken_back,
-                                            result: res,
-                                        };
-                                        let replaced = self.buf.replace(buf);
-                                        assert!(replaced.is_none(), "we just took it above");
-                                        return std::task::Poll::Pending;
-                                    }
-                                    std::task::Poll::Ready(()) => {
-                                        // fallthrough
-                                    }
-                                }
-                            }
-                            self.state = PreadvCompletionFutState::ReadyPolled;
-                            return std::task::Poll::Ready((file_ready_to_be_taken_back, buf, res));
-                        }
                     }
                 }
-                PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness {
+                PreadvCompletionFutState::Submitted {
                     file,
-                    result,
+                    mut inflight_op_handle,
                 } => {
-                    self.state = PreadvCompletionFutState::ReadyPolled;
-                    return std::task::Poll::Ready((file, self.buf.take().unwrap(), result));
+                    trace!("checking op state to see if it's ready, storing waker in it if not");
+                    match {
+                        let pinned = Pin::new(&mut inflight_op_handle);
+                        pinned.poll(cx)
+                    } {
+                        std::task::Poll::Ready((buf, res)) => {
+                            self.state = PreadvCompletionFutState::ReadyPolled;
+                            return std::task::Poll::Ready((file, buf, res));
+                        }
+                        std::task::Poll::Pending => {
+                            self.state = PreadvCompletionFutState::Submitted {
+                                file,
+                                inflight_op_handle,
+                            };
+                            return std::task::Poll::Pending;
+                        }
+                    }
                 }
             }
         }
@@ -606,46 +373,13 @@ impl<S: SystemTrait, B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvComple
             PreadvCompletionFutState::Dropped => {
                 unreachable!("future is in dropped state, but we're in drop() right now")
             }
+            PreadvCompletionFutState::Created { .. } => (),
             PreadvCompletionFutState::WaitingForOpSlot { .. } => (),
             PreadvCompletionFutState::ReadyPolled => (),
-            PreadvCompletionFutState::ReadyButYieldingToExecutorForFairness { .. } => (),
             PreadvCompletionFutState::Submitted {
-                sq,
-                ops,
-                idx,
-                poll_count: _,
+                inflight_op_handle, ..
             } => {
-                let mut ops_guard = ops.lock().unwrap();
-                let op_state = &mut ops_guard.storage[idx];
-                let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
-
-                let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
-                match cur {
-                    OpStateInner::Undefined => {
-                        unreachable!("operation is in undefined state")
-                    }
-                    OpStateInner::Ready { .. } => {
-                        drop(op_state_inner);
-                        *op_state = None;
-                        ops_guard.return_slot_and_wake(Arc::downgrade(&sq), idx);
-                    }
-                    OpStateInner::Pending { .. } => {
-                        // keep the buffer alive by storing it in `ops`
-                        let buf = self
-                            .buf
-                            .take()
-                            .expect("we only take() during drop, which is here");
-                        // we can't have B as a type parameter in the preallocated_completions, drop it
-                        let _buffer_owned: Box<dyn std::any::Any + Send> = Box::new(buf);
-                        *op_state_inner = OpStateInner::PendingButFutureDropped { _buffer_owned };
-                    }
-                    OpStateInner::PendingButFutureDropped { .. } => {
-                        unreachable!("future is being dropped right now")
-                    }
-                    OpStateInner::ReadyButFutureDropped => {
-                        unreachable!("we are only dropping now, completion handler can't ahve observed us in PendingButFutureDropped state")
-                    }
-                }
+                drop(inflight_op_handle) // dropping moves ownership of the buffer from inflight_op_handle to the OpState
             }
         }
     }
@@ -681,13 +415,9 @@ impl SendSyncCompletionQueue {
             let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
             match cur {
                 OpStateInner::Undefined => unreachable!("implementation error"),
-                OpStateInner::Pending {
-                    file_currently_owned_by_kernel,
-                    waker,
-                } => {
+                OpStateInner::Pending { waker } => {
                     *op_state_inner = OpStateInner::Ready {
                         result: cqe.result(),
-                        file_ready_to_be_taken_back: file_currently_owned_by_kernel,
                     };
                     drop(op_state_inner);
                     if let Some(waker) = waker {
@@ -699,7 +429,9 @@ impl SendSyncCompletionQueue {
                     drop(op_state_inner);
                     *op_state = None;
                     drop(op_state);
-                    ops_guard.return_slot_and_wake(Weak::clone(&self.submit_side), idx as usize);
+                    let submit_side = Weak::upgrade(&self.submit_side)
+                        .expect("completion gets shut down after submission");
+                    ops_guard.return_slot_and_wake(submit_side, idx as usize);
                 }
                 OpStateInner::ReadyButFutureDropped => {
                     unreachable!("can't be ready twice")
@@ -723,29 +455,28 @@ impl SendSyncCompletionQueue {
 struct Ops {
     storage: [Option<OpState>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
-    waiters_rx: tokio::sync::mpsc::UnboundedReceiver<
-        tokio::sync::oneshot::Sender<(Weak<Mutex<SubmitSide>>, usize)>,
-    >,
+    waiters_rx:
+        tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
 }
 
 impl Ops {
-    fn return_slot_and_wake(&mut self, submit_side: Weak<Mutex<SubmitSide>>, idx: usize) {
+    fn return_slot_and_wake(&mut self, submit_side: Arc<Mutex<SubmitSide>>, idx: usize) {
         assert!(self.storage[idx].is_none());
-        let mut submit_side_loop_var = Some(submit_side);
         loop {
             match self.waiters_rx.try_recv() {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                     break;
                 }
                 Ok(waiter) => {
-                    let submit_side = submit_side_loop_var.take().unwrap();
-                    match waiter.send((submit_side, idx)) {
+                    match waiter.send(UnsafeOpsSlotHandle {
+                        submit_side: Arc::clone(&submit_side),
+                        idx,
+                    }) {
                         Ok(()) => {
                             trace!("handed `idx` to a waiter");
                             return;
                         }
-                        Err((submit_side, _idx)) => {
-                            submit_side_loop_var = Some(submit_side);
+                        Err(_) => {
                             // the future requesting wakeup got dropped. wake up next one
                             continue;
                         }
@@ -769,9 +500,8 @@ pub(crate) struct SubmitSide {
     ops: Arc<Mutex<Ops>>,
     // wake_poller_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     cq: Arc<Mutex<SendSyncCompletionQueue>>,
-    waiters_tx: tokio::sync::mpsc::UnboundedSender<
-        tokio::sync::oneshot::Sender<(Weak<Mutex<SubmitSide>>, usize)>,
-    >,
+    waiters_tx:
+        tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
     myself: Weak<Mutex<SubmitSide>>,
 }
 
@@ -781,12 +511,256 @@ pub(crate) enum SubmitError {
     QueueFull,
 }
 
+pub struct GetOpsSlotFut {
+    state: GetOpsSlotFutState,
+}
+enum GetOpsSlotFutState {
+    Undefined,
+    NotPolled { submit_side: Arc<Mutex<SubmitSide>> },
+    EnqueuedWaiter(tokio::sync::oneshot::Receiver<UnsafeOpsSlotHandle>),
+    ReadyPolled,
+}
+
+pub struct NotInflightSlotHandle {
+    state: NotInflightSlotHandleState,
+}
+
+struct UnsafeOpsSlotHandle {
+    submit_side: Arc<Mutex<SubmitSide>>,
+    idx: usize,
+}
+
+enum NotInflightSlotHandleState {
+    Usable { slot: UnsafeOpsSlotHandle },
+    Used,
+    Dropped,
+}
+
 impl SubmitSide {
-    /// Take `&mut self` so that we can't submit() while holding ops guard, which doesn't make sense generally.
-    fn ops(&mut self) -> MutexGuard<'_, Ops> {
-        self.ops.lock().unwrap()
+    pub fn get_ops_slot(&mut self) -> GetOpsSlotFut {
+        return GetOpsSlotFut {
+            state: GetOpsSlotFutState::NotPolled {
+                submit_side: Weak::upgrade(&self.myself).expect("we're executing on myself"),
+            },
+        };
     }
-    fn submit(&mut self, sqe: io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
+}
+
+impl Future for GetOpsSlotFut {
+    type Output = NotInflightSlotHandle;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let cur = std::mem::replace(&mut self.state, GetOpsSlotFutState::Undefined);
+        match cur {
+            GetOpsSlotFutState::Undefined => unreachable!("implementation error"),
+            GetOpsSlotFutState::NotPolled { submit_side } => {
+                let submit_side_guard = submit_side.lock().unwrap();
+                let mut ops_guard = submit_side_guard.ops.lock().unwrap();
+                match ops_guard.unused_indices.pop() {
+                    Some(idx) => {
+                        drop(ops_guard);
+                        drop(submit_side_guard);
+                        self.state = GetOpsSlotFutState::ReadyPolled;
+                        return std::task::Poll::Ready(NotInflightSlotHandle {
+                            state: NotInflightSlotHandleState::Usable {
+                                slot: UnsafeOpsSlotHandle { submit_side, idx },
+                            },
+                        });
+                    }
+                    None => {
+                        // all slots are taken.
+                        // do some opportunistic completion processing to wake up futures that will release ops slots
+                        // then yield to executor
+                        drop(ops_guard); // so that  process_completions() can take it
+
+                        lazy_static::lazy_static! {
+                            static ref PROCESS_URING_ON_QUEUE_FULL: bool =
+                                std::env::var("PROCESS_URING_ON_QUEUE_FULL")
+                                    .map(|v| v == "1")
+                                    .unwrap_or_else(|e| match e {
+                                        std::env::VarError::NotPresent => false,
+                                        std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
+                                    });
+                        }
+                        if *PROCESS_URING_ON_QUEUE_FULL {
+                            submit_side_guard.submitter.submit().unwrap();
+                            match submit_side_guard.cq.lock().unwrap().process_completions() {
+                                Ok(()) => (),
+                                Err(ProcessCompletionsErr::PoisonPill) => {
+                                    unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent")
+                                }
+                            }
+                        }
+                        let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
+                        match submit_side_guard.waiters_tx.send(wake_up_tx) {
+                            Ok(()) => (),
+                            Err(tokio::sync::mpsc::error::SendError(_)) => {
+                                todo!("can this happen? poller would be dead")
+                            }
+                        }
+                        self.state = GetOpsSlotFutState::EnqueuedWaiter(wake_up_rx);
+                        return std::task::Poll::Pending;
+                    }
+                }
+            }
+            GetOpsSlotFutState::EnqueuedWaiter(waiter) => {
+                tokio::pin!(waiter);
+                match ready!(waiter.poll(cx)) {
+                    Ok(slot_handle) => {
+                        self.state = GetOpsSlotFutState::ReadyPolled;
+                        std::task::Poll::Ready(NotInflightSlotHandle { state: NotInflightSlotHandleState::Usable { slot: slot_handle }})
+                    }
+                    Err(_waiter_dropped) => unreachable!("system dropped before all GetOpsSlotFut were dropped; type system should prevent this"),
+                }
+            }
+            GetOpsSlotFutState::ReadyPolled => {
+                panic!("must not poll future after observing ready")
+            }
+        }
+    }
+}
+
+struct InflightOpHandle<B: tokio_uring::buf::IoBufMut + Send> {
+    buf: Option<B>, // beocmes None in `drop()`, Some otherwise
+    state: InflightOpHandleState,
+}
+
+enum InflightOpHandleState {
+    Undefined,
+    Submitted {
+        slot: UnsafeOpsSlotHandle,
+        poll_count: usize,
+    },
+    ReadyButYieldingToExecutorForFairness {
+        result: std::io::Result<usize>,
+    },
+    ReadyPolled,
+    Dropped,
+}
+
+impl NotInflightSlotHandle {
+    fn submit<B, MakeSqe>(mut self, buf: B, make_sqe: MakeSqe) -> InflightOpHandle<B>
+    where
+        B: tokio_uring::buf::IoBufMut + Send + 'static,
+        MakeSqe: FnOnce(&mut B) -> io_uring::squeue::Entry,
+    {
+        let cur = std::mem::replace(&mut self.state, NotInflightSlotHandleState::Used);
+        match cur {
+            NotInflightSlotHandleState::Usable { slot } => slot.submit(buf, make_sqe),
+            NotInflightSlotHandleState::Used => unreachable!("implementation error"),
+            NotInflightSlotHandleState::Dropped => unreachable!("implementation error"),
+        }
+    }
+}
+
+impl UnsafeOpsSlotHandle {
+    fn submit<B, MakeSqe>(self, mut buf: B, make_sqe: MakeSqe) -> InflightOpHandle<B>
+    where
+        B: tokio_uring::buf::IoBufMut + Send + 'static,
+        MakeSqe: FnOnce(&mut B) -> io_uring::squeue::Entry,
+    {
+        let sqe = make_sqe(&mut buf);
+        let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
+
+        let mut submit_side_guard = self.submit_side.lock().unwrap();
+
+        let mut ops_guard = submit_side_guard.ops.lock().unwrap();
+        assert!(ops_guard.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
+        ops_guard.storage[self.idx] =
+            Some(OpState(Mutex::new(OpStateInner::Pending { waker: None })));
+        drop(ops_guard);
+
+        // if we're going to process completions immediately, get the lock on the CQ so that
+        // we are guaranteed to process completions before the poller task
+        {
+            lazy_static::lazy_static! {
+                static ref PROCESS_URING_ON_SUBMIT: bool =
+                    std::env::var("PROCESS_URING_ON_SUBMIT")
+                        .map(|v| v == "1")
+                        .unwrap_or_else(|e| match e {
+                            std::env::VarError::NotPresent => false,
+                            std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_SUBMIT must be a unicode string"),
+                        });
+            }
+
+            let mut cq_owned = None;
+            let cq_guard = if *PROCESS_URING_ON_SUBMIT {
+                let cq = Arc::clone(&submit_side_guard.cq);
+                cq_owned = Some(cq);
+                Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
+            } else {
+                None
+            };
+            assert_eq!(cq_owned.is_none(), cq_guard.is_none());
+
+            match submit_side_guard.submit_raw(sqe) {
+                Ok(()) => {}
+                Err(SubmitError::QueueFull) => {
+                    // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
+                    // So, we could just submit_and_wait here. But, that'd prevent the
+                    // current executor thread from making progress on other tasks.
+                    //
+                    // So, for now, keep SQ size == inflight ops size.
+                    // This potentially limits throughput if SQ size is chosen too small.
+                    unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
+                }
+            }
+
+            if let Some(mut cq) = cq_guard {
+                assert!(*PROCESS_URING_ON_SUBMIT);
+                // opportunistically process completion immediately
+                // TODO do it during ::poll() as well?
+                match cq.process_completions() {
+                    Ok(()) => {}
+                    Err(ProcessCompletionsErr::PoisonPill) => {
+                        unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent");
+                    }
+                }
+            } else {
+                assert!(!*PROCESS_URING_ON_SUBMIT);
+            }
+        }
+        drop(submit_side_guard);
+        InflightOpHandle {
+            buf: Some(buf),
+            state: InflightOpHandleState::Submitted {
+                slot: self,
+                poll_count: 0,
+            },
+        }
+    }
+}
+
+impl UnsafeOpsSlotHandle {
+    fn return_slot_and_wake(self) {
+        let UnsafeOpsSlotHandle { submit_side, idx } = self;
+        let submit_side_guard = submit_side.lock().unwrap();
+        let mut ops_guard = submit_side_guard.ops.lock().unwrap();
+        assert!(ops_guard.storage[idx].is_some());
+        ops_guard.storage[idx] = None;
+        ops_guard.return_slot_and_wake(Arc::clone(&submit_side), self.idx);
+        drop(ops_guard);
+    }
+}
+
+impl Drop for NotInflightSlotHandle {
+    fn drop(&mut self) {
+        let cur = std::mem::replace(&mut self.state, NotInflightSlotHandleState::Dropped);
+        match cur {
+            NotInflightSlotHandleState::Usable { slot } => {
+                slot.return_slot_and_wake();
+            }
+            NotInflightSlotHandleState::Used => (),
+            NotInflightSlotHandleState::Dropped => unreachable!("implementation error"),
+        }
+    }
+}
+
+impl SubmitSide {
+    fn submit_raw(&mut self, sqe: io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
         self.sq.sync();
         match unsafe { self.sq.push(&sqe) } {
             Ok(()) => {}
@@ -797,6 +771,188 @@ impl SubmitSide {
         self.sq.sync();
         self.submitter.submit().unwrap();
         Ok(())
+    }
+}
+
+enum OwnedSlotPollResult {
+    Ready(i32),
+    Pending(UnsafeOpsSlotHandle),
+}
+
+impl UnsafeOpsSlotHandle {
+    fn poll(self, cx: &mut std::task::Context<'_>) -> OwnedSlotPollResult {
+        let submit_side = self.submit_side.lock().unwrap();
+        let mut ops_guard = submit_side.ops.lock().unwrap();
+        let op_state = &mut ops_guard.storage[self.idx];
+        let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
+
+        let cur: OpStateInner = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
+        match cur {
+            OpStateInner::Undefined => panic!("future is in undefined state"),
+            OpStateInner::Pending {
+                waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
+            } => {
+                trace!("op is still pending, storing waker in it");
+
+                *op_state_inner = OpStateInner::Pending {
+                    waker: Some(cx.waker().clone()),
+                };
+                drop(op_state_inner);
+                drop(op_state);
+                drop(ops_guard);
+                drop(submit_side);
+                return OwnedSlotPollResult::Pending(self);
+            }
+            OpStateInner::PendingButFutureDropped { .. } => {
+                unreachable!("if it's dropped, it's not pollable")
+            }
+            OpStateInner::ReadyButFutureDropped => {
+                unreachable!("if it's dropped, it's not pollable")
+            }
+            OpStateInner::Ready { result: res } => {
+                trace!("op is ready, returning file and buffer to user");
+                drop(op_state_inner);
+                drop(ops_guard);
+                drop(submit_side);
+                self.return_slot_and_wake();
+                return OwnedSlotPollResult::Ready(res);
+            }
+        }
+    }
+}
+
+impl<B: tokio_uring::buf::IoBufMut + Send> Future for InflightOpHandle<B> {
+    type Output = (B, std::io::Result<usize>);
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let cur = std::mem::replace(&mut self.state, InflightOpHandleState::Undefined);
+        match cur {
+            InflightOpHandleState::Undefined => unreachable!("implementation error"),
+            InflightOpHandleState::ReadyPolled => {
+                panic!("must not poll future after observing ready")
+            }
+            InflightOpHandleState::Dropped => unreachable!("implementation error"),
+            InflightOpHandleState::Submitted { slot, poll_count } => {
+                let res = match slot.poll(cx) {
+                    OwnedSlotPollResult::Ready(res) => res,
+                    OwnedSlotPollResult::Pending(slot) => {
+                        self.state = InflightOpHandleState::Submitted {
+                            slot,
+                            poll_count: poll_count + 1,
+                        };
+                        return std::task::Poll::Pending;
+                    }
+                };
+
+                let mut buf_mut =
+                    unsafe { self.as_mut().map_unchecked_mut(|myself| &mut myself.buf) };
+                let mut buf = buf_mut.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
+                drop(buf_mut);
+                // https://man.archlinux.org/man/io_uring_prep_read.3.en
+                let res = if res < 0 {
+                    Err(std::io::Error::from_raw_os_error(-res))
+                } else {
+                    unsafe { buf.set_init(res as usize) };
+                    Ok(res as usize)
+                };
+
+                lazy_static::lazy_static! {
+                    static ref YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: bool =
+                        std::env::var("YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL")
+                            .map(|v| v == "1")
+                            .unwrap_or_else(|e| match e {
+                                std::env::VarError::NotPresent => false,
+                                std::env::VarError::NotUnicode(_) => panic!("YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL must be a unicode string"),
+                            });
+                }
+
+                if poll_count == 0 && *YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
+                    let fut = tokio::task::yield_now();
+                    tokio::pin!(fut);
+                    match fut.poll(cx) {
+                        std::task::Poll::Pending => {
+                            self.state =
+                                InflightOpHandleState::ReadyButYieldingToExecutorForFairness {
+                                    result: res,
+                                };
+                            let replaced = self.buf.replace(buf);
+                            assert!(replaced.is_none(), "we just took it above");
+                            return std::task::Poll::Pending;
+                        }
+                        std::task::Poll::Ready(()) => {
+                            // fallthrough
+                        }
+                    }
+                }
+                self.state = InflightOpHandleState::ReadyPolled;
+                return std::task::Poll::Ready((buf, res));
+            }
+            InflightOpHandleState::ReadyButYieldingToExecutorForFairness { result } => {
+                self.state = InflightOpHandleState::ReadyPolled;
+                return std::task::Poll::Ready((self.buf.take().unwrap(), result));
+            }
+        }
+    }
+}
+
+impl<B> Drop for InflightOpHandle<B>
+where
+    B: tokio_uring::buf::IoBufMut + Send,
+{
+    fn drop(&mut self) {
+        let cur = std::mem::replace(&mut self.state, InflightOpHandleState::Dropped);
+        match cur {
+            InflightOpHandleState::Undefined => unreachable!("future is in undefined state"),
+            InflightOpHandleState::Dropped => {
+                unreachable!("future is in dropped state, but we're in drop() right now")
+            }
+            InflightOpHandleState::ReadyPolled => (),
+            InflightOpHandleState::ReadyButYieldingToExecutorForFairness { .. } => (),
+            InflightOpHandleState::Submitted {
+                slot,
+                poll_count: _,
+            } => {
+                // buffer must be kept alive until the operation is complete, even if we lose interest
+                let buf = self
+                    .buf
+                    .take()
+                    .expect("we only take() during drop, which is here");
+                slot.move_buf_and_slot_ownership_to_system(buf);
+            }
+        }
+    }
+}
+
+impl UnsafeOpsSlotHandle {
+    fn move_buf_and_slot_ownership_to_system<B>(self, buf: B)
+    where
+        B: tokio_uring::buf::IoBufMut + Send + 'static,
+    {
+        let _buffer_owned: Box<dyn std::any::Any + Send> = Box::new(buf);
+        let submit_side = self.submit_side.lock().unwrap();
+        let mut ops_guard = submit_side.ops.lock().unwrap();
+        let op_state = &mut ops_guard.storage[self.idx];
+        let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
+        let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
+        match cur {
+            OpStateInner::Undefined => unreachable!("implementation error"),
+            OpStateInner::Pending { .. } => {
+                *op_state_inner = OpStateInner::PendingButFutureDropped { _buffer_owned };
+                drop(op_state_inner);
+            }
+            OpStateInner::PendingButFutureDropped { .. } => {
+                unreachable!("implementation error")
+            }
+            OpStateInner::Ready { .. } => {
+                unreachable!("implementation error")
+            }
+            OpStateInner::ReadyButFutureDropped => {
+                unreachable!("implementation error")
+            }
+        }
     }
 }
 
