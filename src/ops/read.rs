@@ -1,31 +1,27 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::system::{ResourcesOwnedByKernel, SystemLifecycleManager};
+use crate::system::{ResourcesOwnedByKernel, SubmitSideProvider};
 
-pub(crate) type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
+pub type PreadvOutput<B> = (OwnedFd, B, std::io::Result<usize>);
 
-pub(crate) async fn read<S, B>(system: S, file: OwnedFd, offset: u64, buf: B) -> PreadvOutput<B>
+pub async fn read<S, B>(submit_provider: S, file: OwnedFd, offset: u64, buf: B) -> PreadvOutput<B>
 where
-    S: SystemLifecycleManager,
+    S: SubmitSideProvider,
     B: tokio_uring::buf::IoBufMut + Send,
 {
-    let slot_handle = system
+    submit_provider
         .with_submit_side(|submit_side| {
-            let mut submit_side_guard = submit_side.lock().unwrap();
-            let submit_side = submit_side_guard.must_open();
-            submit_side.get_ops_slot()
+            submit_side.submit(Read { file, buf }, |preadv| {
+                io_uring::opcode::Read::new(
+                    io_uring::types::Fd(preadv.file.as_raw_fd()),
+                    preadv.buf.stable_mut_ptr(),
+                    preadv.buf.bytes_total() as _,
+                )
+                .offset(offset)
+                .build()
+            })
         })
-        .await;
-    let inflight_op_handle = slot_handle.submit(Read { file, buf }, |preadv| {
-        io_uring::opcode::Read::new(
-            io_uring::types::Fd(preadv.file.as_raw_fd()),
-            preadv.buf.stable_mut_ptr(),
-            preadv.buf.bytes_total() as _,
-        )
-        .offset(offset)
-        .build()
-    });
-    inflight_op_handle.await
+        .await
 }
 
 struct Read<B>

@@ -1,19 +1,16 @@
 //! Artificially limits futures lifetime to ensure we don't shutdown system before all futures are gone.
 
-use std::{
-    os::fd::OwnedFd,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use crate::system::{SubmitSide, SystemHandle};
-use crate::system::{System, SystemLifecycleManager};
+use crate::system::{SubmitSideProvider, System};
 
 pub struct SystemLifecycle {
     system_handle: Arc<Mutex<Option<SystemHandle>>>,
 }
 
-impl SystemLifecycleManager for &'_ SystemLifecycle {
-    fn with_submit_side<F: FnOnce(Arc<Mutex<SubmitSide>>) -> R, R>(self, f: F) -> R {
+impl SubmitSideProvider for &'_ SystemLifecycle {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
         f({
             let guard = self.system_handle.lock().unwrap();
             let guard = guard.as_ref().unwrap();
@@ -38,13 +35,5 @@ impl SystemLifecycle {
         Self {
             system_handle: Arc::new(Mutex::new(Some(System::new()))),
         }
-    }
-    pub async fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
-        &self,
-        file: OwnedFd,
-        offset: u64,
-        buf: B,
-    ) -> crate::ops::PreadvOutput<B> {
-        crate::ops::read(self, file, offset, buf).await
     }
 }

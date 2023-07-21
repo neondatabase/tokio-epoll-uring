@@ -1,12 +1,5 @@
-use std::{
-    os::fd::OwnedFd,
-    sync::{Arc, Mutex},
-};
 
-use crate::{
-    ops::{read, PreadvOutput},
-    system::{SubmitSide, SystemHandle, SystemLifecycleManager},
-};
+use crate::system::{SubmitSide, SubmitSideProvider, SystemHandle};
 
 #[derive(Clone, Copy)]
 pub struct SystemLifecycle;
@@ -22,8 +15,8 @@ thread_local! {
     static THREAD_LOCAL: std::cell::RefCell<ThreadLocalState> = std::cell::RefCell::new(ThreadLocalState(ThreadLocalStateInner::NotUsed));
 }
 
-impl SystemLifecycleManager for SystemLifecycle {
-    fn with_submit_side<F: FnOnce(Arc<Mutex<SubmitSide>>) -> R, R>(self, f: F) -> R {
+impl SubmitSideProvider for SystemLifecycle {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
         THREAD_LOCAL.with(|local_state| {
             let mut local_state = local_state.borrow_mut();
             loop {
@@ -57,15 +50,5 @@ impl Drop for ThreadLocalState {
                 unreachable!("ThreadLocalState::drop() had already been called in the past");
             }
         }
-    }
-}
-
-impl SystemLifecycle {
-    pub async fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
-        file: OwnedFd,
-        offset: u64,
-        buf: B,
-    ) -> PreadvOutput<B> {
-        read(SystemLifecycle, file, offset, buf).await
     }
 }

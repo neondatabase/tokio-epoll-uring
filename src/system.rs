@@ -13,7 +13,7 @@ pub(crate) struct System {
     #[allow(dead_code)]
     id: usize,
     split_uring: *mut io_uring::IoUring,
-    pub(crate) submit_side: Arc<Mutex<SubmitSide>>,
+    pub(crate) submit_side: Arc<Mutex<SubmitSideInner>>,
 }
 
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
@@ -22,7 +22,7 @@ unsafe impl Send for System {}
 unsafe impl Sync for System {}
 
 pub(crate) struct SystemHandle {
-    pub(crate) submit_side: Arc<Mutex<SubmitSide>>,
+    pub(crate) submit_side: SubmitSide,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -52,7 +52,7 @@ impl System {
         }));
 
         let submit_side = Arc::new_cyclic(|myself| {
-            Mutex::new(SubmitSide::Open(SubmitSideOpen {
+            Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
                 id,
                 submitter,
                 sq,
@@ -76,7 +76,7 @@ impl System {
             shutdown_rx,
         );
         SystemHandle {
-            submit_side,
+            submit_side: SubmitSide(submit_side),
             shutdown_tx,
         }
     }
@@ -94,8 +94,14 @@ impl SystemHandle {
     }
 }
 
-pub(crate) trait SystemLifecycleManager: Unpin + Copy {
-    fn with_submit_side<F: FnOnce(Arc<Mutex<SubmitSide>>) -> R, R>(self, f: F) -> R;
+mod private {
+    pub trait Sealed {}
+    impl Sealed for &'_ crate::system_lifecycle::BorrowBased {}
+    impl Sealed for crate::system_lifecycle::ThreadLocal {}
+}
+
+pub trait SubmitSideProvider: private::Sealed + Unpin + Copy {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R;
 }
 
 struct OpState(Mutex<OpStateInner>);
@@ -133,7 +139,7 @@ struct CompletionSide {
     id: usize,
     cq: CompletionQueue<'static>,
     ops: Arc<Mutex<Ops>>,
-    submit_side: Weak<Mutex<SubmitSide>>,
+    submit_side: Weak<Mutex<SubmitSideInner>>,
 }
 
 unsafe impl Send for CompletionSide {}
@@ -193,7 +199,7 @@ struct Ops {
 }
 
 impl Ops {
-    fn return_slot_and_wake(&mut self, submit_side: Arc<Mutex<SubmitSide>>, idx: usize) {
+    fn return_slot_and_wake(&mut self, submit_side: Arc<Mutex<SubmitSideInner>>, idx: usize) {
         assert!(self.storage[idx].is_none());
         loop {
             match self.waiters_rx.try_recv() {
@@ -230,11 +236,15 @@ impl Ops {
 
 const RING_SIZE: u32 = 128;
 
-pub(crate) enum SubmitSide {
+#[derive(Clone)]
+pub struct SubmitSide(Arc<Mutex<SubmitSideInner>>);
+
+pub(crate) enum SubmitSideInner {
     Open(SubmitSideOpen),
     Plugged,
     Undefined,
 }
+
 pub(crate) struct SubmitSideOpen {
     #[cfg(debug_assertions)]
     #[allow(dead_code)]
@@ -245,33 +255,33 @@ pub(crate) struct SubmitSideOpen {
     completion_side: Arc<Mutex<CompletionSide>>,
     waiters_tx:
         tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
-    myself: Weak<Mutex<SubmitSide>>,
+    myself: Weak<Mutex<SubmitSideInner>>,
 }
 
-impl SubmitSide {
+impl SubmitSideInner {
     fn plug(&mut self) -> SubmitSideOpen {
-        let cur = std::mem::replace(self, SubmitSide::Undefined);
+        let cur = std::mem::replace(self, SubmitSideInner::Undefined);
         match cur {
-            SubmitSide::Undefined => panic!("implementation error"),
-            SubmitSide::Open(open) => {
-                *self = SubmitSide::Plugged;
+            SubmitSideInner::Undefined => panic!("implementation error"),
+            SubmitSideInner::Open(open) => {
+                *self = SubmitSideInner::Plugged;
                 open
             }
-            SubmitSide::Plugged => panic!("must only plug once"),
+            SubmitSideInner::Plugged => panic!("must only plug once"),
         }
     }
     pub(crate) fn must_open(&mut self) -> &mut SubmitSideOpen {
         match self {
-            SubmitSide::Undefined => panic!("implementation error"),
-            SubmitSide::Open(open) => open,
-            SubmitSide::Plugged => {
+            SubmitSideInner::Undefined => panic!("implementation error"),
+            SubmitSideInner::Open(open) => open,
+            SubmitSideInner::Plugged => {
                 panic!("submit side is plugged, likely because poller task is dead")
             }
         }
     }
 }
 
-unsafe impl Send for SubmitSide {}
+unsafe impl Send for SubmitSideInner {}
 
 pub(crate) enum SubmitError {
     QueueFull,
@@ -282,7 +292,9 @@ pub struct GetOpsSlotFut {
 }
 enum GetOpsSlotFutState {
     Undefined,
-    NotPolled { submit_side: Arc<Mutex<SubmitSide>> },
+    NotPolled {
+        submit_side: Arc<Mutex<SubmitSideInner>>,
+    },
     EnqueuedWaiter(tokio::sync::oneshot::Receiver<UnsafeOpsSlotHandle>),
     ReadyPolled,
 }
@@ -292,7 +304,7 @@ pub struct NotInflightSlotHandle {
 }
 
 struct UnsafeOpsSlotHandle {
-    submit_side: Arc<Mutex<SubmitSide>>,
+    submit_side: Arc<Mutex<SubmitSideInner>>,
     idx: usize,
 }
 
@@ -931,4 +943,21 @@ fn setup_poller_task(
             cq = Some(give_back_cq_on_drop(system, unprotected_cq_arc));
         }
     }.instrument(info_span!(parent: None, "poller_task", system=id )));
+}
+
+impl SubmitSide {
+    pub(crate) async fn submit<R, MakeSqe>(self, rsrc: R, make_sqe: MakeSqe) -> R::OpResult
+    where
+        R: ResourcesOwnedByKernel + Send + Unpin + 'static,
+        MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
+    {
+        let slot_fut = {
+            let SubmitSide(inner) = self;
+            let mut submit_side_guard = inner.lock().unwrap();
+            let submit_side_open = submit_side_guard.must_open();
+            submit_side_open.get_ops_slot()
+        };
+        let slot = slot_fut.await;
+        slot.submit(rsrc, make_sqe).await
+    }
 }
