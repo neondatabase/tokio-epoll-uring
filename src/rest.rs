@@ -3,13 +3,14 @@ use std::{
     future::Future,
     os::fd::AsRawFd,
     sync::{Arc, Mutex, Weak},
-    task::ready,
 };
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use tracing::{debug, info, info_span, trace, Instrument};
 
 pub(crate) struct System {
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
     id: usize,
     split_uring: *mut io_uring::IoUring,
     pub(crate) submit_side: Arc<Mutex<SubmitSide>>,
@@ -127,6 +128,8 @@ impl OpStateInner {
 }
 
 struct CompletionSide {
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
     id: usize,
     cq: CompletionQueue<'static>,
     ops: Arc<Mutex<Ops>>,
@@ -233,6 +236,8 @@ pub(crate) enum SubmitSide {
     Undefined,
 }
 pub(crate) struct SubmitSideOpen {
+    #[cfg(debug_assertions)]
+    #[allow(dead_code)]
     id: usize,
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
@@ -298,6 +303,7 @@ enum NotInflightSlotHandleState {
 }
 
 impl GetOpsSlotFut {
+    #[allow(dead_code)]
     pub(crate) fn state_discriminant_str(&self) -> &'static str {
         match self.state {
             GetOpsSlotFutState::Undefined => "Undefined",

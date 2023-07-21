@@ -5,10 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{
-    preadv::{PreadvCompletionFut, PreadvOutput},
-    rest::{SubmitSide, SystemHandle},
-};
+use crate::{rest::{SubmitSide, SystemHandle}, preadv::PreadvOutput};
 
 use crate::rest::{System, SystemLifecycleManager};
 
@@ -43,12 +40,12 @@ impl BorrowSystem {
             system_handle: Arc::new(Mutex::new(Some(System::new()))),
         }
     }
-    pub fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
+    pub async fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
         &self,
         file: OwnedFd,
         offset: u64,
         buf: B,
-    ) -> impl std::future::Future<Output = PreadvOutput<B>> + Send + '_ {
-        PreadvCompletionFut::new(self, file, offset, buf)
+    ) -> PreadvOutput<B> {
+        crate::preadv::preadv(self, file, offset, buf).await
     }
 }

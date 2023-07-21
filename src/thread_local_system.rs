@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    preadv::{PreadvCompletionFut, PreadvOutput},
+    preadv::{preadv, PreadvOutput},
     rest::{SubmitSide, SystemHandle, SystemLifecycleManager},
 };
 
@@ -61,11 +61,11 @@ impl Drop for ThreadLocalState {
 }
 
 impl ThreadLocalSystem {
-    pub fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
+    pub async fn preadv<B: tokio_uring::buf::IoBufMut + Send>(
         file: OwnedFd,
         offset: u64,
         buf: B,
-    ) -> impl std::future::Future<Output = PreadvOutput<B>> + Send {
-        PreadvCompletionFut::new(ThreadLocalSystem, file, offset, buf)
+    ) -> PreadvOutput<B> {
+        preadv(ThreadLocalSystem, file, offset, buf).await
     }
 }
