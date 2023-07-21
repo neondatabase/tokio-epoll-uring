@@ -5,8 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{rest::{SubmitSide, SystemHandle}, preadv::PreadvOutput};
-
+use crate::rest::{SubmitSide, SystemHandle};
 use crate::rest::{System, SystemLifecycleManager};
 
 pub struct BorrowSystem {
@@ -45,7 +44,7 @@ impl BorrowSystem {
         file: OwnedFd,
         offset: u64,
         buf: B,
-    ) -> PreadvOutput<B> {
-        crate::preadv::preadv(self, file, offset, buf).await
+    ) -> crate::ops::PreadvOutput<B> {
+        crate::ops::preadv(self, file, offset, buf).await
     }
 }
