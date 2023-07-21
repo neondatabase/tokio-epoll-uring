@@ -5,7 +5,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::rest::{PreadvCompletionFut, PreadvOutput, SubmitSide, System, SystemTrait};
+use crate::preadv::{PreadvOutput, PreadvCompletionFut};
+
+use crate::rest::{SubmitSide, System, SystemTrait};
 
 pub struct BorrowSystem {
     system: Arc<Mutex<Option<System>>>,
