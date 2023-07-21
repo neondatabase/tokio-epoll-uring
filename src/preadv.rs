@@ -6,7 +6,9 @@ use std::{
 
 use tracing::trace;
 
-use crate::rest::{GetOpsSlotFut, InflightOpHandle, ResourcesOwnedByKernel, SystemLifecycleManager};
+use crate::rest::{
+    GetOpsSlotFut, InflightOpHandle, ResourcesOwnedByKernel, SystemLifecycleManager,
+};
 
 enum PreadvCompletionFutState<B>
 where
@@ -31,7 +33,10 @@ where
     Dropped,
 }
 
-pub(crate) struct PreadvCompletionFut<S: SystemLifecycleManager, B: tokio_uring::buf::IoBufMut + Send> {
+pub(crate) struct PreadvCompletionFut<
+    S: SystemLifecycleManager,
+    B: tokio_uring::buf::IoBufMut + Send,
+> {
     system: S,
     state: PreadvCompletionFutState<B>,
 }
@@ -171,7 +176,9 @@ where
     }
 }
 
-impl<S: SystemLifecycleManager, B: tokio_uring::buf::IoBufMut + Send> Drop for PreadvCompletionFut<S, B> {
+impl<S: SystemLifecycleManager, B: tokio_uring::buf::IoBufMut + Send> Drop
+    for PreadvCompletionFut<S, B>
+{
     fn drop(&mut self) {
         let cur = std::mem::replace(&mut self.state, PreadvCompletionFutState::Dropped);
         match cur {

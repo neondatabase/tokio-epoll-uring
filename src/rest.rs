@@ -11,8 +11,7 @@ use tracing::{info, trace};
 pub(crate) struct System {
     split_uring: *mut io_uring::IoUring,
     pub(crate) submit_side: Arc<Mutex<SubmitSide>>,
-    rx_completion_queue_from_poller_task:
-        std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>>,
+    rx_completion_queue_from_poller_task: std::sync::mpsc::Receiver<Arc<Mutex<CompletionSide>>>,
 }
 
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
@@ -33,7 +32,7 @@ impl System {
         let uring_fd = unsafe { (*uring).as_raw_fd() };
         let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
 
-        let send_sync_completion_queue = Arc::new(Mutex::new(SendSyncCompletionQueue {
+        let send_sync_completion_queue = Arc::new(Mutex::new(CompletionSide {
             cq,
             seen_poison: false,
             ops: preallocated_completions.clone(),
@@ -43,9 +42,10 @@ impl System {
             setup_poller_task(uring_fd, Arc::clone(&send_sync_completion_queue));
         let submit_side = Arc::new_cyclic(|myself| {
             Mutex::new(SubmitSide {
+                plugged: false,
                 submitter,
                 sq,
-                cq: send_sync_completion_queue,
+                completion_side: send_sync_completion_queue,
                 ops: preallocated_completions,
                 waiters_tx,
                 myself: Weak::clone(myself),
@@ -60,18 +60,54 @@ impl System {
 
     // TODO: use compile-time tricks to ensure the system is always `shutdown()` and never Dropped.
     pub fn shutdown(self) {
+        // NB: can't use tracing here because it relies on thread-local state,
+        // which musn't be accessed while or after being dropped. And the ThreadLocalSystem
+        // calls this function from its Drop handler.
+
+        // Prevent new ops from being submitted.
+        // Wait for all inflight ops to finish.
+        // Unsplit the uring by
+        // 1. By dropping Submitter, SubmissionQueue, CompletionQueue
+        // 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
+        // Drop the IoUring struct, cleaning up the underlying kernel resources.
+
         let System {
             split_uring,
             submit_side,
             rx_completion_queue_from_poller_task,
         } = self;
-        trace!("start dropping thread-local state");
-        // case (1) current thread is getting stopped but poller is still running; it'll exit once it sees the poison.
-        // case (2) poller got stopped, e.g., because the executor is shutting down; we'll wait for the poison.
-        //
-        // in both cases,
 
-        let mut cq = None;
+        // Prevent new ops from being submitted.
+        let mut submit_side_guard = submit_side.lock().unwrap(); // TODO this could be an RwLock?
+        assert!(
+            !submit_side_guard.plugged,
+            "only shutdown sets the plugged flag, and shutdown only runs once"
+        );
+        submit_side_guard.plugged = true;
+        drop(submit_side_guard);
+
+        // Wait for all inflight ops to finish.
+        // We do this by sending an IO_DRAIN'ing NOP SQE through the ring.
+        // Quoting IO_DRAIN semantics:
+        //
+        //   When this flag is specified,
+        //   the SQE will not be started before previously submitted SQEs have completed,
+        //   and new SQEs will not be started before this one completes.
+        //
+        // We care about the first part: "the SQE will not be started before previously submitted SQEs have completed".
+        // It means the IO_DRAIN NOP SQE will act as a barrier.
+        // We already plugged the SubmitSide above, so, we know there are no new ops after the IO_DRAIN SQE.
+        //
+        // The question is: how to wait for the CQE of the IO_DRAIN NOP op?
+        // After all, the poller task owns the CompletionSide.
+        // The solution is: the poller task gives us back the CompletionSide at the end of its life.
+        // End of poller task life comes in two flavors:
+        // (1) poller task observes IO_DRAIN NOP CQE.
+        // (2) poller task future gets dropped;
+        //     this happens if System outlives the tokio runtime on which the poller task was spawned.
+        //     TODO: provide facility to re-spawn poller task.
+        // Note that the poll task guarantees to gives back its CompletionSide in both of these cases.
+        let mut poller_task_completion_side_loop_var = None;
         loop {
             let entry = io_uring::opcode::Nop::new()
                 .build()
@@ -84,11 +120,21 @@ impl System {
             } {
                 Ok(_) => break,
                 Err(SubmitError::QueueFull) => {
-                    // poller may be stopping
-                    let cq = cq.get_or_insert_with(|| {
-                        rx_completion_queue_from_poller_task.recv().unwrap()
-                    });
-                    match cq.lock().unwrap().process_completions() {
+                    // TODO the below is broken. We block forever here if the poller task is still alive.
+                    //
+                    // If the poller task is still alive, we'll eventually have room for the poison.
+                    // If it's dead, the rx_completion_queue_from_poller_task will contain the CompletionSide
+                    // and we will make room ourselves;
+                    //
+                    // TODO: this seems overly compllicated. Can the poller task Drop handler just plug the SubmissionSide
+                    // and wait for all inflight ops to finish? We'd signal it from here though a oneshot or similar.
+                    let completion_side =
+                        poller_task_completion_side_loop_var.get_or_insert_with(|| {
+                            // TODO: if this runs on a tokio worker thread, and the poller task is on the same thread, we have a deadlock.
+                            // blocking waiting for poller task to give us back the CompletionSide
+                            rx_completion_queue_from_poller_task.recv().unwrap()
+                        });
+                    match completion_side.lock().unwrap().process_completions() {
                         Ok(()) => continue, // retry submit poison
                         Err(ProcessCompletionsErr::PoisonPill) => {
                             unreachable!("only we send poison pills")
@@ -97,49 +143,62 @@ impl System {
                 }
             }
         }
-        let cq = cq.unwrap_or_else(|| rx_completion_queue_from_poller_task.recv().unwrap());
-        let mut cq_locked = cq.lock().unwrap();
-        if !cq_locked.seen_poison {
+        // invariant: poison pill submitted
+        // blocking wait for the poller task
+        let completion_side = poller_task_completion_side_loop_var
+            .unwrap_or_else(|| rx_completion_queue_from_poller_task.recv().unwrap());
+        let mut completion_side_locked = completion_side.lock().unwrap();
+        if !completion_side_locked.seen_poison {
             // this is case (2)
             loop {
-                match cq_locked.process_completions() {
+                match completion_side_locked.process_completions() {
                     Ok(()) => continue,
                     Err(ProcessCompletionsErr::PoisonPill) => break,
                 }
             }
         }
-        assert!(cq_locked.seen_poison);
-        drop(cq_locked);
+        assert!(completion_side_locked.seen_poison);
+        drop(completion_side_locked);
 
-        // XXX: we still hold the weak reference in `myself` and in the SendSyncCompletionQueue
-        let submit_side = Arc::try_unwrap(submit_side).ok().expect(
+        // Unsplit the uring by restoring exclusive ownership of all parts and dropping them.
+        let submit_side = Arc::try_unwrap(submit_side).ok()
+        // FIXME: this can panic with the ThreadLocalSystem because
+        // 1. the futures contain an Arc to the SubmitSide and
+        // 2. the futures can outlive the thread on which they were created, but
+        // 3. ThreadLocalSystem shuts down a system when the thread local gets dropped
+        .expect(
             "we've shut down the system, so, we're the only ones with a reference to submit_side",
         );
         let submit_side = Mutex::into_inner(submit_side).unwrap();
         let SubmitSide {
+            plugged: _,
             submitter,
             sq,
             ops: preallocated_completions,
-            cq: cq_arc_from_submit_side,
+            completion_side: completion_side_arc_from_submit_side,
             waiters_tx: _,
             myself: _,
         } = submit_side;
-        assert!(Arc::ptr_eq(&cq_arc_from_submit_side, &cq)); // ptr_eq is safe because these are not trait objects
-        drop(cq_arc_from_submit_side);
-        // cq can have at most refcount 3 at a time:
-        // - the poller thread
-        // - the thread-local storage
+        assert!(
+            Arc::ptr_eq(&completion_side_arc_from_submit_side, &completion_side),
+            "internal inconsistency about System's completion side Arc and "
+        ); // ptr_eq is safe because these are not trait objects
+        drop(completion_side_arc_from_submit_side);
+        // We dropped
+        // Who can refer to the completion_side current?
+        // - the poller task that we launched
         // - the thread that's currently in PreadvCompletion::poll, helping the executor thread with completion processing
-        let cq = Arc::try_unwrap(cq)
+        let completion_side = Arc::try_unwrap(completion_side)
             .ok()
-            .expect("at this point, cq is not referenced by anything else anymore");
-        let cq = Mutex::into_inner(cq).unwrap();
-        let SendSyncCompletionQueue {
+            // this is true, despite the earlier FIXME
+            .expect("at this point, CompletionSide is not referenced by anything else anymore");
+        let completion_side = Mutex::into_inner(completion_side).unwrap();
+        let CompletionSide {
             seen_poison: _,
             cq,
             ops: _,
             submit_side: _,
-        } = cq;
+        } = completion_side;
 
         let submitter: Submitter<'_> = submitter;
         let mut sq: SubmissionQueue<'_> = sq;
@@ -188,20 +247,20 @@ enum OpStateInner {
     },
 }
 
-struct SendSyncCompletionQueue {
+struct CompletionSide {
     seen_poison: bool,
     cq: CompletionQueue<'static>,
     ops: Arc<Mutex<Ops>>,
     submit_side: Weak<Mutex<SubmitSide>>,
 }
 
-unsafe impl Send for SendSyncCompletionQueue {}
+unsafe impl Send for CompletionSide {}
 
 enum ProcessCompletionsErr {
     PoisonPill,
 }
 
-impl SendSyncCompletionQueue {
+impl CompletionSide {
     fn process_completions(&mut self) -> std::result::Result<(), ProcessCompletionsErr> {
         let cq = &mut self.cq;
         cq.sync();
@@ -301,11 +360,12 @@ impl Ops {
 const RING_SIZE: u32 = 128;
 
 pub(crate) struct SubmitSide {
+    plugged: bool,
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
     ops: Arc<Mutex<Ops>>,
     // wake_poller_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
-    cq: Arc<Mutex<SendSyncCompletionQueue>>,
+    completion_side: Arc<Mutex<CompletionSide>>,
     waiters_tx:
         tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
     myself: Weak<Mutex<SubmitSide>>,
@@ -355,6 +415,9 @@ impl GetOpsSlotFut {
 
 impl SubmitSide {
     pub fn get_ops_slot(&mut self) -> GetOpsSlotFut {
+        if self.plugged {
+            unreachable!("trying to submit work after system was shut down, your SystemLifecycleManager impl is supposed to prevent this")
+        }
         return GetOpsSlotFut {
             state: GetOpsSlotFutState::NotPolled {
                 submit_side: Weak::upgrade(&self.myself).expect("we're executing on myself"),
@@ -404,7 +467,12 @@ impl Future for GetOpsSlotFut {
                         }
                         if *PROCESS_URING_ON_QUEUE_FULL {
                             submit_side_guard.submitter.submit().unwrap();
-                            match submit_side_guard.cq.lock().unwrap().process_completions() {
+                            match submit_side_guard
+                                .completion_side
+                                .lock()
+                                .unwrap()
+                                .process_completions()
+                            {
                                 Ok(()) => (),
                                 Err(ProcessCompletionsErr::PoisonPill) => {
                                     unreachable!("the thread-local destructor is the only one that sends them, and we're currently using that thread-local, so, it can't have been sent")
@@ -505,7 +573,7 @@ impl UnsafeOpsSlotHandle {
 
             let mut cq_owned = None;
             let cq_guard = if *PROCESS_URING_ON_SUBMIT {
-                let cq = Arc::clone(&submit_side_guard.cq);
+                let cq = Arc::clone(&submit_side_guard.completion_side);
                 cq_owned = Some(cq);
                 Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
             } else {
@@ -779,8 +847,8 @@ where
 
 fn setup_poller_task(
     uring_fd: std::os::fd::RawFd,
-    cq: Arc<Mutex<SendSyncCompletionQueue>>,
-) -> std::sync::mpsc::Receiver<Arc<Mutex<SendSyncCompletionQueue>>> {
+    completion_side: Arc<Mutex<CompletionSide>>,
+) -> std::sync::mpsc::Receiver<Arc<Mutex<CompletionSide>>> {
     let (giveback_cq_tx, giveback_cq_rx) = std::sync::mpsc::sync_channel(1);
 
     let fut = async move {
@@ -792,7 +860,7 @@ fn setup_poller_task(
                 giveback_cq_tx.send(cq).unwrap();
             })
         };
-        let mut cq = Some(give_back_cq_on_drop(cq));
+        let mut cq = Some(give_back_cq_on_drop(completion_side));
 
         info!(
             "launching poller task on thread id {:?}",
