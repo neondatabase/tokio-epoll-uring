@@ -13,7 +13,7 @@ async fn main() {
         file.write_all(&[42u8].repeat(1024)).unwrap();
         file.write_all(&[67u8].repeat(1024)).unwrap();
     }
-    let system_handle = tokio_io_uring_eventfd_bridge::launch_owned();
+    let system_handle = tokio_io_uring_eventfd_bridge::launch_owned().await;
 
     let buf = vec![0; 2048];
     let (_, buf, res) =

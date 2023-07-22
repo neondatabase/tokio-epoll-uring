@@ -6,6 +6,7 @@ use std::{
 };
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
+use tokio::sync::oneshot;
 use tracing::{debug, info_span, trace, Instrument};
 
 use crate::shutdown_request::WaitForShutdownResult;
@@ -24,7 +25,7 @@ unsafe impl Send for System {}
 unsafe impl Sync for System {}
 
 impl System {
-    pub(crate) fn launch() -> SystemHandle {
+    pub(crate) async fn launch() -> SystemHandle {
         static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -76,7 +77,9 @@ impl System {
                 shutdown_rx,
             }),
         ))));
-        tokio::task::spawn(poller_task(id, poller_task_state));
+        let (poller_ready_tx, poller_ready_rx) = oneshot::channel();
+        tokio::task::spawn(poller_task(id, poller_task_state, poller_ready_tx));
+        poller_ready_rx.await;
         SystemHandle {
             state: SystemHandleState::KeepSystemAlive(SystemHandleLive {
                 id,
@@ -142,7 +145,7 @@ impl SystemHandle {
     /// Shutdown may spawn an `std::thread` for this purpose.
     /// It would generally be unsafe to have "force shutdown" after a timeout because
     /// in io_uring, the kernel owns resources such as memory buffers while operations are in flight.
-    pub fn shutdown(mut self) -> impl Future<Output = ()> {
+    pub fn shutdown(mut self) -> impl Future<Output = ()> + Send + Unpin {
         let cur = std::mem::replace(
             &mut self.state,
             SystemHandleState::ExplicitShutdownRequestOngoing,
@@ -180,8 +183,32 @@ impl SystemHandleState {
         }
     }
 }
+
+struct WaitShutdownFut {
+    done_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl Future for WaitShutdownFut {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let done_rx = &mut self.done_rx;
+        let done_rx = std::pin::Pin::new(done_rx);
+        match done_rx.poll(cx) {
+            std::task::Poll::Ready(res) => match res {
+                Ok(()) => std::task::Poll::Ready(()),
+                Err(_) => panic!("implementation error: poller must not die before SystemHandle"),
+            },
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 impl SystemHandleLive {
-    fn shutdown(self) -> impl Future<Output = ()> {
+    fn shutdown(self) -> impl Future<Output = ()> + Send + Unpin {
         let SystemHandleLive {
             id: _,
             submit_side,
@@ -202,11 +229,7 @@ impl SystemHandleLive {
             done_tx,
         };
         shutdown_tx.shutdown(req);
-        async move {
-            done_rx
-                .await
-                .expect("implementation error: poller must not die before SystemHandle")
-        }
+        WaitShutdownFut { done_rx }
     }
 }
 
@@ -677,7 +700,6 @@ impl UnsafeOpsSlotHandle {
             idx,
         } = self;
         let mut ops_guard = ops.lock().unwrap();
-        assert!(ops_guard.storage[idx].is_some());
         ops_guard.storage[idx] = None;
         ops_guard.return_slot_and_wake(submit_side, self.idx);
         drop(ops_guard);
@@ -942,7 +964,7 @@ struct PollerStateInner {
     shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
 }
 
-async fn poller_task(id: usize, state: Arc<Mutex<PollerState>>) {
+async fn poller_task(id: usize, state: Arc<Mutex<PollerState>>, poller_ready: oneshot::Sender<()>) {
     let _switch_to_thread_if_task_gets_dropped =
         scopeguard::guard(Arc::clone(&state), move |state| {
             let mut state_guard = state.lock().unwrap();
@@ -969,6 +991,7 @@ async fn poller_task(id: usize, state: Arc<Mutex<PollerState>>) {
                 .spawn(move || {
                     tokio::runtime::Builder::new_current_thread()
                         .enable_time()
+                        .enable_io()
                         .build()
                         .unwrap()
                         .block_on(async move {
@@ -995,6 +1018,7 @@ async fn poller_task(id: usize, state: Arc<Mutex<PollerState>>) {
                 })
                 .unwrap();
         });
+    let _ = poller_ready.send(());
     poller_impl(state)
         .instrument(info_span!("poller_task", system=%id))
         .await;
@@ -1250,13 +1274,26 @@ impl SubmitSide {
 
 #[cfg(test)]
 mod submit_side_tests {
+    use tracing::trace;
+
     use crate::SubmitSideProvider;
+
+    use super::{InflightOpHandle, NotInflightSlotHandle};
+    struct MockOp {}
+    fn submit_mock_op(slot: NotInflightSlotHandle) -> InflightOpHandle<MockOp> {
+        impl super::ResourcesOwnedByKernel for MockOp {
+            type OpResult = ();
+            fn on_op_completion(self, _res: i32) -> Self::OpResult {}
+        }
+        let submit_fut = slot.submit(MockOp {}, |_| io_uring::opcode::Nop::new().build());
+        submit_fut
+    }
 
     #[tokio::test]
     async fn shutdown_waits_for_ongoing_ops() {
         // tracing_subscriber::fmt::init();
 
-        let system = crate::launch_shared();
+        let system = crate::launch_shared().await;
         let slot = system
             .clone()
             .with_submit_side(|submit_side| {
@@ -1265,13 +1302,7 @@ mod submit_side_tests {
                 guard.get_ops_slot()
             })
             .await;
-
-        struct MockOp {}
-        impl super::ResourcesOwnedByKernel for MockOp {
-            type OpResult = ();
-            fn on_op_completion(self, _res: i32) -> Self::OpResult {}
-        }
-        let submit_fut = slot.submit(MockOp {}, |_| io_uring::opcode::Nop::new().build());
+        let submit_fut = submit_mock_op(slot);
         let shutdown_done = system.shutdown();
         tokio::pin!(shutdown_done);
         tokio::select! {
@@ -1291,5 +1322,59 @@ mod submit_side_tests {
             }
             _ = &mut shutdown_done => { }
         }
+    }
+
+    #[test]
+    fn poller_task_dropped_during_shutdown() {
+        // tracing_subscriber::fmt::init();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (slot, shutdown_done) = rt.block_on(async move {
+            let system = crate::launch_shared().await;
+            let slot = system
+                .clone()
+                .with_submit_side(|submit_side| {
+                    let mut guard = submit_side.0.lock().unwrap();
+                    let guard = guard.must_open();
+                    guard.get_ops_slot()
+                })
+                .await;
+            // When we send shutdown, the slot will keep the poller task in the shutdown process_completions loop.
+            // Then we'll drop the rt, which causes the poller task to get dropped.
+            // We should observe a transition to RunningInThread.
+            let shutdown_done = system.shutdown();
+            (slot, shutdown_done)
+        });
+        rt.shutdown_background();
+
+        let new_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        new_rt.block_on(async move {
+            let mut shutdown_done = shutdown_done;
+            tokio::select! {
+                // TODO don't rely on timing
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => { }
+                _ = &mut shutdown_done => {
+                    panic!("shutdown should not complete until submit_fut is done");
+                }
+            }
+            // clear the slot
+            drop(slot);
+
+            tokio::select! {
+                // TODO don't rely on timing
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    panic!("shutdown should complete after submit_fut is done");
+                }
+                _ = &mut shutdown_done => { }
+            }
+        });
     }
 }

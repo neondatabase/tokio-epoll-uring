@@ -31,8 +31,9 @@ impl SubmitSideProvider for SharedSystemHandle {
 }
 
 impl SharedSystemHandle {
-    pub fn launch() -> Self {
-        Self(Arc::new(RwLock::new(Some(System::launch()))))
+    pub async fn launch() -> Self {
+        let handle = System::launch().await;
+        Self(Arc::new(RwLock::new(Some(handle))))
     }
 
     /// Plug the submission queue; new operation submissions will cause panics.
@@ -40,7 +41,7 @@ impl SharedSystemHandle {
     /// Returns a oneshot receiver that will be signalled when all operations have completed.
     ///
     /// This function panics if it's called more than once (i.e., on another clone of the wrapped handle).
-    pub fn shutdown(self) -> impl Future<Output = ()> {
+    pub fn shutdown(self) -> impl Future<Output = ()> + Send + Unpin {
         self.0
             .write()
             .unwrap()

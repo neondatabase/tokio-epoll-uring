@@ -11,18 +11,19 @@ use system::SystemHandle;
 mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
 
-pub fn launch_owned() -> SystemHandle {
-    system::System::launch()
+pub async fn launch_owned() -> SystemHandle {
+    system::System::launch().await
 }
 
-pub fn launch_shared() -> SharedSystemHandle {
-    SharedSystemHandle::launch()
+pub async fn launch_shared() -> SharedSystemHandle {
+    SharedSystemHandle::launch().await
 }
 
 mod thread_local_system_handle;
 pub use thread_local_system_handle::ThreadLocalSystemHandle;
 
 pub fn thread_local_system() -> ThreadLocalSystemHandle {
+    todo!();
     ThreadLocalSystemHandle
 }
 
@@ -34,7 +35,7 @@ mod tests {
 
     #[tokio::test]
     async fn panics_if_future_is_polled_after_shutdown() {
-        let system = launch_shared();
+        let system = launch_shared().await;
         let (reader, _writer) = os_pipe::pipe().unwrap();
         let reader_owned =
             unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
