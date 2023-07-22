@@ -611,15 +611,28 @@ impl NotInflightSlotHandle {
     {
         let cur = std::mem::replace(&mut self.state, NotInflightSlotHandleState::Used);
         match cur {
-            NotInflightSlotHandleState::Usable { slot } => slot.submit(rsrc, make_sqe),
+            NotInflightSlotHandleState::Usable { slot } => {
+                match slot.submit(rsrc, make_sqe) {
+                    Ok(inflight_op_handle) => inflight_op_handle,
+                    Err(UnsafeOpsSlotHandleSubmitError::SubmitSidePlugged(slot)) => {
+                        // put back so we run the Drop handler
+                        self.state = NotInflightSlotHandleState::Usable { slot };
+                        panic!("cannot use slot for submission, SubmitSide is already plugged")
+                    }
+                }
+            }
             NotInflightSlotHandleState::Used => unreachable!("implementation error"),
             NotInflightSlotHandleState::Dropped => unreachable!("implementation error"),
         }
     }
 }
 
+enum UnsafeOpsSlotHandleSubmitError {
+    SubmitSidePlugged(UnsafeOpsSlotHandle),
+}
+
 impl UnsafeOpsSlotHandle {
-    fn submit<R, MakeSqe>(self, mut rsrc: R, make_sqe: MakeSqe) -> InflightOpHandle<R>
+    fn submit<R, MakeSqe>(self, mut rsrc: R, make_sqe: MakeSqe) -> Result<InflightOpHandle<R>, UnsafeOpsSlotHandleSubmitError>
     where
         R: ResourcesOwnedByKernel + Send + 'static,
         MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
@@ -628,7 +641,14 @@ impl UnsafeOpsSlotHandle {
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
 
         let mut submit_side_guard = self.submit_side.lock().unwrap();
-        let submit_side_open = submit_side_guard.must_open();
+        let submit_side_open = match &mut *submit_side_guard {
+            SubmitSideInner::Open(open) => open,
+            SubmitSideInner::Plugged => {
+                drop(submit_side_guard);
+                return Err(UnsafeOpsSlotHandleSubmitError::SubmitSidePlugged(self));
+            }
+            SubmitSideInner::Undefined => panic!("implementation error"),
+        };
 
         let mut ops_guard = submit_side_open.ops.lock().unwrap();
         assert!(ops_guard.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
@@ -682,13 +702,13 @@ impl UnsafeOpsSlotHandle {
             }
         }
         drop(submit_side_guard);
-        InflightOpHandle {
+        Ok(InflightOpHandle {
             resources_owned_by_kernel: Some(rsrc),
             state: InflightOpHandleState::Inflight {
                 slot: self,
                 poll_count: 0,
             },
-        }
+        })
     }
 }
 
@@ -1274,6 +1294,8 @@ impl SubmitSide {
 
 #[cfg(test)]
 mod submit_side_tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
     use tracing::trace;
 
     use crate::SubmitSideProvider;
@@ -1287,6 +1309,49 @@ mod submit_side_tests {
         }
         let submit_fut = slot.submit(MockOp {}, |_| io_uring::opcode::Nop::new().build());
         submit_fut
+    }
+
+    // TODO: turn into a does-not-compile test
+    // #[tokio::test]
+    // async fn get_slot_panics_if_used_after_shutdown() {
+    //     let handle = crate::launch_owned().await;
+    //     handle.shutdown().await;
+    //     // handle.
+    //     // .with_submit_side(|submit_side| {
+    //     //     let mut guard = submit_side.0.lock().unwrap();
+    //     //     let guard = guard.must_open();
+    //     //     guard.get_ops_slot()
+    //     // })
+    //     // .await;
+    // }
+
+    #[tokio::test]
+    async fn submit_panics_after_shutdown() {
+        let system = crate::launch_shared().await;
+
+        // get a slot
+        let slot = system
+            .clone()
+            .with_submit_side(|submit_side| {
+                let mut guard = submit_side.0.lock().unwrap();
+                let guard = guard.must_open();
+                guard.get_ops_slot()
+            })
+            .await;
+
+        let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let jh = tokio::spawn(async move {
+            shutdown_started_rx.await.unwrap();
+            assert_panic::assert_panic!{
+                { let _ = submit_mock_op(slot); },
+                &str,
+                "cannot use slot for submission, SubmitSide is already plugged"
+            };
+        });
+        let wait_shutdown = system.initiate_shutdown();
+        shutdown_started_tx.send(()).unwrap();
+        jh.await.unwrap();
+        wait_shutdown.await;
     }
 
     #[tokio::test]
@@ -1303,7 +1368,7 @@ mod submit_side_tests {
             })
             .await;
         let submit_fut = submit_mock_op(slot);
-        let shutdown_done = system.shutdown();
+        let shutdown_done = system.initiate_shutdown();
         tokio::pin!(shutdown_done);
         tokio::select! {
             // TODO don't rely on timing
@@ -1346,7 +1411,7 @@ mod submit_side_tests {
             // When we send shutdown, the slot will keep the poller task in the shutdown process_completions loop.
             // Then we'll drop the rt, which causes the poller task to get dropped.
             // We should observe a transition to RunningInThread.
-            let shutdown_done = system.shutdown();
+            let shutdown_done = system.initiate_shutdown();
             (slot, shutdown_done)
         });
         rt.shutdown_background();

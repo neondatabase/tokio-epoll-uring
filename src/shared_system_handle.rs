@@ -41,7 +41,7 @@ impl SharedSystemHandle {
     /// Returns a oneshot receiver that will be signalled when all operations have completed.
     ///
     /// This function panics if it's called more than once (i.e., on another clone of the wrapped handle).
-    pub fn shutdown(self) -> impl Future<Output = ()> + Send + Unpin {
+    pub fn initiate_shutdown(self) -> impl Future<Output = ()> + Send + Unpin {
         self.0
             .write()
             .unwrap()
