@@ -1020,22 +1020,54 @@ async fn poller_impl(state: Arc<Mutex<PollerState>>) {
             }
         }
     };
-    let shutdown_req = poller_impl_impl(Arc::clone(&state), inner).await;
+    let shutdown_req = poller_impl_impl(Arc::clone(&state), Arc::clone(&inner)).await;
     let cur = std::mem::replace(&mut *state.lock().unwrap(), PollerState::ShuttingDown);
-    let inner_owned = match cur {
-        PollerState::RunningInTask(inner) | PollerState::RunningInThread(inner) => {
-            let owned = Arc::try_unwrap(inner)
-                .ok()
-                .expect("we replaced the state with ShuttingDown, so, we're the only owner");
-            Mutex::into_inner(owned).unwrap()
+
+    // Prevent new ops from being submitted.
+    // Wait for all inflight ops to finish.
+    // Unsplit the uring by
+    // 1. By dropping Submitter, SubmissionQueue, CompletionQueue
+    // 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
+    // Drop the IoUring struct, cleaning up the underlying kernel resources.
+
+    // Prevent new ops from being submitted:
+    // => SystemHandle::drop / SystemHandle::shutdown already plugged the submit side. Nothing to do.
+
+    // Wait for all inflight ops to finish.
+    loop {
+        {
+            let inner_guard = inner.lock().unwrap();
+            let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
+            let ops_guard = completion_side_guard.ops.lock().unwrap();
+            if ops_guard.unused_indices.len() == RING_SIZE as usize {
+                break;
+            }
+            drop(ops_guard);
+            completion_side_guard.process_completions();
         }
-        PollerState::Undefined => todo!(),
-        PollerState::SwitchingFromTaskToThread => todo!(),
-        PollerState::ShuttingDown => todo!(),
-        PollerState::ShutDown => todo!(),
-    };
-    poller_impl_shutdown(inner_owned, shutdown_req);
-    *state.lock().unwrap() = PollerState::ShutDown;
+        // if we get preempted here, e.g., because the runtime is getting dropped, then the task is in state ShuttingDown.
+        // The scopeguard in the caller will spawn a thread to re-call us and resume here
+        tokio::task::yield_now().await;
+    }
+
+    // no await preemption from here on, enforce it through the closure
+    (move || {
+        drop(inner); // this should make us the only owner
+        let inner_owned: PollerStateInner = match cur {
+            PollerState::RunningInTask(inner) | PollerState::RunningInThread(inner) => {
+                let owned = Arc::try_unwrap(inner)
+                    .ok()
+                    .expect("we replaced the state with ShuttingDown, so, we're the only owner");
+                Mutex::into_inner(owned).unwrap()
+            }
+            PollerState::Undefined => todo!(),
+            PollerState::SwitchingFromTaskToThread => todo!(),
+            PollerState::ShuttingDown => todo!(),
+            PollerState::ShutDown => todo!(),
+        };
+        poller_impl_finish_shutdown(inner_owned, shutdown_req);
+        *state.lock().unwrap() = PollerState::ShutDown;
+    })()
 }
 
 async fn poller_impl_impl(
@@ -1123,35 +1155,27 @@ async fn poller_impl_impl(
     }
 }
 
-fn poller_impl_shutdown(inner_owned: PollerStateInner, req: ShutdownRequest) {
+fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownRequest) {
     tracing::info!("poller shutdown start");
     scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
     scopeguard::defer_on_unwind! {tracing::error!("poller shutdown panic")};
 
     let PollerStateInner {
         id: _,
-        uring_fd,
+        uring_fd: _,
         completion_side,
         system,
-        shutdown_rx: mut shutdown,
+        shutdown_rx: _,
     } = inner_owned;
-
-    // Prevent new ops from being submitted.
-    // Wait for all inflight ops to finish.
-    // Unsplit the uring by
-    // 1. By dropping Submitter, SubmissionQueue, CompletionQueue
-    // 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
-    // Drop the IoUring struct, cleaning up the underlying kernel resources.
 
     let system = system; // needed to move the System, which we Unsafe-imp'ed Send
     let System { id: _, split_uring } = system;
 
-    // Prevent new ops from being submitted:
-    // => SystemHandle::drop / SystemHandle::shutdown already plugged the submit side. Nothing to do.
     let ShutdownRequest {
         done_tx,
         open_state,
     } = req;
+
     let SubmitSideOpen {
         id: _,
         submitter,
@@ -1167,21 +1191,10 @@ fn poller_impl_shutdown(inner_owned: PollerStateInner, req: ShutdownRequest) {
     ); // ptr_eq is safe because these are not trait objects
        // drop stuff we already have
     drop(submit_sides_completion_side);
-
-    // Wait for all inflight ops to finish.
     let completion_side = Arc::try_unwrap(completion_side)
         .ok()
         .expect("we plugged the SubmitSide, so, all refs to CompletionSide are gone");
     let mut completion_side = Mutex::into_inner(completion_side).unwrap();
-    loop {
-        let ops_guard = completion_side.ops.lock().unwrap();
-        if ops_guard.unused_indices.len() == RING_SIZE as usize {
-            break;
-        }
-        drop(ops_guard);
-        completion_side.process_completions();
-        std::thread::yield_now();
-    }
 
     // Unsplit the uring
     let CompletionSide {
@@ -1241,6 +1254,8 @@ mod submit_side_tests {
 
     #[tokio::test]
     async fn shutdown_waits_for_ongoing_ops() {
+        // tracing_subscriber::fmt::init();
+
         let system = crate::launch_shared();
         let slot = system
             .clone()
@@ -1266,7 +1281,9 @@ mod submit_side_tests {
                 panic!("shutdown should not complete until submit_fut is done");
             }
         }
+        println!("waiting submit_fut");
         let _: () = submit_fut.await;
+        println!("submit_fut is done");
         tokio::select! {
             // TODO don't rely on timing
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {

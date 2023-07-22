@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 enum State<T> {
     Undefined,
@@ -74,24 +77,39 @@ pub enum WaitForShutdownResult<T> {
 
 impl<T> Receiver<T> {
     pub async fn wait_for_shutdown_request(&self) -> WaitForShutdownResult<T> {
-        self.0.posted_shutdown_request.notified().await;
-        let mut guard = self.0.shutdown_request.lock().unwrap();
-        let cur = std::mem::replace(&mut *guard, State::Undefined);
-        match cur {
-            State::Undefined => panic!("implementation error"),
-            State::Waiting => unreachable!("we only notify after we set Posted"),
-            State::Posted(req) => {
-                *guard = State::Taken;
-                return WaitForShutdownResult::ExplicitRequest(req);
-            }
-            State::Taken => {
-                *guard = State::Taken;
-                return WaitForShutdownResult::ExplicitRequestObservedEarlier;
-            }
-            State::SenderDropped => {
-                *guard = State::SenderDropped;
-                return WaitForShutdownResult::SenderDropped;
-            }
+        let mut iter = 0;
+        loop {
+            let wait_notify = loop {
+                let mut guard = self.0.shutdown_request.lock().unwrap();
+                let cur = std::mem::replace(&mut *guard, State::Undefined);
+                assert!(iter < 2, "implementation error");
+                match cur {
+                    State::Undefined => panic!("implementation error"),
+                    State::Waiting => {
+                        // FIXME: allocation on the hot path
+                        let mut notified = Box::pin(self.0.posted_shutdown_request.notified());
+                        notified.as_mut().enable();
+                        *guard = State::Waiting;
+                        drop(guard);
+                        break notified;
+                    }
+                    State::Posted(req) => {
+                        *guard = State::Taken;
+                        return WaitForShutdownResult::ExplicitRequest(req);
+                    }
+                    State::Taken => {
+                        *guard = State::Taken;
+                        return WaitForShutdownResult::ExplicitRequestObservedEarlier;
+                    }
+                    State::SenderDropped => {
+                        *guard = State::SenderDropped;
+                        return WaitForShutdownResult::SenderDropped;
+                    }
+                }
+            };
+            wait_notify.await;
+            iter += 1;
+            continue;
         }
     }
 }
