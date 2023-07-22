@@ -26,7 +26,9 @@ impl SubmitSideProvider for ThreadLocalSystemHandle {
                         ));
                     }
                     // fast path
-                    ThreadLocalStateInner::Used(system) => break f(system.submit_side.clone()),
+                    ThreadLocalStateInner::Used(system) => {
+                        break f(system.state.guaranteed_live().submit_side.clone())
+                    }
                     ThreadLocalStateInner::Dropped => {
                         unreachable!("threat-local can't be dropped while executing")
                     }
@@ -43,7 +45,8 @@ impl Drop for ThreadLocalState {
         match cur {
             ThreadLocalStateInner::NotUsed => {}
             ThreadLocalStateInner::Used(system) => {
-                system.shutdown();
+                // on implicit shutdown, we don't care about when it finishes
+                let _ = system.shutdown();
             }
             ThreadLocalStateInner::Dropped => {
                 unreachable!("ThreadLocalState::drop() had already been called in the past");

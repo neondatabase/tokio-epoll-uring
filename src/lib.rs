@@ -3,8 +3,10 @@ pub use ops::read::read;
 
 mod system;
 
+pub(crate) mod shutdown_request;
+
 pub use system::SubmitSideProvider;
-pub use system::SystemHandle;
+use system::SystemHandle;
 
 mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
@@ -51,7 +53,7 @@ mod tests {
                 "SharedSystemHandle is shut down, cannot submit new operations"
             );
         });
-        system.shutdown();
+        system.shutdown().await;
         jh.await.unwrap();
     }
 }

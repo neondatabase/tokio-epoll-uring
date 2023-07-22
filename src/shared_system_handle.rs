@@ -1,6 +1,8 @@
 use std::sync::{Arc, RwLock};
 
-use crate::system::{SubmitSide, SystemHandle, ShutdownError};
+use futures::Future;
+
+use crate::system::{SubmitSide, SystemHandleState, SystemHandle};
 use crate::system::{SubmitSideProvider, System};
 
 #[derive(Clone)]
@@ -13,14 +15,19 @@ impl SubmitSideProvider for SharedSystemHandle {
             let guard = guard
                 .as_ref()
                 .expect("SharedSystemHandle is shut down, cannot submit new operations");
-            guard.submit_side.clone()
+            match &guard.state {
+                SystemHandleState::KeepSystemAlive(inner) => inner.submit_side.clone(),
+                SystemHandleState::ExplicitShutdownRequestOngoing
+                | SystemHandleState::ExplicitShutdownRequestDone
+                | SystemHandleState::ImplicitShutdownRequestThroughDropOngoing
+                | SystemHandleState::ImplicitShutdownRequestThroughDropDone => {
+                    unreachable!(
+                        "the .take() in fn shutdown plus the RwLock prevent us from reaching here"
+                    )
+                }
+            }
         })
     }
-}
-
-enum SharedSystemShutdownError {
-    Inner(ShutdownError),
-
 }
 
 impl SharedSystemHandle {
@@ -33,7 +40,7 @@ impl SharedSystemHandle {
     /// Returns a oneshot receiver that will be signalled when all operations have completed.
     ///
     /// This function panics if it's called more than once (i.e., on another clone of the wrapped handle).
-    pub fn shutdown(self) -> Result<tokio::sync::oneshot::Receiver<()>, > {
+    pub fn shutdown(self) -> impl Future<Output = ()> {
         self.0
             .write()
             .unwrap()

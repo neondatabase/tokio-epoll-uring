@@ -5,29 +5,23 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use either::Either;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
-use tokio::net::unix::pipe::Sender;
-use tracing::{debug, info, info_span, trace, Instrument};
+use tracing::{debug, info_span, trace, Instrument};
+
+use crate::shutdown_request::WaitForShutdownResult;
 
 pub(crate) struct System {
     #[cfg(debug_assertions)]
     #[allow(dead_code)]
     id: usize,
     split_uring: *mut io_uring::IoUring,
-    pub(crate) submit_side: Arc<Mutex<SubmitSideInner>>,
+    // poller_heartbeat: (), // TODO
 }
 
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
 unsafe impl Send for System {}
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
 unsafe impl Sync for System {}
-
-pub struct SystemHandle {
-    id: usize,
-    pub(crate) submit_side: SubmitSide,
-    shutdown_tx: tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>,
-}
 
 impl System {
     pub(crate) fn launch() -> SystemHandle {
@@ -50,7 +44,7 @@ impl System {
         let uring_fd = unsafe { (*uring).as_raw_fd() };
         let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
 
-        let send_sync_completion_queue = Arc::new(Mutex::new(CompletionSide {
+        let completion_side = Arc::new(Mutex::new(CompletionSide {
             id,
             cq,
             ops: ops.clone(),
@@ -62,7 +56,7 @@ impl System {
                 id,
                 submitter,
                 sq,
-                completion_side: Arc::clone(&send_sync_completion_queue),
+                completion_side: Arc::clone(&completion_side),
                 ops,
                 waiters_tx,
                 myself: Weak::clone(myself),
@@ -71,26 +65,69 @@ impl System {
         let system = System {
             id,
             split_uring: uring,
-            submit_side: Arc::clone(&submit_side),
         };
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        setup_poller_task(
-            id,
-            uring_fd,
-            Arc::clone(&send_sync_completion_queue),
-            system,
-            shutdown_rx,
-        );
+        let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
+        let poller_task_state = Arc::new(Mutex::new(PollerState::RunningInTask(Arc::new(
+            Mutex::new(PollerStateInner {
+                id,
+                uring_fd,
+                completion_side,
+                system,
+                shutdown_rx,
+            }),
+        ))));
+        tokio::task::spawn(poller_task(id, poller_task_state));
         SystemHandle {
-            id,
-            submit_side: SubmitSide(submit_side),
-            shutdown_tx,
+            state: SystemHandleState::KeepSystemAlive(SystemHandleLive {
+                id,
+                submit_side: SubmitSide(submit_side),
+                shutdown_tx,
+            }),
         }
     }
 }
 
-pub enum ShutdownError {
-    AlreadyShutDown,
+pub struct SystemHandle {
+    pub(crate) state: SystemHandleState,
+}
+
+pub(crate) enum SystemHandleState {
+    KeepSystemAlive(SystemHandleLive),
+    ExplicitShutdownRequestOngoing,
+    ExplicitShutdownRequestDone,
+    ImplicitShutdownRequestThroughDropOngoing,
+    ImplicitShutdownRequestThroughDropDone,
+}
+pub(crate) struct SystemHandleLive {
+    #[allow(dead_code)]
+    id: usize,
+    pub(crate) submit_side: SubmitSide,
+    shutdown_tx: crate::shutdown_request::Sender<ShutdownRequest>,
+}
+
+impl Drop for SystemHandle {
+    fn drop(&mut self) {
+        let cur = std::mem::replace(
+            &mut self.state,
+            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing,
+        );
+        match cur {
+            SystemHandleState::ExplicitShutdownRequestOngoing => {
+                panic!("implementation error, likely panic during explicit shutdown")
+            }
+            SystemHandleState::ExplicitShutdownRequestDone => (), // nothing to do
+            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing => {
+                unreachable!("only this function sets that state, and it gets called exactly once")
+            }
+            SystemHandleState::ImplicitShutdownRequestThroughDropDone => {
+                unreachable!("only this function sets that state, and it gets called exactly once")
+            }
+            SystemHandleState::KeepSystemAlive(live) => {
+                let _ = live.shutdown(); // we don't care about the result
+                self.state = SystemHandleState::ImplicitShutdownRequestThroughDropDone;
+            }
+        }
+    }
 }
 
 impl SystemHandle {
@@ -105,22 +142,71 @@ impl SystemHandle {
     /// Shutdown may spawn an `std::thread` for this purpose.
     /// It would generally be unsafe to have "force shutdown" after a timeout because
     /// in io_uring, the kernel owns resources such as memory buffers while operations are in flight.
-    pub fn shutdown(self) -> Result<impl Future<Output = ()>, ShutdownError> {
-        let SystemHandle {
-            id,
+    pub fn shutdown(mut self) -> impl Future<Output = ()> {
+        let cur = std::mem::replace(
+            &mut self.state,
+            SystemHandleState::ExplicitShutdownRequestOngoing,
+        );
+        match cur {
+            SystemHandleState::ExplicitShutdownRequestOngoing => {
+                unreachable!("this function consumes self")
+            }
+            SystemHandleState::ExplicitShutdownRequestDone => {
+                unreachable!("this function consumes self")
+            }
+            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing => {
+                unreachable!("this function consumes self")
+            }
+            SystemHandleState::ImplicitShutdownRequestThroughDropDone => {
+                unreachable!("this function consumes self")
+            }
+            SystemHandleState::KeepSystemAlive(live) => {
+                let ret = live.shutdown();
+                self.state = SystemHandleState::ExplicitShutdownRequestDone;
+                ret
+            }
+        }
+    }
+}
+
+impl SystemHandleState {
+    pub(crate) fn guaranteed_live(&self) -> &SystemHandleLive {
+        match self {
+            SystemHandleState::ExplicitShutdownRequestOngoing => unreachable!("caller guarantees that system handle is live, but it is in state ExplicitShutdownRequestOngoing"),
+            SystemHandleState::ExplicitShutdownRequestDone => unreachable!("caller guarantees that system handle is live, but it is in state ExplicitShutdownRequestDone"),
+            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing => unreachable!("caller guarantees that system handle is live, but it is in state ImplicitShutdownRequestThroughDrop"),
+            SystemHandleState::ImplicitShutdownRequestThroughDropDone => unreachable!("caller guarantees that system handle is live, but it is in state ImplicitShutdownRequestThroughDropDone"),
+            SystemHandleState::KeepSystemAlive(live) => live,
+        }
+    }
+}
+impl SystemHandleLive {
+    fn shutdown(self) -> impl Future<Output = ()> {
+        let SystemHandleLive {
+            id: _,
             submit_side,
             shutdown_tx,
         } = self;
-        let (shutdown_done_tx, shutdown_done_rx) = tokio::sync::oneshot::channel();
-        match shutdown_tx.send(shutdown_done_tx) {
-            Ok(()) => (),
-            Err(_disconnected) => {
-                let _: Sender<()> = shutdown_done_tx;
-                return Err(ShutdownError::AlreadyShutDown);
-            }
-        }
+        let mut submit_side_guard = submit_side.0.lock().unwrap();
+        let open_state = match submit_side_guard.plug() {
+            Ok(open_state) => open_state,
+            Err(PlugError::AlreadyPlugged) => panic!(
+                "implementation error: its solely the SystemHandle's job to plug the submit side"
+            ),
+        };
+        drop(submit_side_guard);
         drop(submit_side);
-        Ok(shutdown_done_rx)
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let req = ShutdownRequest {
+            open_state,
+            done_tx,
+        };
+        shutdown_tx.shutdown(req);
+        async move {
+            done_rx
+                .await
+                .expect("implementation error: poller must not die before SystemHandle")
+        }
     }
 }
 
@@ -133,7 +219,7 @@ impl SystemHandle {
 
 impl SubmitSideProvider for &'_ SystemHandle {
     fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
-        f(self.submit_side.clone())
+        f(self.state.guaranteed_live().submit_side.clone())
     }
 }
 
@@ -299,16 +385,21 @@ pub(crate) struct SubmitSideOpen {
     myself: Weak<Mutex<SubmitSideInner>>,
 }
 
+unsafe impl Send for SubmitSideOpen {}
+
+enum PlugError {
+    AlreadyPlugged,
+}
 impl SubmitSideInner {
-    fn plug(&mut self) -> SubmitSideOpen {
+    fn plug(&mut self) -> Result<SubmitSideOpen, PlugError> {
         let cur = std::mem::replace(self, SubmitSideInner::Undefined);
         match cur {
             SubmitSideInner::Undefined => panic!("implementation error"),
             SubmitSideInner::Open(open) => {
                 *self = SubmitSideInner::Plugged;
-                open
+                Ok(open)
             }
-            SubmitSideInner::Plugged => panic!("must only plug once"),
+            SubmitSideInner::Plugged => Err(PlugError::AlreadyPlugged),
         }
     }
     pub(crate) fn must_open(&mut self) -> &mut SubmitSideOpen {
@@ -321,8 +412,6 @@ impl SubmitSideInner {
         }
     }
 }
-
-unsafe impl Send for SubmitSideInner {}
 
 pub(crate) enum SubmitError {
     QueueFull,
@@ -818,199 +907,315 @@ where
     }
 }
 
-fn setup_poller_task(
+struct ShutdownRequest {
+    done_tx: tokio::sync::oneshot::Sender<()>,
+    open_state: SubmitSideOpen,
+}
+
+enum PollerState {
+    Undefined,
+    RunningInTask(Arc<Mutex<PollerStateInner>>),
+    SwitchingFromTaskToThread,
+    RunningInThread(Arc<Mutex<PollerStateInner>>),
+    ShuttingDown,
+    ShutDown,
+}
+
+impl std::fmt::Debug for PollerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PollerState::Undefined => write!(f, "Undefined"),
+            PollerState::RunningInTask(_) => write!(f, "RunningInTask"),
+            PollerState::SwitchingFromTaskToThread => write!(f, "SwitchingFromTaskToThread"),
+            PollerState::RunningInThread(_) => write!(f, "RunningInThread"),
+            PollerState::ShuttingDown => write!(f, "ShuttingDown"),
+            PollerState::ShutDown => write!(f, "ShutDown"),
+        }
+    }
+}
+
+struct PollerStateInner {
     id: usize,
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
-    mut shutdown: tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>,
-) {
-    let _ = tokio::task::spawn(async move {
-        let give_back_completion_side_on_drop = {
-            |system, cq, shutdown: Option<Either<tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>, tokio::sync::oneshot::Sender<()>>>| {
-                scopeguard::guard((system, cq, shutdown), move |(system, completion_side, shutdown)| {
-                    std::thread::Builder::new().name("shutdown-thread".to_owned()).spawn(move || {
-                        let _entered = info_span!("shutdown-thread", system=id).entered();
-                        tracing::info!("poller task shutdown thread start");
-                        scopeguard::defer_on_success! {tracing::info!("poller task shutdown thread end")};
-                        scopeguard::defer_on_unwind! {tracing::error!("poller task shutdown thread panic")};
+    shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
+}
 
-                        // Prevent new ops from being submitted.
-                        // Wait for all inflight ops to finish.
-                        // Unsplit the uring by
-                        // 1. By dropping Submitter, SubmissionQueue, CompletionQueue
-                        // 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
-                        // Drop the IoUring struct, cleaning up the underlying kernel resources.
-
-                        let system = system; // needed to move the System, which we Unsafe-imp'ed Send
-                        let System {
-                            id: _,
-                            split_uring,
-                            submit_side,
-                        } = system;
-
-                        // Prevent new ops from being submitted.
-                        let mut submit_side_guard = submit_side.lock().unwrap(); // TODO this could be an RwLock?
-                        let SubmitSideOpen {
-                            id: _,
-                            submitter,
-                            sq,
-                            ops: _,
-                            completion_side: submit_sides_completion_side,
-                            waiters_tx: _,
-                            myself: _,
-                        } = submit_side_guard.plug();
-                        drop(submit_side_guard);
-                        assert!(
-                            Arc::ptr_eq(&submit_sides_completion_side, &completion_side),
-                            "internal inconsistency about System's completion side Arc and "
-                        ); // ptr_eq is safe because these are not trait objects
-                           // drop stuff we already have
-                        drop(submit_sides_completion_side);
-
-                        // Wait for all inflight ops to finish.
-                        let completion_side = Arc::try_unwrap(completion_side).ok().expect(
-                            "we plugged the SubmitSide, so, all refs to CompletionSide are gone",
-                        );
-                        let mut completion_side = Mutex::into_inner(completion_side).unwrap();
-
-                        loop {
-                            let ops_guard = completion_side.ops.lock().unwrap();
-                            if ops_guard.unused_indices.len() == RING_SIZE as usize {
-                                break;
-                            }
-                            drop(ops_guard);
-                            completion_side.process_completions();
-                            std::thread::yield_now();
-                        }
-
-                        // Unsplit the uring
-                        let CompletionSide {
-                            id: _,
-                            cq,
-                            ops,
-                            submit_side: _,
-                        } = completion_side;
-                        // compile-time-ensure we've got the owned types here by declaring the types explicitly
-                        let mut sq: SubmissionQueue<'_> = sq;
-                        let submitter: Submitter<'_> = submitter;
-                        let mut cq: CompletionQueue<'_> = cq;
-                        // We now own all the parts from the IoUring::split() again.
-                        // Some final assertions, then drop them all, unleak the IoUring, and drop it as well.
-                        // That cleans up the SQ, CQs, registrations, etc.
-                        cq.sync();
-                        assert_eq!(cq.len(), 0, "cqe: {:?}", cq.next());
-                        sq.sync();
-                        assert_eq!(sq.len(), 0);
-                        assert_eq!(
-                            ops.try_lock().unwrap().unused_indices.len(),
-                            RING_SIZE.try_into().unwrap()
-                        );
-                        drop(cq);
-                        drop(sq);
-                        drop(submitter);
-                        let uring = unsafe { Box::from_raw(split_uring) };
-
-                        // Drop the IoUring struct, cleaning up the underlying kernel resources.
-                        drop(uring);
-
-                        // We keep shutdown_rx alive until here so that users can subscribe to shutdown progress
-                        // until we've really torn down everything. In some situation, it's just nice to be able
-                        // to wait that everything is gone.
-                        match shutdown {
-                            Some(Either::Left(mut shutdown_rx)) => {
-                                if let Ok(signal) = shutdown_rx.try_recv() {
-                                    let _ = signal.send(());
+async fn poller_task(id: usize, state: Arc<Mutex<PollerState>>) {
+    let _switch_to_thread_if_task_gets_dropped =
+        scopeguard::guard(Arc::clone(&state), move |state| {
+            let mut state_guard = state.lock().unwrap();
+            let cur = std::mem::replace(&mut *state_guard, PollerState::Undefined);
+            let inner = match cur {
+                PollerState::ShutDown => {
+                    // we're done
+                    *state_guard = PollerState::ShutDown;
+                    return;
+                }
+                PollerState::RunningInTask(inner) => {
+                    tracing::info!("poller task is getting dropped, switching to thread");
+                    *state_guard = PollerState::SwitchingFromTaskToThread;
+                    inner
+                }
+                PollerState::SwitchingFromTaskToThread
+                | PollerState::RunningInThread(_)
+                | PollerState::ShuttingDown
+                | PollerState::Undefined => unreachable!("unexpected state: {cur:?}"),
+            };
+            let state_clone = Arc::clone(&state);
+            std::thread::Builder::new()
+                .name(format!("{}-shutdown-thread", id))
+                .spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let state = state_clone;
+                            let mut state_guard = state.lock().unwrap();
+                            let cur = std::mem::replace(&mut *state_guard, PollerState::Undefined);
+                            match cur {
+                                PollerState::SwitchingFromTaskToThread => {
+                                    *state_guard = PollerState::RunningInThread(inner);
+                                    drop(state_guard);
+                                    poller_impl(state)
+                                        .instrument(info_span!("poller_thread", system=%id))
+                                        .await
+                                }
+                                PollerState::Undefined
+                                | PollerState::RunningInTask(_)
+                                | PollerState::RunningInThread(_)
+                                | PollerState::ShuttingDown
+                                | PollerState::ShutDown => {
+                                    unreachable!("unexpected state: {cur:x?}")
                                 }
                             }
-                            Some(Either::Right(shutdown_tx)) => {
-                                let _ = shutdown_tx.send(());
-                            },
-                            None => (),
-                        }
-                    }).unwrap();
+                        })
                 })
-            }
-        };
-        #[allow(unused_assignments)]
-        let mut shutdown_guard = Some(give_back_completion_side_on_drop(system, completion_side, None));
+                .unwrap();
+        });
+    poller_impl(state)
+        .instrument(info_span!("poller_task", system=%id))
+        .await;
+}
 
-        info!("launching poller task");
-
-        let fd = tokio::io::unix::AsyncFd::new(uring_fd).unwrap();
-        loop {
-            let mut is_timeout_wakeup;
-            // See fd.read() API docs for recipe for this code block.
-            loop {
-                is_timeout_wakeup = false;
-                let mut guard = tokio::select! {
-                    ready_res = fd.ready(tokio::io::Interest::READABLE) => {
-                        ready_res.unwrap()
-                    }
-                    shutdown_done_tx = &mut shutdown  => {
-                        let shutdown_done_tx = match shutdown_done_tx {
-                            Ok(shutdown_done_tx) => Either::Right(shutdown_done_tx),
-                            Err(_no_intereset) => Either::Left(shutdown),
-                        };
-                        trace!("poller task got shutdown signal");
-                        let (system, unprotected_cq_arc, x) =
-                            scopeguard::ScopeGuard::into_inner(shutdown_guard.take().unwrap());
-                        #[allow(unused_assignments)]
-                        if x.is_some() {
-                            // this branch should never be taken because we only receive shutdown signal once.
-                            // But, just in case, restore the shutdown guard first
-                            shutdown_guard = Some(give_back_completion_side_on_drop(system, unprotected_cq_arc, x));
-                            panic!("implementation error");
-                        } else {
-                            shutdown_guard = Some(give_back_completion_side_on_drop(system, unprotected_cq_arc, Some(shutdown_done_tx)));
-                            return;
-                        }
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                        is_timeout_wakeup = true;
-                        break;
-                    }
-                };
-                if !guard.ready().is_readable() {
-                    trace!("spurious wakeup");
-                    continue;
-                }
-                guard.clear_ready_matching(tokio::io::Ready::READABLE);
-                break;
+async fn poller_impl(state: Arc<Mutex<PollerState>>) {
+    let inner = {
+        let state_guard = state.lock().unwrap();
+        match &*state_guard {
+            PollerState::Undefined | PollerState::SwitchingFromTaskToThread => {
+                panic!("implementation error")
             }
-
-            let (system, unprotected_cq_arc, shutdown_done) =
-                scopeguard::ScopeGuard::into_inner(shutdown_guard.take().unwrap());
-            let mut unprotected_cq = unprotected_cq_arc.lock().unwrap();
-            unprotected_cq.process_completions(); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
-            if is_timeout_wakeup {
-                let ops = unprotected_cq.ops.lock().unwrap();
-                let mut by_state_discr = HashMap::new();
-                for s in &ops.storage {
-                    match s {
-                        Some(opstate) => {
-                            let opstate_inner = opstate.0.lock().unwrap();
-                            let state_discr = opstate_inner.discriminant_str();
-                            by_state_discr
-                                .entry(state_discr)
-                                .and_modify(|v| *v += 1)
-                                .or_insert(1);
-                        }
-                        None => {
-                            by_state_discr.entry("None").and_modify(|v| *v += 1).or_insert(1);
-                        },
-                    }
-                }
-                debug!(
-                    "poller task got timeout: ops free slots = {} by_ops_state: {:?}",
-                    ops.unused_indices.len(),
-                    by_state_discr
-                );
+            PollerState::ShutDown => {
+                unreachable!("if poller_impl_impl shuts shuts down, we never get back here, caller guarantees it")
             }
-            drop(unprotected_cq);
-            shutdown_guard = Some(give_back_completion_side_on_drop(system, unprotected_cq_arc, shutdown_done));
+            PollerState::ShuttingDown => {
+                unreachable!(
+                    "only this function transitions into that state, and then never revisits"
+                )
+            }
+            PollerState::RunningInTask(inner) | PollerState::RunningInThread(inner) => {
+                Arc::clone(&inner)
+            }
         }
-    }.instrument(info_span!(parent: None, "poller_task", system=id )));
+    };
+    let shutdown_req = poller_impl_impl(Arc::clone(&state), inner).await;
+    let cur = std::mem::replace(&mut *state.lock().unwrap(), PollerState::ShuttingDown);
+    let inner_owned = match cur {
+        PollerState::RunningInTask(inner) | PollerState::RunningInThread(inner) => {
+            let owned = Arc::try_unwrap(inner)
+                .ok()
+                .expect("we replaced the state with ShuttingDown, so, we're the only owner");
+            Mutex::into_inner(owned).unwrap()
+        }
+        PollerState::Undefined => todo!(),
+        PollerState::SwitchingFromTaskToThread => todo!(),
+        PollerState::ShuttingDown => todo!(),
+        PollerState::ShutDown => todo!(),
+    };
+    poller_impl_shutdown(inner_owned, shutdown_req);
+    *state.lock().unwrap() = PollerState::ShutDown;
+}
+
+async fn poller_impl_impl(
+    state: Arc<Mutex<PollerState>>,
+    inner: Arc<Mutex<PollerStateInner>>,
+) -> ShutdownRequest {
+    let (uring_fd, completion_side, shutdown_rx) = {
+        let mut inner_guard = inner.lock().unwrap();
+        let PollerStateInner {
+            id: _,
+            uring_fd,
+            completion_side,
+            system,
+            shutdown_rx: ref mut shutdown,
+        } = &mut *inner_guard;
+        (*uring_fd, Arc::clone(completion_side), shutdown.clone())
+    };
+
+    let fd = tokio::io::unix::AsyncFd::new(uring_fd).unwrap();
+    loop {
+        let mut is_timeout_wakeup;
+        // See fd.read() API docs for recipe for this code block.
+        loop {
+            is_timeout_wakeup = false;
+            let mut guard = tokio::select! {
+                ready_res = fd.ready(tokio::io::Interest::READABLE) => {
+                    ready_res.unwrap()
+                }
+                rx = shutdown_rx.wait_for_shutdown_request()  => {
+                    match rx {
+                        WaitForShutdownResult::ExplicitRequest(req) => {
+                            return req;
+                        }
+                        WaitForShutdownResult::ExplicitRequestObservedEarlier => {
+                            panic!("once we observe a shutdown request, we return it and the caller does through with shutdown, without a chance for the executor to intervene")
+                        }
+                        WaitForShutdownResult::SenderDropped => {
+                            panic!("implementation error: SystemHandle _must_ send shutdown request");
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    is_timeout_wakeup = true;
+                    break;
+                }
+            };
+            if !guard.ready().is_readable() {
+                trace!("spurious wakeup");
+                continue;
+            }
+            guard.clear_ready_matching(tokio::io::Ready::READABLE);
+            break;
+        }
+
+        let mut completion_side_guard = completion_side.lock().unwrap();
+        completion_side_guard.process_completions(); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
+        if is_timeout_wakeup {
+            let ops = completion_side_guard.ops.lock().unwrap();
+            let mut by_state_discr = HashMap::new();
+            for s in &ops.storage {
+                match s {
+                    Some(opstate) => {
+                        let opstate_inner = opstate.0.lock().unwrap();
+                        let state_discr = opstate_inner.discriminant_str();
+                        by_state_discr
+                            .entry(state_discr)
+                            .and_modify(|v| *v += 1)
+                            .or_insert(1);
+                    }
+                    None => {
+                        by_state_discr
+                            .entry("None")
+                            .and_modify(|v| *v += 1)
+                            .or_insert(1);
+                    }
+                }
+            }
+            debug!(
+                "poller task got timeout: ops free slots = {} by_ops_state: {:?}",
+                ops.unused_indices.len(),
+                by_state_discr
+            );
+        }
+        drop(completion_side_guard);
+    }
+}
+
+fn poller_impl_shutdown(inner_owned: PollerStateInner, req: ShutdownRequest) {
+    tracing::info!("poller shutdown start");
+    scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
+    scopeguard::defer_on_unwind! {tracing::error!("poller shutdown panic")};
+
+    let PollerStateInner {
+        id: _,
+        uring_fd,
+        completion_side,
+        system,
+        shutdown_rx: mut shutdown,
+    } = inner_owned;
+
+    // Prevent new ops from being submitted.
+    // Wait for all inflight ops to finish.
+    // Unsplit the uring by
+    // 1. By dropping Submitter, SubmissionQueue, CompletionQueue
+    // 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
+    // Drop the IoUring struct, cleaning up the underlying kernel resources.
+
+    let system = system; // needed to move the System, which we Unsafe-imp'ed Send
+    let System { id: _, split_uring } = system;
+
+    // Prevent new ops from being submitted:
+    // => SystemHandle::drop / SystemHandle::shutdown already plugged the submit side. Nothing to do.
+    let ShutdownRequest {
+        done_tx,
+        open_state,
+    } = req;
+    let SubmitSideOpen {
+        id: _,
+        submitter,
+        sq,
+        ops: _,
+        completion_side: submit_sides_completion_side,
+        waiters_tx: _,
+        myself: _,
+    } = open_state;
+    assert!(
+        Arc::ptr_eq(&submit_sides_completion_side, &completion_side),
+        "internal inconsistency about System's completion side Arc and "
+    ); // ptr_eq is safe because these are not trait objects
+       // drop stuff we already have
+    drop(submit_sides_completion_side);
+
+    // Wait for all inflight ops to finish.
+    let completion_side = Arc::try_unwrap(completion_side)
+        .ok()
+        .expect("we plugged the SubmitSide, so, all refs to CompletionSide are gone");
+    let mut completion_side = Mutex::into_inner(completion_side).unwrap();
+    loop {
+        let ops_guard = completion_side.ops.lock().unwrap();
+        if ops_guard.unused_indices.len() == RING_SIZE as usize {
+            break;
+        }
+        drop(ops_guard);
+        completion_side.process_completions();
+        std::thread::yield_now();
+    }
+
+    // Unsplit the uring
+    let CompletionSide {
+        id: _,
+        cq,
+        ops,
+        submit_side: _,
+    } = completion_side;
+    // compile-time-ensure we've got the owned types here by declaring the types explicitly
+    let mut sq: SubmissionQueue<'_> = sq;
+    let submitter: Submitter<'_> = submitter;
+    let mut cq: CompletionQueue<'_> = cq;
+    // We now own all the parts from the IoUring::split() again.
+    // Some final assertions, then drop them all, unleak the IoUring, and drop it as well.
+    // That cleans up the SQ, CQs, registrations, etc.
+    cq.sync();
+    assert_eq!(cq.len(), 0, "cqe: {:?}", cq.next());
+    sq.sync();
+    assert_eq!(sq.len(), 0);
+    assert_eq!(
+        ops.try_lock().unwrap().unused_indices.len(),
+        RING_SIZE.try_into().unwrap()
+    );
+    drop(cq);
+    drop(sq);
+    drop(submitter);
+    let uring = unsafe { Box::from_raw(split_uring) };
+
+    // Drop the IoUring struct, cleaning up the underlying kernel resources.
+    drop(uring);
+
+    // notify about completed shutdown;
+    // ignore send errors, interest may be gone if it's implicit shutdown through SystemHandle::drop
+    let _ = done_tx.send(());
 }
 
 impl SubmitSide {
