@@ -7,6 +7,7 @@ use std::{
 
 use either::Either;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
+use tokio::net::unix::pipe::Sender;
 use tracing::{debug, info, info_span, trace, Instrument};
 
 pub(crate) struct System {
@@ -88,9 +89,23 @@ impl System {
     }
 }
 
+pub enum ShutdownError {
+    AlreadyShutDown,
+}
+
 impl SystemHandle {
-    // TODO: use compile-time tricks to ensure the system is always `shutdown()` and never Dropped.
-    pub fn shutdown(self) -> tokio::sync::oneshot::Receiver<()> {
+    /// Initiate system shtudown and return a future to await completion of shutdown.
+    ///
+    /// If this call returns Ok(), it is guaranteed that no new operations
+    /// will be allowed to start (TODO: not true right now, since poller task plugs the queue).
+    /// Currently, such attempts will cause a panic but we may change the behavior
+    /// to make it return a custom [`std::io::Error`] instead.
+    ///
+    /// Shutdown must wait for all in-flight operations to finish..
+    /// Shutdown may spawn an `std::thread` for this purpose.
+    /// It would generally be unsafe to have "force shutdown" after a timeout because
+    /// in io_uring, the kernel owns resources such as memory buffers while operations are in flight.
+    pub fn shutdown(self) -> Result<impl Future<Output = ()>, ShutdownError> {
         let SystemHandle {
             id,
             submit_side,
@@ -99,12 +114,13 @@ impl SystemHandle {
         let (shutdown_done_tx, shutdown_done_rx) = tokio::sync::oneshot::channel();
         match shutdown_tx.send(shutdown_done_tx) {
             Ok(()) => (),
-            Err(e) => {
-                panic!("poller task already dead, shouldn't happen (system={id}): {e:?}");
+            Err(_disconnected) => {
+                let _: Sender<()> = shutdown_done_tx;
+                return Err(ShutdownError::AlreadyShutDown);
             }
         }
         drop(submit_side);
-        shutdown_done_rx
+        Ok(shutdown_done_rx)
     }
 }
 

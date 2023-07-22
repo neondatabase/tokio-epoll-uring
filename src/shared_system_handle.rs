@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use crate::system::{SubmitSide, SystemHandle};
+use crate::system::{SubmitSide, SystemHandle, ShutdownError};
 use crate::system::{SubmitSideProvider, System};
 
 #[derive(Clone)]
@@ -18,6 +18,11 @@ impl SubmitSideProvider for SharedSystemHandle {
     }
 }
 
+enum SharedSystemShutdownError {
+    Inner(ShutdownError),
+
+}
+
 impl SharedSystemHandle {
     pub fn launch() -> Self {
         Self(Arc::new(RwLock::new(Some(System::launch()))))
@@ -28,7 +33,7 @@ impl SharedSystemHandle {
     /// Returns a oneshot receiver that will be signalled when all operations have completed.
     ///
     /// This function panics if it's called more than once (i.e., on another clone of the wrapped handle).
-    pub fn shutdown(self) -> tokio::sync::oneshot::Receiver<()> {
+    pub fn shutdown(self) -> Result<tokio::sync::oneshot::Receiver<()>, > {
         self.0
             .write()
             .unwrap()
