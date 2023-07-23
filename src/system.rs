@@ -8,7 +8,7 @@ use std::{
 use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use tokio::sync::oneshot;
-use tracing::{debug, info_span, trace, Instrument};
+use tracing::{debug, info, info_span, trace, Instrument};
 
 use crate::shutdown_request::WaitForShutdownResult;
 
@@ -104,17 +104,17 @@ impl Future for Launch {
                         split_uring: uring,
                     };
                     let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
-                    let poller_task_state = Arc::new(Mutex::new(PollerState::RunningInTask(
-                        Arc::new(Mutex::new(PollerStateInner {
-                            id,
+                    let poller_task_state = Arc::new(Mutex::new(Poller {
+                        id,
+                        state: PollerState::RunningInTask(Arc::new(Mutex::new(PollerStateInner {
                             uring_fd,
                             completion_side,
                             system,
                             shutdown_rx,
-                        })),
-                    )));
+                        }))),
+                    }));
                     let (poller_ready_tx, poller_ready_rx) = oneshot::channel();
-                    tokio::task::spawn(poller_task(id, poller_task_state, poller_ready_tx));
+                    tokio::task::spawn(poller_task(poller_task_state, poller_ready_tx));
                     let system_handle_not_safe_for_use_yet = SystemHandle {
                         state: SystemHandleState::KeepSystemAlive(SystemHandleLive {
                             id,
@@ -475,6 +475,7 @@ pub(crate) struct SubmitSideOpen {
 }
 
 unsafe impl Send for SubmitSideOpen {}
+unsafe impl Sync for SubmitSideOpen {}
 
 enum PlugError {
     AlreadyPlugged,
@@ -1024,12 +1025,17 @@ struct ShutdownRequest {
     open_state: SubmitSideOpen,
 }
 
+struct Poller {
+    id: usize,
+    state: PollerState,
+}
+
 enum PollerState {
     Undefined,
     RunningInTask(Arc<Mutex<PollerStateInner>>),
-    SwitchingFromTaskToThread,
     RunningInThread(Arc<Mutex<PollerStateInner>>),
-    ShuttingDown,
+    ShuttingDownPreemptible(Arc<Mutex<PollerStateInner>>, Arc<ShutdownRequest>),
+    ShuttingDownNoMorePreemptible,
     ShutDown,
 }
 
@@ -1038,68 +1044,80 @@ impl std::fmt::Debug for PollerState {
         match self {
             PollerState::Undefined => write!(f, "Undefined"),
             PollerState::RunningInTask(_) => write!(f, "RunningInTask"),
-            PollerState::SwitchingFromTaskToThread => write!(f, "SwitchingFromTaskToThread"),
             PollerState::RunningInThread(_) => write!(f, "RunningInThread"),
-            PollerState::ShuttingDown => write!(f, "ShuttingDown"),
+            PollerState::ShuttingDownPreemptible(_, _) => write!(f, "ShuttingDownPreemptible"),
+            PollerState::ShuttingDownNoMorePreemptible => {
+                write!(f, "ShuttingDownNoMorePreemptible")
+            }
             PollerState::ShutDown => write!(f, "ShutDown"),
         }
     }
 }
 
 struct PollerStateInner {
-    id: usize,
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
     shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
 }
 
-async fn poller_task(id: usize, state: Arc<Mutex<PollerState>>, poller_ready: oneshot::Sender<()>) {
-    let _switch_to_thread_if_task_gets_dropped =
-        scopeguard::guard(Arc::clone(&state), move |state| {
-            let mut state_guard = state.lock().unwrap();
-            let cur = std::mem::replace(&mut *state_guard, PollerState::Undefined);
-            let inner = match cur {
+async fn poller_task(poller: Arc<Mutex<Poller>>, poller_ready: oneshot::Sender<()>) {
+    let id = poller.lock().unwrap().id;
+    let switch_to_thread_if_task_gets_dropped =
+        scopeguard::guard(Arc::clone(&poller), move |poller| {
+            let span = info_span!("poller_task_scopeguard", system=%id);
+            let _entered = span.enter(); // safe to use here because there's no more .await
+            let mut poller_guard = poller.lock().unwrap();
+            let cur = std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
+            match cur {
                 PollerState::ShutDown => {
                     // we're done
-                    *state_guard = PollerState::ShutDown;
+                    poller_guard.state = PollerState::ShutDown;
                     return;
                 }
-                PollerState::RunningInTask(inner) => {
-                    tracing::info!("poller task is getting dropped, switching to thread");
-                    *state_guard = PollerState::SwitchingFromTaskToThread;
-                    inner
+                x @ PollerState::ShuttingDownPreemptible(_, _) => {
+                    tracing::info!("poller task dropped while shutting down");
+                    poller_guard.state = x;
                 }
-                PollerState::SwitchingFromTaskToThread
-                | PollerState::RunningInThread(_)
-                | PollerState::ShuttingDown
-                | PollerState::Undefined => unreachable!("unexpected state: {cur:?}"),
-            };
-            let state_clone = Arc::clone(&state);
+                PollerState::RunningInTask(inner) => {
+                    tracing::info!("poller task dropped while running poller_impl_impl");
+                    poller_guard.state = PollerState::RunningInThread(inner);
+                }
+                PollerState::RunningInThread(_)
+                | PollerState::Undefined
+                | PollerState::ShuttingDownNoMorePreemptible => {
+                    unreachable!("unexpected state: {cur:?}")
+                }
+            }
+            let poller_clone = Arc::clone(&poller);
             std::thread::Builder::new()
-                .name(format!("{}-shutdown-thread", id))
+                .name(format!("{}-poller-thread", id))
                 .spawn(move || {
+                    let span = info_span!("poller_thread", system=%id);
+                    let _entered = span.enter(); // safe to use here because we use new_current_thread
+                    info!("poller thread running");
                     tokio::runtime::Builder::new_current_thread()
                         .enable_time()
                         .enable_io()
                         .build()
                         .unwrap()
                         .block_on(async move {
-                            let state = state_clone;
-                            let mut state_guard = state.lock().unwrap();
-                            let cur = std::mem::replace(&mut *state_guard, PollerState::Undefined);
+                            let poller = poller_clone;
+                            let mut poller_guard = poller.lock().unwrap();
+                            let cur =
+                                std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
                             match cur {
-                                PollerState::SwitchingFromTaskToThread => {
-                                    *state_guard = PollerState::RunningInThread(inner);
-                                    drop(state_guard);
-                                    poller_impl(state)
+                                x @ PollerState::RunningInThread(_)
+                                | x @ PollerState::ShuttingDownPreemptible(_, _) => {
+                                    poller_guard.state = x;
+                                    drop(poller_guard);
+                                    poller_impl(poller)
                                         .instrument(info_span!("poller_thread", system=%id))
                                         .await
                                 }
                                 PollerState::Undefined
                                 | PollerState::RunningInTask(_)
-                                | PollerState::RunningInThread(_)
-                                | PollerState::ShuttingDown
+                                | PollerState::ShuttingDownNoMorePreemptible
                                 | PollerState::ShutDown => {
                                     unreachable!("unexpected state: {cur:x?}")
                                 }
@@ -1109,48 +1127,68 @@ async fn poller_task(id: usize, state: Arc<Mutex<PollerState>>, poller_ready: on
                 .unwrap();
         });
     let _ = poller_ready.send(());
-    poller_impl(state)
+    poller_impl(poller)
         .instrument(info_span!("poller_task", system=%id))
         .await;
+    // keep scopeguard alive across .await point
+    drop(switch_to_thread_if_task_gets_dropped);
 }
 
-async fn poller_impl(state: Arc<Mutex<PollerState>>) {
-    let inner = {
-        let state_guard = state.lock().unwrap();
-        match &*state_guard {
-            PollerState::Undefined | PollerState::SwitchingFromTaskToThread => {
-                panic!("implementation error")
+async fn poller_impl(poller: Arc<Mutex<Poller>>) {
+    info!("poller_impl running");
+    // Run poller_impl_impl. It only returns if we got a shutdown request.
+    // If we get cancelled at an await point, the caller's scope-guard will spawn an OS thread and re-run this function.
+    // So, keep book about our state.
+    let (inner_shared, shutdown_req_shared) = loop {
+        let inner = {
+            let mut poller_guard = poller.lock().unwrap();
+            let cur = std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
+            match cur {
+                PollerState::Undefined => {
+                    panic!("implementation error")
+                }
+                PollerState::ShuttingDownNoMorePreemptible => unreachable!(),
+                PollerState::ShutDown => {
+                    unreachable!("if poller_impl_impl shuts shuts down, we never get back here, caller guarantees it")
+                }
+                PollerState::ShuttingDownPreemptible(inner, req) => {
+                    let inner_clone = Arc::clone(&inner);
+                    let req_clone = Arc::clone(&req);
+                    poller_guard.state = PollerState::ShuttingDownPreemptible(inner, req);
+                    break (inner_clone, req_clone);
+                }
+                PollerState::RunningInTask(inner) => {
+                    let clone = Arc::clone(&inner);
+                    poller_guard.state = PollerState::RunningInTask(inner);
+                    clone
+                }
+                PollerState::RunningInThread(inner) => {
+                    let clone = Arc::clone(&inner);
+                    poller_guard.state = PollerState::RunningInThread(inner);
+                    clone
+                }
             }
-            PollerState::ShutDown => {
-                unreachable!("if poller_impl_impl shuts shuts down, we never get back here, caller guarantees it")
-            }
-            PollerState::ShuttingDown => {
-                unreachable!(
-                    "only this function transitions into that state, and then never revisits"
-                )
-            }
-            PollerState::RunningInTask(inner) | PollerState::RunningInThread(inner) => {
-                Arc::clone(&inner)
-            }
-        }
+        };
+        let shutdown_req: ShutdownRequest = poller_impl_impl(Arc::clone(&inner)).await;
+        poller.lock().unwrap().state =
+            PollerState::ShuttingDownPreemptible(inner, Arc::new(shutdown_req));
+        continue;
     };
-    let shutdown_req = poller_impl_impl(Arc::clone(&state), Arc::clone(&inner)).await;
-    let cur = std::mem::replace(&mut *state.lock().unwrap(), PollerState::ShuttingDown);
+    // We got the shutdown request; what do we need to do?
+    // 1. Prevent new ops from being submitted.
+    // 2. Wait for all inflight ops to finish.
+    // 3. Unsplit the uring by
+    //      3.1. By dropping Submitter, SubmissionQueue, CompletionQueue
+    //      3 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
+    // 4. Drop the IoUring struct, cleaning up the underlying kernel resources.
 
-    // Prevent new ops from being submitted.
-    // Wait for all inflight ops to finish.
-    // Unsplit the uring by
-    // 1. By dropping Submitter, SubmissionQueue, CompletionQueue
-    // 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
-    // Drop the IoUring struct, cleaning up the underlying kernel resources.
-
-    // Prevent new ops from being submitted:
-    // => SystemHandle::drop / SystemHandle::shutdown already plugged the submit side. Nothing to do.
+    // 1. Prevent new ops from being submitted:
+    // Already plugged the sumit side in SystemHandle::drop / SystemHandle::shutdown;
 
     // Wait for all inflight ops to finish.
     loop {
         {
-            let inner_guard = inner.lock().unwrap();
+            let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
             let ops_guard = completion_side_guard.ops.lock().unwrap();
             if ops_guard.unused_indices.len() == RING_SIZE as usize {
@@ -1159,42 +1197,55 @@ async fn poller_impl(state: Arc<Mutex<PollerState>>) {
             drop(ops_guard);
             completion_side_guard.process_completions();
         }
-        // if we get preempted here, e.g., because the runtime is getting dropped, then the task is in state ShuttingDown.
-        // The scopeguard in the caller will spawn a thread to re-call us and resume here
+        // If we get cancelled here, e.g., because the runtime is getting dropped,
+        // the Poller is in state ShuttingDown.
+        // The scopeguard in our caller will spawn an OS thread and re-run this function.
         tokio::task::yield_now().await;
     }
 
-    // no await preemption from here on, enforce it through the closure
+    // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
+    // (See comment on `yield_now().await` above why preemption is safe)
+    // Use a closure to enforce it.
     (move || {
-        drop(inner); // this should make us the only owner
-        let inner_owned: PollerStateInner = match cur {
-            PollerState::RunningInTask(inner) | PollerState::RunningInThread(inner) => {
+        let mut poller_guard = poller.lock().unwrap();
+        let cur = std::mem::replace(
+            &mut poller_guard.state,
+            PollerState::ShuttingDownNoMorePreemptible,
+        );
+        drop(poller_guard);
+        match cur {
+            x @ PollerState::RunningInTask(_)
+            | x @ PollerState::RunningInThread(_)
+            | x @ PollerState::ShutDown
+            | x @ PollerState::ShuttingDownNoMorePreemptible
+            | x @ PollerState::Undefined => unreachable!("unexpected state: {x:?}"),
+            PollerState::ShuttingDownPreemptible(inner, req) => {
+                assert!(Arc::ptr_eq(&inner_shared, &inner));
+                assert!(Arc::ptr_eq(&shutdown_req_shared, &req));
+                drop(inner_shared); // this should make `poller` the only owner, needed for try_unwrap below
+                drop(shutdown_req_shared); // this should make `poller` the only owner, needed for try_unwrap below
                 let owned = Arc::try_unwrap(inner)
                     .ok()
                     .expect("we replaced the state with ShuttingDown, so, we're the only owner");
-                Mutex::into_inner(owned).unwrap()
+                let inner_owned = Mutex::into_inner(owned).unwrap();
+                let req = Arc::try_unwrap(req)
+                    .ok()
+                    .expect("we replaced the state with ShuttingDown, so, we're the only owner");
+                poller_impl_finish_shutdown(inner_owned, req);
             }
-            PollerState::Undefined => todo!(),
-            PollerState::SwitchingFromTaskToThread => todo!(),
-            PollerState::ShuttingDown => todo!(),
-            PollerState::ShutDown => todo!(),
         };
-        poller_impl_finish_shutdown(inner_owned, shutdown_req);
-        *state.lock().unwrap() = PollerState::ShutDown;
+        poller.lock().unwrap().state = PollerState::ShutDown;
+        tracing::info!("poller finished shutdown");
     })()
 }
 
-async fn poller_impl_impl(
-    state: Arc<Mutex<PollerState>>,
-    inner: Arc<Mutex<PollerStateInner>>,
-) -> ShutdownRequest {
+async fn poller_impl_impl(inner: Arc<Mutex<PollerStateInner>>) -> ShutdownRequest {
     let (uring_fd, completion_side, shutdown_rx) = {
         let mut inner_guard = inner.lock().unwrap();
         let PollerStateInner {
-            id: _,
             uring_fd,
             completion_side,
-            system,
+            system: _,
             shutdown_rx: ref mut shutdown,
         } = &mut *inner_guard;
         (*uring_fd, Arc::clone(completion_side), shutdown.clone())
@@ -1275,7 +1326,6 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
     scopeguard::defer_on_unwind! {tracing::error!("poller shutdown panic")};
 
     let PollerStateInner {
-        id: _,
         uring_fd: _,
         completion_side,
         system,
@@ -1308,7 +1358,7 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
     let completion_side = Arc::try_unwrap(completion_side)
         .ok()
         .expect("we plugged the SubmitSide, so, all refs to CompletionSide are gone");
-    let mut completion_side = Mutex::into_inner(completion_side).unwrap();
+    let completion_side = Mutex::into_inner(completion_side).unwrap();
 
     // Unsplit the uring
     let CompletionSide {
@@ -1343,23 +1393,6 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
     // notify about completed shutdown;
     // ignore send errors, interest may be gone if it's implicit shutdown through SystemHandle::drop
     let _ = done_tx.send(());
-}
-
-impl SubmitSide {
-    pub(crate) async fn submit<R, MakeSqe>(self, rsrc: R, make_sqe: MakeSqe) -> R::OpResult
-    where
-        R: ResourcesOwnedByKernel + Send + Unpin + 'static,
-        MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
-    {
-        let slot_fut = {
-            let SubmitSide(inner) = self;
-            let mut submit_side_guard = inner.lock().unwrap();
-            let submit_side_open = submit_side_guard.must_open();
-            submit_side_open.get_ops_slot()
-        };
-        let slot = slot_fut.await;
-        slot.submit(rsrc, make_sqe).await
-    }
 }
 
 #[cfg(test)]
