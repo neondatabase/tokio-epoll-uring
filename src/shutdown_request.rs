@@ -1,7 +1,4 @@
-use std::{
-    pin::Pin,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 enum State<T> {
     Undefined,

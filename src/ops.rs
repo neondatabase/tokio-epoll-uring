@@ -1,10 +1,5 @@
 pub mod read;
 
-use std::{
-    os::fd::{AsRawFd, OwnedFd},
-    pin::Pin,
-};
-
 use futures::{Future, FutureExt};
 
 use crate::system::{ResourcesOwnedByKernel, SubmitSide, SubmitSideProvider};
@@ -39,18 +34,6 @@ pub(crate) trait OpTrait: ResourcesOwnedByKernel + Sized + Send + 'static {
             system_launcher: launcher,
             make_op: self,
         }
-    }
-}
-
-pub(crate) fn op<L, P, O, R>(system_launcher: L, make_op: O) -> OpFut<L, P, O>
-where
-    L: Future<Output = P> + Unpin,
-    P: SubmitSideProvider,
-    O: OpTrait + Send + 'static,
-{
-    OpFut::NeedLaunch {
-        system_launcher,
-        make_op,
     }
 }
 

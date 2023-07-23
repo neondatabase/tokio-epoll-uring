@@ -86,7 +86,7 @@ async fn main() {
 
             let buf = vec![0; 2048];
             let (_file, buf, res) = tokio_io_uring_eventfd_bridge::read(
-                tokio_io_uring_eventfd_bridge::thread_local_system(),
+                tokio_io_uring_eventfd_bridge::ThreadLocalSystemHandle,
                 file.into(),
                 512,
                 buf,

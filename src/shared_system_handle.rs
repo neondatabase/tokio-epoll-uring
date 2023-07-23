@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use futures::Future;
 
-use crate::system::{SubmitSide, SystemHandleState, SystemHandle};
+use crate::system::{SubmitSide, SystemHandle, SystemHandleState};
 use crate::system::{SubmitSideProvider, System};
 
 #[derive(Clone)]

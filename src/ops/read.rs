@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::{system::ResourcesOwnedByKernel, SubmitSideProvider};
+use crate::system::{ResourcesOwnedByKernel, SubmitSideProvider};
 
 use super::OpTrait;
 

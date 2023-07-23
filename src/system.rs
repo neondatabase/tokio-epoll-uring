@@ -306,7 +306,6 @@ impl SystemHandleLive {
 //     impl Sealed for &'_ super::SystemHandle {}
 // }
 
-
 impl SubmitSideProvider for &'_ SystemHandle {
     fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
         f(self.state.guaranteed_live().submit_side.clone())
@@ -1365,13 +1364,9 @@ impl SubmitSide {
 
 #[cfg(test)]
 mod submit_side_tests {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use crate::SharedSystemHandle;
 
-    use tracing::trace;
-
-    use crate::SubmitSideProvider;
-
-    use super::{InflightOpHandle, NotInflightSlotHandle};
+    use super::{InflightOpHandle, NotInflightSlotHandle, SubmitSideProvider};
     struct MockOp {}
     fn submit_mock_op(slot: NotInflightSlotHandle) -> InflightOpHandle<MockOp> {
         impl super::ResourcesOwnedByKernel for MockOp {
@@ -1398,7 +1393,7 @@ mod submit_side_tests {
 
     #[tokio::test]
     async fn submit_panics_after_shutdown() {
-        let system = crate::launch_shared().await;
+        let system = SharedSystemHandle::launch().await;
 
         // get a slot
         let slot = system
@@ -1429,7 +1424,7 @@ mod submit_side_tests {
     async fn shutdown_waits_for_ongoing_ops() {
         // tracing_subscriber::fmt::init();
 
-        let system = crate::launch_shared().await;
+        let system = SharedSystemHandle::launch().await;
         let slot = system
             .clone()
             .with_submit_side(|submit_side| {
@@ -1470,7 +1465,7 @@ mod submit_side_tests {
             .unwrap();
 
         let (slot, shutdown_done) = rt.block_on(async move {
-            let system = crate::launch_shared().await;
+            let system = SharedSystemHandle::launch().await;
             let slot = system
                 .clone()
                 .with_submit_side(|submit_side| {
