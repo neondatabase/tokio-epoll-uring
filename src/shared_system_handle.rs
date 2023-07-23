@@ -47,6 +47,6 @@ impl SharedSystemHandle {
             .unwrap()
             .take()
             .expect("SharedSystemHandle already shut down")
-            .shutdown()
+            .initiate_shutdown()
     }
 }

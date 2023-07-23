@@ -109,7 +109,7 @@ impl Drop for ThreadLocalState {
             }
             ThreadLocalStateInner::Launched(system) => {
                 // on implicit shutdown, we don't care about when it finishes
-                let _ = system.shutdown();
+                let _ = system.initiate_shutdown();
             }
             ThreadLocalStateInner::Dropped => {
                 unreachable!("ThreadLocalState::drop() had already been called in the past");

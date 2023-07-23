@@ -1,7 +1,9 @@
 use std::{
+    cell::Cell,
     collections::HashMap,
     future::Future,
     os::fd::AsRawFd,
+    rc::Rc,
     sync::{Arc, Mutex, Weak},
 };
 
@@ -31,7 +33,10 @@ pub struct Launch {
 }
 
 enum LaunchState {
-    Init,
+    Init {
+        // TODO: cfg test
+        poller_preempt: Option<PollerTesting>,
+    },
     WaitForPollerTaskToStart {
         poller_ready_rx: oneshot::Receiver<()>,
         system_handle_not_safe_for_use_yet: SystemHandle,
@@ -47,7 +52,21 @@ impl System {
         let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Launch {
             id,
-            state: LaunchState::Init,
+            state: LaunchState::Init {
+                poller_preempt: None,
+            },
+        }
+    }
+    #[cfg(test)]
+    fn launch_with_testing(poller_preempt: PollerTesting) -> Launch {
+        static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Launch {
+            id,
+            state: LaunchState::Init {
+                poller_preempt: Some(poller_preempt),
+            },
         }
     }
 }
@@ -65,7 +84,7 @@ impl Future for Launch {
             let cur = { std::mem::replace(&mut myself.state, LaunchState::Undefined) };
             match cur {
                 LaunchState::Undefined => unreachable!("implementation error"),
-                LaunchState::Init => {
+                LaunchState::Init { poller_preempt } => {
                     // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
                     let (waiters_tx, waiters_rx) = tokio::sync::mpsc::unbounded_channel();
                     let ops = Arc::new_cyclic(|myself| {
@@ -114,7 +133,11 @@ impl Future for Launch {
                         }))),
                     }));
                     let (poller_ready_tx, poller_ready_rx) = oneshot::channel();
-                    tokio::task::spawn(poller_task(poller_task_state, poller_ready_tx));
+                    tokio::task::spawn(poller_task(
+                        Arc::clone(&poller_task_state),
+                        poller_ready_tx,
+                        poller_preempt,
+                    ));
                     let system_handle_not_safe_for_use_yet = SystemHandle {
                         state: SystemHandleState::KeepSystemAlive(SystemHandleLive {
                             id,
@@ -211,7 +234,7 @@ impl SystemHandle {
     /// Shutdown may spawn an `std::thread` for this purpose.
     /// It would generally be unsafe to have "force shutdown" after a timeout because
     /// in io_uring, the kernel owns resources such as memory buffers while operations are in flight.
-    pub fn shutdown(mut self) -> impl Future<Output = ()> + Send + Unpin {
+    pub fn initiate_shutdown(mut self) -> impl Future<Output = ()> + Send + Unpin {
         let cur = std::mem::replace(
             &mut self.state,
             SystemHandleState::ExplicitShutdownRequestOngoing,
@@ -1061,10 +1084,37 @@ struct PollerStateInner {
     shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
 }
 
-async fn poller_task(poller: Arc<Mutex<Poller>>, poller_ready: oneshot::Sender<()>) {
+struct PollerTesting {
+    shutdown_loop_reached_tx: tokio::sync::mpsc::UnboundedSender<Arc<Mutex<Poller>>>,
+    preempt_rx: oneshot::Receiver<()>,
+    poller_switch_to_thread_done_tx: oneshot::Sender<Arc<Mutex<Poller>>>,
+}
+
+async fn poller_task(
+    poller: Arc<Mutex<Poller>>,
+    poller_ready: oneshot::Sender<()>,
+    testing: Option<PollerTesting>,
+) {
     let id = poller.lock().unwrap().id;
-    let switch_to_thread_if_task_gets_dropped =
-        scopeguard::guard(Arc::clone(&poller), move |poller| {
+    let preempt;
+    let poller_switch_to_thread_done;
+    let shutdown_loop_reached;
+    match testing {
+        None => {
+            preempt = None;
+            poller_switch_to_thread_done = None;
+            shutdown_loop_reached = None;
+        }
+        Some(testing) => {
+            preempt = Some(testing.preempt_rx);
+            poller_switch_to_thread_done = Some(testing.poller_switch_to_thread_done_tx);
+            shutdown_loop_reached = Some(testing.shutdown_loop_reached_tx);
+        }
+    }
+    let switch_to_thread_if_task_gets_dropped = scopeguard::guard(
+        (Arc::clone(&poller), poller_switch_to_thread_done),
+        |(poller, poller_switch_to_thread_done)| {
+            let shutdown_loop_reached = shutdown_loop_reached.clone();
             let span = info_span!("poller_task_scopeguard", system=%id);
             let _entered = span.enter(); // safe to use here because there's no more .await
             let mut poller_guard = poller.lock().unwrap();
@@ -1111,7 +1161,11 @@ async fn poller_task(poller: Arc<Mutex<Poller>>, poller_ready: oneshot::Sender<(
                                 | x @ PollerState::ShuttingDownPreemptible(_, _) => {
                                     poller_guard.state = x;
                                     drop(poller_guard);
-                                    poller_impl(poller)
+                                    if let Some(tx) = poller_switch_to_thread_done {
+                                        // receiver must ensure that clone doesn't outlive the try_unwrap during shutdown
+                                        tx.send(Arc::clone(&poller)).ok().unwrap();
+                                    }
+                                    poller_impl(poller, shutdown_loop_reached.clone())
                                         .instrument(info_span!("poller_thread", system=%id))
                                         .await
                                 }
@@ -1125,16 +1179,30 @@ async fn poller_task(poller: Arc<Mutex<Poller>>, poller_ready: oneshot::Sender<(
                         })
                 })
                 .unwrap();
-        });
+        },
+    );
+    // scopeguard is installed, call the launch complete
     let _ = poller_ready.send(());
-    poller_impl(poller)
-        .instrument(info_span!("poller_task", system=%id))
-        .await;
-    // keep scopeguard alive across .await point
+    tokio::select! {
+        _ = poller_impl(Arc::clone(&poller), shutdown_loop_reached.clone()).instrument(info_span!("poller_task", system=%id)) => {},
+        _ = async move { match preempt {
+            Some(preempt) => {
+                preempt.await
+            },
+            None => {
+                futures::future::pending().await
+            },
+        } } => { },
+    }
+
+    // just to make it abundantely clear that scopeguard is _also_ involved on regular control flow
     drop(switch_to_thread_if_task_gets_dropped);
 }
 
-async fn poller_impl(poller: Arc<Mutex<Poller>>) {
+async fn poller_impl(
+    poller: Arc<Mutex<Poller>>,
+    shutdown_loop_reached: Option<tokio::sync::mpsc::UnboundedSender<Arc<Mutex<Poller>>>>,
+) {
     info!("poller_impl running");
     // Run poller_impl_impl. It only returns if we got a shutdown request.
     // If we get cancelled at an await point, the caller's scope-guard will spawn an OS thread and re-run this function.
@@ -1186,6 +1254,10 @@ async fn poller_impl(poller: Arc<Mutex<Poller>>) {
     // Already plugged the sumit side in SystemHandle::drop / SystemHandle::shutdown;
 
     // Wait for all inflight ops to finish.
+    if let Some(tx) = shutdown_loop_reached {
+        // receiver must ensure that clone doesn't outlive the try_unwrap during shutdown
+        tx.send(Arc::clone(&poller)).ok().unwrap();
+    }
     loop {
         {
             let inner_guard = inner_shared.lock().unwrap();
@@ -1397,9 +1469,11 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
 
 #[cfg(test)]
 mod submit_side_tests {
-    use crate::SharedSystemHandle;
+    use std::sync::{Arc, Mutex};
 
-    use super::{InflightOpHandle, NotInflightSlotHandle, SubmitSideProvider};
+    use crate::{system::Poller, SharedSystemHandle, System};
+
+    use super::{InflightOpHandle, NotInflightSlotHandle, PollerTesting, SubmitSideProvider};
     struct MockOp {}
     fn submit_mock_op(slot: NotInflightSlotHandle) -> InflightOpHandle<MockOp> {
         impl super::ResourcesOwnedByKernel for MockOp {
@@ -1489,18 +1563,29 @@ mod submit_side_tests {
     }
 
     #[test]
-    fn poller_task_dropped_during_shutdown() {
+    fn poller_task_dropped_during_shutdown_switches_to_thread() {
         // tracing_subscriber::fmt::init();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
+        // multi-thread runtime because we need to wait for preempt_done_rx in this thread.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
 
+        let (poller_switch_to_thread_done_tx, poller_switch_to_thread_done_rx) =
+            tokio::sync::oneshot::channel();
+        let (shutdown_loop_reached_tx, mut shutdown_loop_reached_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (preempt_tx, preempt_rx) = tokio::sync::oneshot::channel();
+        let testing = PollerTesting {
+            shutdown_loop_reached_tx,
+            preempt_rx,
+            poller_switch_to_thread_done_tx,
+        };
         let (slot, shutdown_done) = rt.block_on(async move {
-            let system = SharedSystemHandle::launch().await;
+            let system = System::launch_with_testing(testing).await;
             let slot = system
-                .clone()
                 .with_submit_side(|submit_side| {
                     let mut guard = submit_side.0.lock().unwrap();
                     let guard = guard.must_open();
@@ -1508,19 +1593,43 @@ mod submit_side_tests {
                 })
                 .await;
             // When we send shutdown, the slot will keep the poller task in the shutdown process_completions loop.
-            // Then we'll drop the rt, which causes the poller task to get dropped.
+            // Then we'll use the preempt_tx to cancel the poller task future.
             // We should observe a transition to RunningInThread.
-            let shutdown_done = system.initiate_shutdown();
-            (slot, shutdown_done)
+            let shutdown_done_fut = system.initiate_shutdown();
+            (slot, shutdown_done_fut)
         });
-        rt.shutdown_background();
+        let poller = shutdown_loop_reached_rx.blocking_recv().unwrap();
+        assert!(
+            matches!(
+                poller.lock().unwrap().state,
+                super::PollerState::ShuttingDownPreemptible(_, _)
+            ),
+            " state is {:?}",
+            poller.lock().unwrap().state
+        );
+        preempt_tx.send(()).ok().unwrap();
+        drop(poller);
+        let poller = poller_switch_to_thread_done_rx.blocking_recv().unwrap();
+        assert!(
+            matches!(
+                poller.lock().unwrap().state,
+                super::PollerState::ShuttingDownPreemptible(_, _)
+            ),
+            " state is {:?}",
+            poller.lock().unwrap().state
+        );
+        drop(poller);
+        // NB: both above drop(poller) are crucial so that the shutdown loop's Arc::try_unwrap will succeed
 
-        let new_rt = tokio::runtime::Builder::new_current_thread()
+        // quick check to ensure the shutdown_done future is not ready yet;
+        // we shouldn't signal shutdown_done until end of shutdown, even if we switch to the thread
+
+        let second_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
-
-        new_rt.block_on(async move {
+        second_rt.block_on(async move {
             let mut shutdown_done = shutdown_done;
             tokio::select! {
                 // TODO don't rely on timing
@@ -1529,6 +1638,7 @@ mod submit_side_tests {
                     panic!("shutdown should not complete until submit_fut is done");
                 }
             }
+
             // clear the slot
             drop(slot);
 
@@ -1540,5 +1650,11 @@ mod submit_side_tests {
                 _ = &mut shutdown_done => { }
             }
         });
+    }
+
+    #[tokio::test]
+    async fn drop_system_handle() {
+        let system = System::launch().await;
+        drop(system);
     }
 }
