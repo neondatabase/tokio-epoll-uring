@@ -1,6 +1,23 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::system::{ResourcesOwnedByKernel, SubmitSideProvider};
+use futures::Future;
+
+use crate::system::{self, ResourcesOwnedByKernel, SubmitSide, SubmitSideProvider};
+
+pub async fn read_lazy<'a, L, P, B>(
+    system_launcher: L,
+    file: OwnedFd,
+    offset: u64,
+    buf: B,
+) -> (OwnedFd, B, std::io::Result<usize>)
+where
+    P: SubmitSideProvider,
+    L: Future<Output = P>,
+    B: tokio_uring::buf::IoBufMut + Send,
+{
+    let provider = system_launcher.await;
+    read(provider, file, offset, buf).await
+}
 
 pub async fn read<S, B>(
     submit_provider: S,

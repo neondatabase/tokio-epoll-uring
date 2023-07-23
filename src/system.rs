@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use tokio::sync::oneshot;
 use tracing::{debug, info_span, trace, Instrument};
@@ -24,68 +25,133 @@ unsafe impl Send for System {}
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
 unsafe impl Sync for System {}
 
+pub(crate) struct Launch {
+    id: usize,
+    state: LaunchState,
+}
+
+enum LaunchState {
+    Init,
+    WaitForPollerTaskToStart {
+        poller_ready_rx: oneshot::Receiver<()>,
+        system_handle_not_safe_for_use_yet: SystemHandle,
+    },
+    Launched,
+    Undefined,
+}
+
 impl System {
-    pub(crate) async fn launch() -> SystemHandle {
+    pub(crate) fn launch() -> Launch {
         static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
-        let (waiters_tx, waiters_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ops = Arc::new_cyclic(|myself| {
-            Mutex::new(Ops {
-                id,
-                storage: array_macro::array![_ => None; RING_SIZE as usize],
-                unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
-                waiters_rx,
-                myself: Weak::clone(&myself),
-            })
-        });
-        let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
-        let uring_fd = unsafe { (*uring).as_raw_fd() };
-        let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
-
-        let completion_side = Arc::new(Mutex::new(CompletionSide {
+        Launch {
             id,
-            cq,
-            ops: ops.clone(),
-            submit_side: Weak::new(),
-        }));
+            state: LaunchState::Init,
+        }
+    }
+}
 
-        let submit_side = Arc::new_cyclic(|myself| {
-            Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
-                id,
-                submitter,
-                sq,
-                completion_side: Arc::clone(&completion_side),
-                ops,
-                waiters_tx,
-                myself: Weak::clone(myself),
-            }))
-        });
-        let system = System {
-            id,
-            split_uring: uring,
-        };
-        let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
-        let poller_task_state = Arc::new(Mutex::new(PollerState::RunningInTask(Arc::new(
-            Mutex::new(PollerStateInner {
-                id,
-                uring_fd,
-                completion_side,
-                system,
-                shutdown_rx,
-            }),
-        ))));
-        let (poller_ready_tx, poller_ready_rx) = oneshot::channel();
-        tokio::task::spawn(poller_task(id, poller_task_state, poller_ready_tx));
-        poller_ready_rx.await;
-        SystemHandle {
-            state: SystemHandleState::KeepSystemAlive(SystemHandleLive {
-                id,
-                submit_side: SubmitSide(submit_side),
-                shutdown_tx,
-            }),
+impl Future for Launch {
+    type Output = SystemHandle;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let id = self.id;
+        let myself = self.get_mut();
+        loop {
+            let cur = { std::mem::replace(&mut myself.state, LaunchState::Undefined) };
+            match cur {
+                LaunchState::Undefined => unreachable!("implementation error"),
+                LaunchState::Init => {
+                    // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
+                    let (waiters_tx, waiters_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let ops = Arc::new_cyclic(|myself| {
+                        Mutex::new(Ops {
+                            id,
+                            storage: array_macro::array![_ => None; RING_SIZE as usize],
+                            unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
+                            waiters_rx,
+                            myself: Weak::clone(&myself),
+                        })
+                    });
+                    let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
+                    let uring_fd = unsafe { (*uring).as_raw_fd() };
+                    let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
+
+                    let completion_side = Arc::new(Mutex::new(CompletionSide {
+                        id,
+                        cq,
+                        ops: ops.clone(),
+                        submit_side: Weak::new(),
+                    }));
+
+                    let submit_side = Arc::new_cyclic(|myself| {
+                        Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
+                            id,
+                            submitter,
+                            sq,
+                            completion_side: Arc::clone(&completion_side),
+                            ops,
+                            waiters_tx,
+                            myself: Weak::clone(myself),
+                        }))
+                    });
+                    let system = System {
+                        id,
+                        split_uring: uring,
+                    };
+                    let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
+                    let poller_task_state = Arc::new(Mutex::new(PollerState::RunningInTask(
+                        Arc::new(Mutex::new(PollerStateInner {
+                            id,
+                            uring_fd,
+                            completion_side,
+                            system,
+                            shutdown_rx,
+                        })),
+                    )));
+                    let (poller_ready_tx, poller_ready_rx) = oneshot::channel();
+                    tokio::task::spawn(poller_task(id, poller_task_state, poller_ready_tx));
+                    let system_handle_not_safe_for_use_yet = SystemHandle {
+                        state: SystemHandleState::KeepSystemAlive(SystemHandleLive {
+                            id,
+                            submit_side: SubmitSide(submit_side),
+                            shutdown_tx,
+                        }),
+                    };
+                    myself.state = LaunchState::WaitForPollerTaskToStart {
+                        poller_ready_rx,
+                        system_handle_not_safe_for_use_yet,
+                    };
+                    continue;
+                }
+                LaunchState::WaitForPollerTaskToStart {
+                    mut poller_ready_rx,
+                    system_handle_not_safe_for_use_yet,
+                } => match poller_ready_rx.poll_unpin(cx) {
+                    std::task::Poll::Ready(Ok(())) => {
+                        myself.state = LaunchState::Launched;
+                        return std::task::Poll::Ready(system_handle_not_safe_for_use_yet);
+                    }
+                    std::task::Poll::Ready(Err(_)) => {
+                        // TODO can this happen?
+                        panic!("implementation error: poller task must not die before SystemHandle")
+                    }
+                    std::task::Poll::Pending => {
+                        myself.state = LaunchState::WaitForPollerTaskToStart {
+                            poller_ready_rx,
+                            system_handle_not_safe_for_use_yet,
+                        };
+                        return std::task::Poll::Pending;
+                    }
+                },
+                LaunchState::Launched => {
+                    unreachable!("we already returned Ready(SystemHandle) above, polling after is not allowed");
+                }
+            }
         }
     }
 }
@@ -632,7 +698,11 @@ enum UnsafeOpsSlotHandleSubmitError {
 }
 
 impl UnsafeOpsSlotHandle {
-    fn submit<R, MakeSqe>(self, mut rsrc: R, make_sqe: MakeSqe) -> Result<InflightOpHandle<R>, UnsafeOpsSlotHandleSubmitError>
+    fn submit<R, MakeSqe>(
+        self,
+        mut rsrc: R,
+        make_sqe: MakeSqe,
+    ) -> Result<InflightOpHandle<R>, UnsafeOpsSlotHandleSubmitError>
     where
         R: ResourcesOwnedByKernel + Send + 'static,
         MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
@@ -1342,7 +1412,7 @@ mod submit_side_tests {
         let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel::<()>();
         let jh = tokio::spawn(async move {
             shutdown_started_rx.await.unwrap();
-            assert_panic::assert_panic!{
+            assert_panic::assert_panic! {
                 { let _ = submit_mock_op(slot); },
                 &str,
                 "cannot use slot for submission, SubmitSide is already plugged"
