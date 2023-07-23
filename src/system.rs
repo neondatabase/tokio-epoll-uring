@@ -9,7 +9,7 @@ use std::{
 
 use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
-use tokio::sync::oneshot;
+use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
 use crate::shutdown_request::WaitForShutdownResult;
@@ -1086,7 +1086,8 @@ struct PollerStateInner {
 
 struct PollerTesting {
     shutdown_loop_reached_tx: tokio::sync::mpsc::UnboundedSender<Arc<Mutex<Poller>>>,
-    preempt_rx: oneshot::Receiver<()>,
+    preempt_outer_rx: oneshot::Receiver<()>,
+    preempt_during_epoll_rx: oneshot::Receiver<()>,
     poller_switch_to_thread_done_tx: oneshot::Sender<Arc<Mutex<Poller>>>,
 }
 
@@ -1096,19 +1097,22 @@ async fn poller_task(
     testing: Option<PollerTesting>,
 ) {
     let id = poller.lock().unwrap().id;
-    let preempt;
+    let preempt_outer_rx;
     let poller_switch_to_thread_done;
     let shutdown_loop_reached;
+    let preempt_during_epoll_rx;
     match testing {
         None => {
-            preempt = None;
+            preempt_outer_rx = None;
             poller_switch_to_thread_done = None;
             shutdown_loop_reached = None;
+            preempt_during_epoll_rx = None;
         }
         Some(testing) => {
-            preempt = Some(testing.preempt_rx);
+            preempt_outer_rx = Some(testing.preempt_outer_rx);
             poller_switch_to_thread_done = Some(testing.poller_switch_to_thread_done_tx);
             shutdown_loop_reached = Some(testing.shutdown_loop_reached_tx);
+            preempt_during_epoll_rx = Some(testing.preempt_during_epoll_rx);
         }
     }
     let switch_to_thread_if_task_gets_dropped = scopeguard::guard(
@@ -1165,7 +1169,7 @@ async fn poller_task(
                                         // receiver must ensure that clone doesn't outlive the try_unwrap during shutdown
                                         tx.send(Arc::clone(&poller)).ok().unwrap();
                                     }
-                                    poller_impl(poller, shutdown_loop_reached.clone())
+                                    poller_impl(poller, None, shutdown_loop_reached.clone())
                                         .instrument(info_span!("poller_thread", system=%id))
                                         .await
                                 }
@@ -1183,9 +1187,21 @@ async fn poller_task(
     );
     // scopeguard is installed, call the launch complete
     let _ = poller_ready.send(());
+    let (preempt_during_epoll_doit_tx, preempt_during_epoll_doit_rx) = broadcast::channel(1);
+    let (preempt_due_to_preempt_durign_epoll_tx, mut preempt_due_to_preempt_during_epoll_rx) =
+        mpsc::unbounded_channel();
+    if let Some(rx) = preempt_during_epoll_rx {
+        tokio::spawn(async move {
+            let _ = rx.await;
+            preempt_during_epoll_doit_tx
+                .send(preempt_due_to_preempt_durign_epoll_tx)
+                .unwrap();
+        });
+    }
     tokio::select! {
-        _ = poller_impl(Arc::clone(&poller), shutdown_loop_reached.clone()).instrument(info_span!("poller_task", system=%id)) => {},
-        _ = async move { match preempt {
+        _ = poller_impl(Arc::clone(&poller), Some(preempt_during_epoll_doit_rx) , shutdown_loop_reached.clone()).instrument(info_span!("poller_task", system=%id)) => {},
+        _ = preempt_due_to_preempt_during_epoll_rx.recv() => { },
+        _ = async move { match preempt_outer_rx {
             Some(preempt) => {
                 preempt.await
             },
@@ -1201,47 +1217,57 @@ async fn poller_task(
 
 async fn poller_impl(
     poller: Arc<Mutex<Poller>>,
+    preempt_in_epoll: Option<sync::broadcast::Receiver<mpsc::UnboundedSender<()>>>,
     shutdown_loop_reached: Option<tokio::sync::mpsc::UnboundedSender<Arc<Mutex<Poller>>>>,
 ) {
     info!("poller_impl running");
     // Run poller_impl_impl. It only returns if we got a shutdown request.
     // If we get cancelled at an await point, the caller's scope-guard will spawn an OS thread and re-run this function.
     // So, keep book about our state.
-    let (inner_shared, shutdown_req_shared) = loop {
-        let inner = {
-            let mut poller_guard = poller.lock().unwrap();
-            let cur = std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
-            match cur {
-                PollerState::Undefined => {
-                    panic!("implementation error")
-                }
-                PollerState::ShuttingDownNoMorePreemptible => unreachable!(),
-                PollerState::ShutDown => {
-                    unreachable!("if poller_impl_impl shuts shuts down, we never get back here, caller guarantees it")
-                }
-                PollerState::ShuttingDownPreemptible(inner, req) => {
-                    let inner_clone = Arc::clone(&inner);
-                    let req_clone = Arc::clone(&req);
-                    poller_guard.state = PollerState::ShuttingDownPreemptible(inner, req);
-                    break (inner_clone, req_clone);
-                }
-                PollerState::RunningInTask(inner) => {
-                    let clone = Arc::clone(&inner);
-                    poller_guard.state = PollerState::RunningInTask(inner);
-                    clone
-                }
-                PollerState::RunningInThread(inner) => {
-                    let clone = Arc::clone(&inner);
-                    poller_guard.state = PollerState::RunningInThread(inner);
-                    clone
-                }
+    let (inner_shared, maybe_shutdown_req_shared) = {
+        let mut poller_guard = poller.lock().unwrap();
+        let cur = std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
+        match cur {
+            PollerState::Undefined => {
+                panic!("implementation error")
             }
-        };
-        let shutdown_req: ShutdownRequest = poller_impl_impl(Arc::clone(&inner)).await;
-        poller.lock().unwrap().state =
-            PollerState::ShuttingDownPreemptible(inner, Arc::new(shutdown_req));
-        continue;
+            PollerState::ShuttingDownNoMorePreemptible => unreachable!(),
+            PollerState::ShutDown => {
+                unreachable!("if poller_impl_impl shuts shuts down, we never get back here, caller guarantees it")
+            }
+            PollerState::ShuttingDownPreemptible(inner, req) => {
+                let inner_clone = Arc::clone(&inner);
+                let req_clone = Arc::clone(&req);
+                poller_guard.state = PollerState::ShuttingDownPreemptible(inner, req);
+                (inner_clone, Some(req_clone))
+            }
+            PollerState::RunningInTask(inner) => {
+                let clone = Arc::clone(&inner);
+                poller_guard.state = PollerState::RunningInTask(inner);
+                (clone, None)
+            }
+            PollerState::RunningInThread(inner) => {
+                let clone = Arc::clone(&inner);
+                poller_guard.state = PollerState::RunningInThread(inner);
+                (clone, None)
+            }
+        }
     };
+    let shutdown_req_shared = match maybe_shutdown_req_shared {
+        None => {
+            let shutdown_req: ShutdownRequest = tokio::select! {
+                req = poller_impl_impl(Arc::clone(&inner_shared), preempt_in_epoll) => { req },
+            };
+            let shared = Arc::new(shutdown_req);
+            poller.lock().unwrap().state = PollerState::ShuttingDownPreemptible(
+                Arc::clone(&inner_shared),
+                Arc::clone(&shared),
+            );
+            shared
+        }
+        Some(shared) => shared,
+    };
+
     // We got the shutdown request; what do we need to do?
     // 1. Prevent new ops from being submitted.
     // 2. Wait for all inflight ops to finish.
@@ -1311,7 +1337,10 @@ async fn poller_impl(
     })()
 }
 
-async fn poller_impl_impl(inner: Arc<Mutex<PollerStateInner>>) -> ShutdownRequest {
+async fn poller_impl_impl(
+    inner: Arc<Mutex<PollerStateInner>>,
+    mut preempt_in_epoll: Option<tokio::sync::broadcast::Receiver<mpsc::UnboundedSender<()>>>,
+) -> ShutdownRequest {
     let (uring_fd, completion_side, shutdown_rx) = {
         let mut inner_guard = inner.lock().unwrap();
         let PollerStateInner {
@@ -1332,6 +1361,21 @@ async fn poller_impl_impl(inner: Arc<Mutex<PollerStateInner>>) -> ShutdownReques
             let mut guard = tokio::select! {
                 ready_res = fd.ready(tokio::io::Interest::READABLE) => {
                     ready_res.unwrap()
+                }
+                _ = async {
+                    match &mut preempt_in_epoll {
+                        Some(preempt) => {
+                            let tell_caller = preempt.resubscribe().recv().await.unwrap();
+                            tell_caller.send(()).ok().unwrap();
+                            futures::future::pending::<()>().await;
+                            unreachable!("we should get dropped at above .await point");
+                        },
+                        None => {
+                            futures::future::pending().await
+                        },
+                    }
+                } => {
+                    unreachable!("see above");
                 }
                 rx = shutdown_rx.wait_for_shutdown_request()  => {
                     match rx {
@@ -1469,7 +1513,10 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
 
 #[cfg(test)]
 mod submit_side_tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        sync::{Arc, Mutex},
+    };
 
     use crate::{system::Poller, SharedSystemHandle, System};
 
@@ -1577,11 +1624,13 @@ mod submit_side_tests {
             tokio::sync::oneshot::channel();
         let (shutdown_loop_reached_tx, mut shutdown_loop_reached_rx) =
             tokio::sync::mpsc::unbounded_channel();
-        let (preempt_tx, preempt_rx) = tokio::sync::oneshot::channel();
+        let (preempt_outer_tx, preempt_outer_rx) = tokio::sync::oneshot::channel();
+        let (_preempt_during_epoll_tx, preempt_during_epoll_rx) = tokio::sync::oneshot::channel();
         let testing = PollerTesting {
             shutdown_loop_reached_tx,
-            preempt_rx,
+            preempt_outer_rx,
             poller_switch_to_thread_done_tx,
+            preempt_during_epoll_rx,
         };
         let (slot, shutdown_done) = rt.block_on(async move {
             let system = System::launch_with_testing(testing).await;
@@ -1607,7 +1656,7 @@ mod submit_side_tests {
             " state is {:?}",
             poller.lock().unwrap().state
         );
-        preempt_tx.send(()).ok().unwrap();
+        preempt_outer_tx.send(()).ok().unwrap();
         drop(poller);
         let poller = poller_switch_to_thread_done_rx.blocking_recv().unwrap();
         assert!(
@@ -1649,6 +1698,90 @@ mod submit_side_tests {
                 }
                 _ = &mut shutdown_done => { }
             }
+        });
+    }
+
+    #[test]
+    fn poller_task_dropped_during_epoll_switches_to_thread() {
+        // tracing_subscriber::fmt::init();
+
+        // multi-thread runtime because we need to wait for preempt_done_rx in this thread.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (poller_switch_to_thread_done_tx, poller_switch_to_thread_done_rx) =
+            tokio::sync::oneshot::channel();
+        let (shutdown_loop_reached_tx, _shutdown_loop_reached_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (_preempt_outer_tx, preempt_outer_rx) = tokio::sync::oneshot::channel();
+        let (preempt_during_epoll_tx, preempt_during_epoll_rx) = tokio::sync::oneshot::channel();
+        let testing = PollerTesting {
+            shutdown_loop_reached_tx,
+            preempt_outer_rx,
+            poller_switch_to_thread_done_tx,
+            preempt_during_epoll_rx,
+        };
+
+        let (read_task_jh, mut writer) = rt.block_on(async move {
+            let (reader, writer) = os_pipe::pipe().unwrap();
+            let jh = tokio::spawn(async move {
+                let system = System::launch_with_testing(testing).await;
+                let reader =
+                    unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
+                let buf = vec![0; 1];
+                let (reader, buf, res) =
+                    crate::read(std::future::ready(&system), reader, 0, buf).await;
+                res.unwrap();
+                assert_eq!(buf, &[1]);
+                // now we know it has reached the epoll loop once
+                // next call is the one to be interrupted
+                let (_, buf, res) = crate::read(std::future::ready(&system), reader, 0, buf).await;
+                res.unwrap();
+                assert_eq!(buf, &[2]);
+                system
+            });
+            (jh, writer)
+        });
+        use std::io::Write;
+        // unblock first read
+        writer.write_all(&[1]).unwrap();
+        preempt_during_epoll_tx.send(()).unwrap();
+
+        let poller = poller_switch_to_thread_done_rx.blocking_recv().unwrap();
+        assert!(
+            matches!(
+                poller.lock().unwrap().state,
+                super::PollerState::RunningInThread(_)
+            ),
+            " state is {:?}",
+            poller.lock().unwrap().state
+        );
+        drop(poller);
+        // NB: above drop(poller) is crucial so that the shutdown loop's Arc::try_unwrap will succeed
+
+        assert!(!read_task_jh.is_finished());
+
+        writer.write_all(&[2]).unwrap();
+
+        let second_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        second_rt.block_on(async move {
+            let system = tokio::select! {
+                // TODO don't rely on timing
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    panic!("read should complete as soon as we write the second byte")
+                }
+                system = read_task_jh => { system.unwrap() }
+            };
+
+            // ensure system shutdown works if we're in the thread, not task
+            system.initiate_shutdown().await;
         });
     }
 
