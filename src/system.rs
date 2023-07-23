@@ -12,7 +12,7 @@ use tracing::{debug, info_span, trace, Instrument};
 
 use crate::shutdown_request::WaitForShutdownResult;
 
-pub(crate) struct System {
+pub struct System {
     #[cfg(debug_assertions)]
     #[allow(dead_code)]
     id: usize,
@@ -25,7 +25,7 @@ unsafe impl Send for System {}
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
 unsafe impl Sync for System {}
 
-pub(crate) struct Launch {
+pub struct Launch {
     id: usize,
     state: LaunchState,
 }
@@ -41,7 +41,7 @@ enum LaunchState {
 }
 
 impl System {
-    pub(crate) fn launch() -> Launch {
+    pub fn launch() -> Launch {
         static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -306,6 +306,7 @@ impl SystemHandleLive {
 //     impl Sealed for &'_ super::SystemHandle {}
 // }
 
+
 impl SubmitSideProvider for &'_ SystemHandle {
     fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
         f(self.state.guaranteed_live().submit_side.clone())
@@ -453,7 +454,7 @@ impl Ops {
 const RING_SIZE: u32 = 128;
 
 #[derive(Clone)]
-pub struct SubmitSide(Arc<Mutex<SubmitSideInner>>);
+pub struct SubmitSide(pub(crate) Arc<Mutex<SubmitSideInner>>);
 
 pub(crate) enum SubmitSideInner {
     Open(SubmitSideOpen),
@@ -506,7 +507,7 @@ pub(crate) enum SubmitError {
     QueueFull,
 }
 
-pub struct GetOpsSlotFut {
+pub(crate) struct GetOpsSlotFut {
     state: GetOpsSlotFutState,
 }
 enum GetOpsSlotFutState {

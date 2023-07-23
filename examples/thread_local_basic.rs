@@ -15,7 +15,7 @@ async fn main() {
     }
 
     let buf = vec![0; 2048];
-    let (_, buf, res) = tokio_io_uring_eventfd_bridge::ops::read::read_lazy(
+    let (_, buf, res) = tokio_io_uring_eventfd_bridge::ops::read::read(
         tokio_io_uring_eventfd_bridge::ThreadLocalSystemHandle,
         file.into(),
         512,

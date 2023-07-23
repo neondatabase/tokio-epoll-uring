@@ -6,18 +6,11 @@ mod system;
 pub(crate) mod shutdown_request;
 
 pub use system::SubmitSideProvider;
-use system::SystemHandle;
+pub use system::System;
+pub use system::SystemHandle;
 
 mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
-
-pub async fn launch_owned() -> SystemHandle {
-    system::System::launch().await
-}
-
-pub async fn launch_shared() -> SharedSystemHandle {
-    SharedSystemHandle::launch().await
-}
 
 mod thread_local_system_handle;
 pub use thread_local_system_handle::ThreadLocalSystemHandle;
