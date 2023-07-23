@@ -1,9 +1,7 @@
 use std::{
-    cell::Cell,
     collections::HashMap,
     future::Future,
     os::fd::AsRawFd,
-    rc::Rc,
     sync::{Arc, Mutex, Weak},
 };
 
@@ -1513,12 +1511,9 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
 
 #[cfg(test)]
 mod submit_side_tests {
-    use std::{
-        os::fd::{AsRawFd, FromRawFd, OwnedFd},
-        sync::{Arc, Mutex},
-    };
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use crate::{system::Poller, SharedSystemHandle, System};
+    use crate::{SharedSystemHandle, System};
 
     use super::{InflightOpHandle, NotInflightSlotHandle, PollerTesting, SubmitSideProvider};
     struct MockOp {}
