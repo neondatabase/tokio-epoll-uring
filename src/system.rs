@@ -433,7 +433,6 @@ impl CompletionSide {
                     *op_state_inner = OpStateInner::ReadyButFutureDropped;
                     drop(op_state_inner);
                     *op_state = None;
-                    drop(op_state);
                     drop(resources_owned_by_kernel);
                     let submit_side = Weak::upgrade(&self.submit_side)
                         .expect("completion gets shut down after submission");
@@ -626,7 +625,6 @@ impl Future for GetOpsSlotFut {
                         Some(idx) => {
                             drop(ops_guard);
                             let ops = Arc::clone(&submit_side_open.ops);
-                            drop(submit_side_open);
                             drop(submit_side_guard);
                             self.state = GetOpsSlotFutState::ReadyPolled;
                             return std::task::Poll::Ready(NotInflightSlotHandle {
@@ -897,7 +895,6 @@ impl UnsafeOpsSlotHandle {
                     waker: Some(cx.waker().clone()),
                 };
                 drop(op_state_inner);
-                drop(op_state);
                 drop(ops_guard);
                 return OwnedSlotPollResult::Pending(self);
             }
@@ -1051,9 +1048,7 @@ where
                         // and transition from Inflight to one of the Done states. But this future got dropped first.
                         // So, it's our job to drop the slot.
                         drop(op_state_inner);
-                        drop(op_state);
                         drop(ops_guard);
-                        drop(submit_side_open);
                         drop(submit_side_guard);
                         slot.return_slot_and_wake();
                     }
