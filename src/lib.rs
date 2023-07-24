@@ -10,4 +10,4 @@ mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
 
 mod thread_local_system_handle;
-pub use thread_local_system_handle::ThreadLocalSystemHandle;
+pub use thread_local_system_handle::ThreadLocalSystem;

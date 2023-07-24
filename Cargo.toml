@@ -1,5 +1,5 @@
 [package]
-name = "tokio-io_uring-eventfd-bridge"
+name = "tokio-epoll-uring"
 version = "0.1.0"
 edition = "2021"
 

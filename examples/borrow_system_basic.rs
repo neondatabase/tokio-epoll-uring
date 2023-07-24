@@ -14,12 +14,12 @@ async fn main() {
         file.write_all(&[67u8].repeat(1024)).unwrap();
     }
 
-    let system = tokio_io_uring_eventfd_bridge::System::launch().await;
+    let system = tokio_epoll_uring::System::launch().await;
     let system_provider = std::future::ready(&system);
 
     let buf = vec![0; 2048];
     let (_, buf, res) =
-        tokio_io_uring_eventfd_bridge::read(system_provider, file.into(), 512, buf).await;
+        tokio_epoll_uring::read(system_provider, file.into(), 512, buf).await;
     let read = res.unwrap();
     assert_eq!(read, 2048, "not expecting short read");
     assert_eq!(&buf[0..512], &[23u8; 512]);

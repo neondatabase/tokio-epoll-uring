@@ -5,7 +5,7 @@ use futures::FutureExt;
 use crate::system::{Launch, SubmitSide, SubmitSideProvider, System, SystemHandle};
 
 #[derive(Clone, Copy)]
-pub struct ThreadLocalSystemHandle;
+pub struct ThreadLocalSystem;
 
 enum ThreadLocalStateInner {
     Uninit,
@@ -42,7 +42,7 @@ impl ThreadLocalSubmitSideProvider {
     }
 }
 
-impl std::future::Future for ThreadLocalSystemHandle {
+impl std::future::Future for ThreadLocalSystem {
     type Output = ThreadLocalSubmitSideProvider;
 
     fn poll(
