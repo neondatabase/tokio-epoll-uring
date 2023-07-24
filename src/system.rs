@@ -10,8 +10,12 @@ use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::shutdown_request::WaitForShutdownResult;
+use crate::{
+    shutdown_request::WaitForShutdownResult,
+    thread_local_system_handle::ThreadLocalSubmitSideProvider, SharedSystemHandle,
+};
 
+/// The live system. Not constructible or accessible by user code. Use [`SystemHandle`] to interact.
 pub struct System {
     #[cfg(debug_assertions)]
     #[allow(dead_code)]
@@ -177,6 +181,30 @@ impl Future for Launch {
     }
 }
 
+/// An indirection to allow [`crate::ops`] to be generic over which [`System`] to use.
+///
+/// Check the "Implementors" section for the list of available [`System`]s.
+/// Check any [`crate::ops`] function or the crate's examples to see where you need this.
+///
+/// The name of this trait is subject to debate.
+pub trait SystemLauncher<P>: Future<Output = P>
+where
+    P: SubmitSideProvider,
+{
+}
+impl<'a> SystemLauncher<&'a SystemHandle> for std::future::Ready<&'a SystemHandle> {}
+impl SystemLauncher<ThreadLocalSubmitSideProvider> for crate::ThreadLocalSystemLauncher {}
+impl SystemLauncher<SharedSystemHandle> for std::future::Ready<SharedSystemHandle> {}
+
+/// Owned handle to the [`System`] launched by [`SystemLauncher`].
+///
+/// The only use of this handle is to shut down the [`System`].
+/// Call [`initiate_shutdown`](SystemHandle::initiate_shutdown) for explicit shutdown with ability to wait for shutdown completion.
+///
+/// Alternatively, `drop` will also request shutdown, but not wait for completion of shutdown.
+///
+/// This handle is [`Send`] but not [`Clone`].
+/// If you need to share it between threads, use [`crate::SharedSystemHandle`].
 pub struct SystemHandle {
     pub(crate) state: SystemHandleState,
 }

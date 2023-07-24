@@ -5,6 +5,11 @@ use futures::Future;
 use crate::system::{SubmitSide, SystemHandle, SystemHandleState};
 use crate::system::{SubmitSideProvider, System};
 
+/// [`Clone`]-able wrapper around [`SystemHandle`] for sharing between threads / tokio tasks.
+///
+/// The downside is that shutdown is no longer modeled through the type system, so,
+/// it's up to the user to ensure that shutdown is initiated at the right time.
+/// If they fail, we currently panic.
 #[derive(Clone)]
 pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
 
@@ -36,11 +41,11 @@ impl SharedSystemHandle {
         Self(Arc::new(RwLock::new(Some(handle))))
     }
 
-    /// Plug the submission queue; new operation submissions will cause panics.
-    /// Existing operations will be allowed to complete.
-    /// Returns a oneshot receiver that will be signalled when all operations have completed.
+    /// First shutdown call will succeed, subsequent ones on other [`Clone`]s of `self` will panic.
     ///
-    /// This function panics if it's called more than once (i.e., on another clone of the wrapped handle).
+    /// For more details, see [`crate::SystemHandle::initiate_shutdown`].
+    ///
+    /// TODO: change API to return an error, using [`Arc::try_unwrap`] or similar?
     pub fn initiate_shutdown(self) -> impl Future<Output = ()> + Send + Unpin {
         self.0
             .write()

@@ -4,8 +4,9 @@ use futures::FutureExt;
 
 use crate::system::{Launch, SubmitSide, SubmitSideProvider, System, SystemHandle};
 
+/// [`SystemLauncher`](crate::SystemLauncher) impl that provides executor-thread-local submission.
 #[derive(Clone, Copy)]
-pub struct ThreadLocalSystem;
+pub struct ThreadLocalSystemLauncher;
 
 enum ThreadLocalStateInner {
     Uninit,
@@ -42,7 +43,7 @@ impl ThreadLocalSubmitSideProvider {
     }
 }
 
-impl std::future::Future for ThreadLocalSystem {
+impl std::future::Future for ThreadLocalSystemLauncher {
     type Output = ThreadLocalSubmitSideProvider;
 
     fn poll(

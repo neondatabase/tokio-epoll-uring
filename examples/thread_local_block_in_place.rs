@@ -37,7 +37,7 @@ async fn main() {
 
             let buf = vec![0; 2048];
             let (_file, buf, res) = tokio_epoll_uring::read(
-                tokio_epoll_uring::ThreadLocalSystemHandle,
+                tokio_epoll_uring::ThreadLocalSystemLauncher,
                 file.into(),
                 512,
                 buf,
@@ -86,7 +86,7 @@ async fn main() {
 
             let buf = vec![0; 2048];
             let (_file, buf, res) = tokio_epoll_uring::read(
-                tokio_epoll_uring::ThreadLocalSystem,
+                tokio_epoll_uring::ThreadLocalSystemLauncher,
                 file.into(),
                 512,
                 buf,

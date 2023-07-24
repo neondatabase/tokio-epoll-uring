@@ -4,6 +4,7 @@ use crate::system::{ResourcesOwnedByKernel, SubmitSideProvider};
 
 use super::OpTrait;
 
+/// Read up to `buf.len()` bytes from a `file` into `buf` at the given `offset`.
 pub async fn read<'a, L, P, B>(
     system_launcher: L,
     file: OwnedFd,
