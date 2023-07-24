@@ -1467,7 +1467,7 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
         completion_side,
         system,
         shutdown_rx: _,
-    } = inner_owned;
+    } = { inner_owned }; // scope to make the `x: _` destructuring drop.
 
     let system = system; // needed to move the System, which we Unsafe-imp'ed Send
     let System { id: _, split_uring } = system;
@@ -1485,7 +1485,7 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
         completion_side: submit_sides_completion_side,
         waiters_tx: _,
         myself: _,
-    } = open_state;
+    } = { open_state }; // scope to make the `x: _` destructuring drop.
     assert!(
         Arc::ptr_eq(&submit_sides_completion_side, &completion_side),
         "internal inconsistency about System's completion side Arc and "
@@ -1503,7 +1503,8 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
         cq,
         ops,
         submit_side: _,
-    } = completion_side;
+    } = { completion_side }; // scope to make the `x: _` destructuring drop.
+
     // compile-time-ensure we've got the owned types here by declaring the types explicitly
     let mut sq: SubmissionQueue<'_> = sq;
     let submitter: Submitter<'_> = submitter;
@@ -1519,6 +1520,18 @@ fn poller_impl_finish_shutdown(inner_owned: PollerStateInner, req: ShutdownReque
         ops.try_lock().unwrap().unused_indices.len(),
         RING_SIZE.try_into().unwrap()
     );
+    let ops = Arc::try_unwrap(ops)
+        .ok()
+        .expect("we got back all slots during the preemptible phase of shutdown");
+    let ops = Mutex::into_inner(ops).unwrap();
+    let Ops {
+        id: _,
+        storage: _,
+        unused_indices: _,
+        waiters_rx: _,
+        myself: _,
+    } = { ops }; // scope to make the `x: _` destructuring drop.
+    // final assertions done, do the unsplitting
     drop(cq);
     drop(sq);
     drop(submitter);
