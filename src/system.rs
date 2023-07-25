@@ -10,7 +10,7 @@ pub(super) mod submission;
 mod tests;
 
 use tokio::sync::oneshot;
-use tracing::trace;
+use tracing::{trace, Level};
 
 use self::submission::UnsafeOpsSlotHandle;
 
@@ -102,7 +102,7 @@ impl Ops {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(system=%self.id, idx=%idx))]
+    #[tracing::instrument(skip_all, level=Level::TRACE, fields(system=%self.id, idx=%idx))]
     fn return_slot_and_wake(&mut self, idx: usize) {
         fn return_slot(op_state_ref: &mut Option<OpState>) {
             match op_state_ref {
