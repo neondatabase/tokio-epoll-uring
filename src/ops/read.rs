@@ -12,8 +12,8 @@ pub async fn read<'a, L, P, B>(
     buf: B,
 ) -> (OwnedFd, B, std::io::Result<usize>)
 where
-    L: SystemLauncher<P> + Unpin,
-    P: SubmitSideProvider,
+    L: SystemLauncher<P> + Unpin + Send,
+    P: SubmitSideProvider + Unpin,
     B: tokio_uring::buf::IoBufMut + Send + 'a,
 {
     let op = ReadOp { file, offset, buf };

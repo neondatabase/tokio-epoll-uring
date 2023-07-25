@@ -37,9 +37,18 @@ impl SubmitSideProvider for SharedSystemHandle {
     }
 }
 
+#[cfg(test)]
+use crate::system::completion::PollerTesting;
+
 impl SharedSystemHandle {
     pub async fn launch() -> Self {
         let handle = System::launch().await;
+        Self(Arc::new(RwLock::new(Some(handle))))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn launch_with_testing(poller_testing: PollerTesting) -> Self {
+        let handle = System::launch_with_testing(poller_testing).await;
         Self(Arc::new(RwLock::new(Some(handle))))
     }
 

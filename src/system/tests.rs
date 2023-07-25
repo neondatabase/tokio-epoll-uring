@@ -5,24 +5,19 @@ use std::{
 };
 
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 
-use crate::{ResourcesOwnedByKernel, SharedSystemHandle, SubmitSideProvider, System};
-
-use super::submission::{
-    InflightOpHandle, NotInflightSlotHandle, NotInflightSlotHandleSubmitErrorKind,
-};
+use crate::{ops::OpTrait, ResourcesOwnedByKernel, SharedSystemHandle, System};
 
 struct MockOp {}
-fn submit_mock_op(
-    slot: NotInflightSlotHandle,
-) -> Result<InflightOpHandle<MockOp>, NotInflightSlotHandleSubmitErrorKind> {
-    impl ResourcesOwnedByKernel for MockOp {
-        type OpResult = ();
-        fn on_op_completion(self, _res: i32) -> Self::OpResult {}
+
+impl OpTrait for MockOp {
+    fn make_sqe(&mut self) -> io_uring::squeue::Entry {
+        io_uring::opcode::Nop::new().build()
     }
-    slot.submit(MockOp {}, |_| io_uring::opcode::Nop::new().build())
-        .map_err(|err| err.kind)
+}
+impl ResourcesOwnedByKernel for MockOp {
+    type OpResult = ();
+    fn on_op_completion(self, _res: i32) -> Self::OpResult {}
 }
 
 // TODO: turn into a does-not-compile test
@@ -38,74 +33,6 @@ fn submit_mock_op(
 //     // })
 //     // .await;
 // }
-
-#[tokio::test]
-async fn submit_errors_after_shutdown() {
-    // tracing_subscriber::fmt::init();
-
-    let system = SharedSystemHandle::launch().await;
-
-    // get a slot
-    let slot = system
-        .clone()
-        .with_submit_side(|submit_side| {
-            let mut guard = submit_side.0.lock().unwrap();
-            let guard = guard.must_open();
-            guard.get_ops_slot()
-        })
-        .await
-        .unwrap();
-
-    let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel::<()>();
-    let jh = tokio::spawn(async move {
-        shutdown_started_rx.await.unwrap();
-        match submit_mock_op(slot) {
-            Ok(_inflight) => panic!("submissions should fail after shutdown initiated"),
-            Err(e) => info!("submission failed as expected: {e:#}"),
-        }
-    });
-    let wait_shutdown = system.initiate_shutdown();
-    shutdown_started_tx.send(()).unwrap();
-    jh.await.unwrap();
-    info!("waiting for shutdown to complete");
-    wait_shutdown.await;
-}
-
-#[tokio::test]
-async fn shutdown_waits_for_ongoing_ops() {
-    // tracing_subscriber::fmt::init();
-
-    let system = SharedSystemHandle::launch().await;
-    let slot = system
-        .clone()
-        .with_submit_side(|submit_side| {
-            let mut guard = submit_side.0.lock().unwrap();
-            let guard = guard.must_open();
-            guard.get_ops_slot()
-        })
-        .await
-        .unwrap();
-    let submit_fut = submit_mock_op(slot).unwrap();
-    let shutdown_done = system.initiate_shutdown();
-    tokio::pin!(shutdown_done);
-    tokio::select! {
-        // TODO don't rely on timing
-        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-        _ = &mut shutdown_done => {
-            panic!("shutdown should not complete until submit_fut is done");
-        }
-    }
-    println!("waiting submit_fut");
-    let _: () = submit_fut.await.ok().unwrap();
-    println!("submit_fut is done");
-    tokio::select! {
-        // TODO don't rely on timing
-        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-            panic!("shutdown should complete after submit_fut is done");
-        }
-        _ = &mut shutdown_done => { }
-    }
-}
 
 #[tokio::test]
 async fn drop_system_handle() {
@@ -174,6 +101,16 @@ async fn basic() {
     let sz = res.unwrap();
     assert_eq!(sz, 1);
     assert_eq!(buf, vec![1]);
+
+    system.initiate_shutdown().await;
+}
+
+#[tokio::test]
+async fn nop() {
+    let system = SharedSystemHandle::launch().await;
+
+    let res = crate::ops::nop::nop(std::future::ready(system.clone())).await;
+    assert!(res.is_ok());
 
     system.initiate_shutdown().await;
 }

@@ -10,7 +10,7 @@ pub mod handle;
 use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
-use crate::system::{submission::SubmitSideOpen, Ops, OpsInnerDraining, RING_SIZE};
+use crate::system::{submission::SubmitSideOpen, Ops, RING_SIZE};
 
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
@@ -21,6 +21,7 @@ use super::{
 
 /// The live system. Not constructible or accessible by user code. Use [`SystemHandle`] to interact.
 pub struct System {
+    #[allow(dead_code)]
     id: usize,
     split_uring: *mut io_uring::IoUring,
     // poller_heartbeat: (), // TODO
@@ -215,34 +216,40 @@ pub(crate) fn poller_impl_finish_shutdown(
     assert_eq!(cq.len(), 0, "cqe: {:?}", cq.next());
     sq.sync();
     assert_eq!(sq.len(), 0);
-    let ops = Arc::try_unwrap(ops)
-        .ok()
-        .expect("we got back all slots during the preemptible phase of shutdown");
-    let Ops { id: _, inner } = Mutex::into_inner(ops).unwrap();
-    let inner = Arc::try_unwrap(inner)
-        .ok()
-        .expect("we got back all slots during the preemptible phase of shutdown");
-    let inner = Mutex::into_inner(inner).unwrap();
-    let inner = match inner {
-        OpsInner::Undefined => unreachable!(),
-        OpsInner::Open(_open) => panic!("we should be Draining by now"),
-        OpsInner::Draining(inner) => inner,
-    };
-    assert_eq!(inner.unused_indices.len(), RING_SIZE.try_into().unwrap());
-    assert_eq!(
-        inner
+    {
+        // NB about ops: we can't Arc::try_unwrap().unwrap() it here because
+        // there may still be OpFut's that hold a Weak ref to it, and they may
+        // try to upgrade the Weak ref to an Arc at any time.
+        // Such OpFuts' slot will be in OpState::Ready, so, they're going to
+        // drop their upgraded Arc quite soon.
+        // So, it's guaranteed that `ops` will be dropped quite soon after we
+        // drop our Arc.
+
+        let ops_guard = ops.lock().unwrap();
+        let ops_inner = ops_guard.inner.lock().unwrap();
+        let inner = match &*ops_inner {
+            OpsInner::Undefined => unreachable!(),
+            OpsInner::Open(_open) => panic!("we should be Draining by now"),
+            OpsInner::Draining(inner) => inner,
+        };
+        let slots_owned_by_user_space = inner.slots_owned_by_user_space().collect::<HashSet<_>>();
+        let unused_indices = inner
             .unused_indices
             .iter()
             .cloned()
-            .collect::<HashSet<usize>>(),
-        (0..RING_SIZE.try_into().unwrap()).collect::<HashSet<usize>>()
-    );
-    let OpsInnerDraining {
-        id: _,
-        storage: _,
-        unused_indices: _,
-    } = { *inner }; // scope to make the `x: _` destructuring drop.
-                    // final assertions done, do the unsplitting
+            .collect::<HashSet<usize>>();
+        // at this time, all slots must be either in unused_indices (their state is None) or they must be in Ready state
+        assert_eq!(
+            inner.slots_owned_by_user_space().count(),
+            RING_SIZE.try_into().unwrap()
+        );
+        assert!(unused_indices.is_subset(&slots_owned_by_user_space));
+        // drop our arc
+        drop(ops_inner);
+        drop(ops_guard);
+        drop(ops);
+    }
+    // final assertions done, do the unsplitting
     drop(cq);
     drop(sq);
     drop(submitter);

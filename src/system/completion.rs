@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use io_uring::CompletionQueue;
@@ -23,6 +24,11 @@ pub(crate) struct CompletionSide {
 
 unsafe impl Send for CompletionSide {}
 
+pub(crate) enum ProcessCompletionsCause {
+    Regular,
+    Shutdown,
+}
+
 impl CompletionSide {
     pub(crate) fn new(id: usize, cq: CompletionQueue<'static>, ops: Arc<Mutex<Ops>>) -> Self {
         Self { id, cq, ops }
@@ -31,7 +37,7 @@ impl CompletionSide {
         let Self { id: _, cq, ops: _ } = { self };
         cq
     }
-    pub(crate) fn process_completions(&mut self) {
+    pub(crate) fn process_completions(&mut self, _cause: ProcessCompletionsCause) {
         let cq = &mut self.cq;
         cq.sync();
         for cqe in &mut *cq {
@@ -55,6 +61,7 @@ impl CompletionSide {
                     };
                     drop(op_state_inner);
                     if let Some(waker) = waker {
+                        trace!("waking up future");
                         waker.wake();
                     }
                 }
@@ -67,10 +74,13 @@ impl CompletionSide {
                     };
                     drop(op_state_inner);
                     drop(ops_inner);
-                    ops_guard.return_slot_and_wake(idx as usize);
+                    ops_guard.return_slot(idx as usize);
                 }
-                OpStateInner::Ready { .. } | OpStateInner::ReadyConsumed => {
-                    unreachable!("can't be ready twice: {:?}", cur.discriminant_str())
+                OpStateInner::Ready { .. } => {
+                    unreachable!(
+                        "completions only come in once: {:?}",
+                        cur.discriminant_str()
+                    )
                 }
             }
         }
@@ -396,22 +406,24 @@ async fn poller_impl(
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
             let ops_guard = completion_side_guard.ops.lock().unwrap();
             let ops_inner = ops_guard.inner.lock().unwrap();
-            let unused_indices = match &*ops_inner {
+            let ring_size = usize::try_from(RING_SIZE).unwrap();
+            let slots_pending = match &*ops_inner {
                 OpsInner::Undefined => unreachable!(),
                 OpsInner::Open(_inner) => unreachable!("we transitioned above"),
-                OpsInner::Draining(inner) => &inner.unused_indices,
+                OpsInner::Draining(inner) => ring_size - inner.slots_owned_by_user_space().count(),
             };
-            if unused_indices.len() == RING_SIZE as usize {
+            if slots_pending == 0 {
                 break;
             }
+            debug!(slots_pending, "waiting for pending ops to finish");
             drop(ops_inner);
             drop(ops_guard); // process_completions locks ops again
-            completion_side_guard.process_completions();
+            completion_side_guard.process_completions(ProcessCompletionsCause::Shutdown);
         }
         // If we get cancelled here, e.g., because the runtime is getting dropped,
         // the Poller is in state ShuttingDown.
         // The scopeguard in our caller will spawn an OS thread and re-run this function.
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await; // TODO continue to epoll
     }
 
     // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
@@ -533,7 +545,7 @@ async fn poller_impl_impl(
         }
 
         let mut completion_side_guard = completion_side.lock().unwrap();
-        completion_side_guard.process_completions(); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
+        completion_side_guard.process_completions(ProcessCompletionsCause::Regular); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
         if is_timeout_wakeup {
             // TODO: only do this if some env var is set?
             let ops = completion_side_guard.ops.lock().unwrap();
@@ -574,14 +586,19 @@ async fn poller_impl_impl(
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::{
+        io::Write,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    };
+
+    use tracing::info;
 
     use crate::{
         system::{
             completion::{PollerState, PollerTesting},
             lifecycle::System,
         },
-        SubmitSideProvider,
+        SharedSystemHandle,
     };
 
     #[test]
@@ -607,21 +624,32 @@ mod tests {
             poller_switch_to_thread_done_tx,
             preempt_during_epoll_rx,
         };
-        let (slot, shutdown_done) = rt.block_on(async move {
-            let system = System::launch_with_testing(testing).await;
-            let slot = system
-                .with_submit_side(|submit_side| {
-                    let mut guard = submit_side.0.lock().unwrap();
-                    let guard = guard.must_open();
-                    guard.get_ops_slot()
-                })
-                .await;
-            // When we send shutdown, the slot will keep the poller task in the shutdown process_completions loop.
-            // Then we'll use the preempt_tx to cancel the poller task future.
-            // We should observe a transition to RunningInThread.
-            let shutdown_done_fut = system.initiate_shutdown();
-            (slot, shutdown_done_fut)
+
+        let (reader, mut writer) = os_pipe::pipe().unwrap();
+        let reader = unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
+
+        let (system, read_fut) = rt.block_on(async move {
+            let system = SharedSystemHandle::launch_with_testing(testing).await;
+            let mut read_fut = Box::pin(crate::read(
+                std::future::ready(system.clone()),
+                reader,
+                0,
+                vec![1],
+            ));
+            tokio::select! {
+                _ = &mut read_fut => { panic!("we haven't written to the pipe yet") },
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    info!("by now the operation should be submitted");
+                    (system, read_fut)
+                }
+            }
         });
+
+        // When we send shutdown, the slot will keep the poller task in the shutdown process_completions loop.
+        // Then we'll use the preempt_tx to cancel the poller task future.
+        // We should observe a transition to RunningInThread.
+        let shutdown_done_fut = system.initiate_shutdown();
+
         let poller = shutdown_loop_reached_rx.blocking_recv().unwrap();
         assert!(
             matches!(
@@ -654,26 +682,30 @@ mod tests {
             .build()
             .unwrap();
         second_rt.block_on(async move {
-            let mut shutdown_done = shutdown_done;
+            let mut shutdown_done_fut = shutdown_done_fut;
             tokio::select! {
                 // TODO don't rely on timing
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => { }
-                _ = &mut shutdown_done => {
+                _ = &mut shutdown_done_fut => {
                     panic!("shutdown should not complete until submit_fut is done");
                 }
             }
 
-            // clear the slot
-            drop(slot);
+            // now unblock the read
+            writer.write_all(&[1]).unwrap();
 
             tokio::select! {
                 // TODO don't rely on timing
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                     panic!("shutdown should complete after submit_fut is done");
                 }
-                _ = &mut shutdown_done => { }
+                _ = &mut shutdown_done_fut => { }
             }
         });
+
+        let (_, _, res) = second_rt.block_on(read_fut);
+        let err = res.err().expect("when poller signals shutdown_done, it has dropped the Ops Arc; read_fut only holds a Weak to it and will fail to upgrade");
+        assert_eq!(format!("{:#}", err), "system is shut down");
     }
 
     #[test]
