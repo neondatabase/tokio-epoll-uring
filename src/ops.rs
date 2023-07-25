@@ -3,7 +3,10 @@ pub mod read;
 use futures::{Future, FutureExt};
 
 use crate::{
-    system::submission::{GetOpsSlotFut, InflightOpHandle, SubmitSide},
+    system::submission::{
+        GetOpsSlotError, GetOpsSlotFut, InflightOpHandle, NotInflightSlotHandleSubmitError,
+        NotInflightSlotHandleSubmitErrorKind, SubmitSide,
+    },
     ResourcesOwnedByKernel, SubmitSideProvider,
 };
 
@@ -34,13 +37,21 @@ pub(crate) trait OpTrait: ResourcesOwnedByKernel + Sized + Send + 'static {
     }
 }
 
+pub(crate) enum OpSubmitError<O>
+where
+    O: OpTrait + Send + 'static,
+{
+    GetOpsSlotError(O, GetOpsSlotError),
+    SubmitError(O, NotInflightSlotHandleSubmitErrorKind),
+}
+
 impl<L, P, O> std::future::Future for OpFut<L, P, O>
 where
     L: Future<Output = P> + Unpin,
     P: SubmitSideProvider,
     O: OpTrait + Send + 'static + Unpin,
 {
-    type Output = O::OpResult;
+    type Output = Result<O::OpResult, OpSubmitError<O>>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -82,17 +93,32 @@ where
                         *myself = OpFut::NeedSlot { slot_fut, make_op };
                         return std::task::Poll::Pending;
                     }
-                    std::task::Poll::Ready(slot) => {
-                        let submit_fut = slot.submit(make_op, |op| op.make_sqe());
+                    std::task::Poll::Ready(Ok(not_inflight_slot_handle)) => {
+                        let submit_fut =
+                            match not_inflight_slot_handle.submit(make_op, |op| op.make_sqe()) {
+                                Ok(submit_fut) => submit_fut,
+                                Err(NotInflightSlotHandleSubmitError { rsrc, kind }) => {
+                                    *myself = OpFut::ReadyPolled;
+                                    return std::task::Poll::Ready(Err(
+                                        OpSubmitError::SubmitError(rsrc, kind),
+                                    ));
+                                }
+                            };
                         *myself = OpFut::Submitted(submit_fut);
                         continue;
+                    }
+                    std::task::Poll::Ready(Err(e)) => {
+                        *myself = OpFut::ReadyPolled;
+                        return std::task::Poll::Ready(Err(OpSubmitError::GetOpsSlotError(
+                            make_op, e,
+                        )));
                     }
                 },
                 OpFut::Submitted(mut submit_fut) => match submit_fut.poll_unpin(cx) {
                     std::task::Poll::Ready(output) => {
                         let output: O::OpResult = output;
                         *myself = OpFut::ReadyPolled;
-                        return std::task::Poll::Ready(output);
+                        return std::task::Poll::Ready(Ok(output));
                     }
                     std::task::Poll::Pending => {
                         *myself = OpFut::Submitted(submit_fut);

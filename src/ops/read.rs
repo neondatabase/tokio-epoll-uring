@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{ResourcesOwnedByKernel, SubmitSideProvider, SystemLauncher};
 
-use super::OpTrait;
+use super::{OpSubmitError, OpTrait};
 
 /// Read up to `buf.len()` bytes from a `file` into `buf` at the given `offset`.
 pub async fn read<'a, L, P, B>(
@@ -16,7 +16,34 @@ where
     P: SubmitSideProvider,
     B: tokio_uring::buf::IoBufMut + Send + 'a,
 {
-    ReadOp { file, offset, buf }.into_fut(system_launcher).await
+    let op = ReadOp { file, offset, buf };
+    match op.into_fut(system_launcher).await {
+        Ok(output) => output,
+        Err(OpSubmitError::GetOpsSlotError(
+            ReadOp {
+                file,
+                offset: _,
+                buf,
+            },
+            e,
+        )) => (
+            file,
+            buf,
+            Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        ),
+        Err(OpSubmitError::SubmitError(
+            ReadOp {
+                file,
+                offset: _,
+                buf,
+            },
+            e,
+        )) => (
+            file,
+            buf,
+            Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        ),
+    }
 }
 
 struct ReadOp<B>

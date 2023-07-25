@@ -62,6 +62,7 @@ impl<T> Drop for Sender<T> {
                 *guard = x;
             }
         }
+        drop(guard);
         self.0.posted_shutdown_request.notify_waiters();
     }
 }

@@ -31,7 +31,9 @@
 //! ```
 //! #[tokio::main]
 //! async fn main() {
-//!   let file = fs::File::open("/dev/zero").await.unwrap();
+//!#  use std::os::fd::OwnedFd;
+//!   use tokio_uring::buf::IoBufMut;
+//!   let file = std::fs::File::open("/dev/zero").unwrap();
 //!   let fd: OwnedFd = file.into();
 //!   let buf = vec![1; 1024];
 //!   let (fd, buf, res) =

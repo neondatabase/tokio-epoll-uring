@@ -8,7 +8,7 @@ mod tests;
 
 use tracing::trace;
 
-use self::submission::{SubmitSideInner, UnsafeOpsSlotHandle};
+use self::submission::UnsafeOpsSlotHandle;
 
 pub(crate) const RING_SIZE: u32 = 128;
 
@@ -23,19 +23,10 @@ enum OpStateInner {
         /// When a future gets dropped while the Op is still running, it gets Box'ed  This is a Box'ed `ResourcesOwnedByKernel`
         resources_owned_by_kernel: Box<dyn std::any::Any + Send>,
     },
-    ReadyButFutureDropped,
     Ready {
         result: i32,
     },
-}
-
-pub struct Ops {
-    id: usize,
-    storage: [Option<OpState>; RING_SIZE as usize],
-    unused_indices: Vec<usize>,
-    waiters_rx:
-        tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
-    myself: Weak<Mutex<Ops>>,
+    ReadyConsumed,
 }
 
 impl OpStateInner {
@@ -44,47 +35,102 @@ impl OpStateInner {
             OpStateInner::Undefined => "Undefined",
             OpStateInner::Pending { .. } => "Pending",
             OpStateInner::PendingButFutureDropped { .. } => "PendingButFutureDropped",
-            OpStateInner::ReadyButFutureDropped => "ReadyButFutureDropped",
             OpStateInner::Ready { .. } => "Ready",
+            OpStateInner::ReadyConsumed => "ReadyConsumed",
         }
     }
 }
 
+pub struct Ops {
+    id: usize,
+    inner: Arc<Mutex<OpsInner>>,
+}
+
+enum OpsInner {
+    Open(Box<OpsInnerOpen>),
+    Draining(Box<OpsInnerDraining>),
+    Undefined,
+}
+
+struct OpsInnerOpen {
+    id: usize,
+    storage: [Option<OpState>; RING_SIZE as usize],
+    unused_indices: Vec<usize>,
+    waiters_rx:
+        tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
+    myself: Weak<Mutex<Ops>>,
+}
+
+struct OpsInnerDraining {
+    #[allow(dead_code)]
+    id: usize,
+    storage: [Option<OpState>; RING_SIZE as usize],
+    unused_indices: Vec<usize>,
+}
+
 impl Ops {
-    // TODO: why do we need the submit_side here?
-    fn return_slot_and_wake(&mut self, submit_side: Arc<Mutex<SubmitSideInner>>, idx: usize) {
-        assert!(self.storage[idx].is_none());
-        loop {
-            match self.waiters_rx.try_recv() {
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    break;
-                }
-                Ok(waiter) => {
-                    match waiter.send(UnsafeOpsSlotHandle {
-                        submit_side: Arc::clone(&submit_side),
-                        ops: Weak::upgrade(&self.myself).expect("we're executing on myself"),
-                        idx,
-                    }) {
-                        Ok(()) => {
-                            trace!(system = self.id, "handed `idx` to a waiter");
-                            return;
+    #[tracing::instrument(skip_all, fields(system=%self.id, idx=%idx))]
+    fn return_slot_and_wake(&mut self, idx: usize) {
+        fn return_slot(op_state_ref: &mut Option<OpState>) {
+            match op_state_ref {
+                None => (),
+                Some(some) => {
+                    let op_state_inner_guard = some.0.lock().unwrap();
+                    match &*op_state_inner_guard {
+                        OpStateInner::Undefined => unreachable!(),
+                        OpStateInner::Pending { .. }
+                        | OpStateInner::PendingButFutureDropped { .. } => {
+                            panic!("implementation error: potential memory unsafetiy: we must not return a slot that is still pending  {:?}", op_state_inner_guard.discriminant_str());
                         }
-                        Err(_) => {
-                            // the future requesting wakeup got dropped. wake up next one
-                            continue;
+                        OpStateInner::Ready { .. } | OpStateInner::ReadyConsumed => {
+                            drop(op_state_inner_guard);
+                            *op_state_ref = None;
                         }
                     }
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // submit side is plugged already
-                    break;
-                }
             }
         }
-        trace!(
-            system = self.id,
-            "no waiters, returning `idx` to unused_indices"
-        );
-        self.unused_indices.push(idx);
+
+        let mut inner_guard = self.inner.lock().unwrap();
+        match &mut *inner_guard {
+            OpsInner::Undefined => unreachable!(),
+            OpsInner::Open(inner) => {
+                return_slot(&mut inner.storage[idx]);
+                loop {
+                    match inner.waiters_rx.try_recv() {
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                            break;
+                        }
+                        Ok(waiter) => {
+                            match waiter.send(UnsafeOpsSlotHandle {
+                                ops: Weak::upgrade(&inner.myself)
+                                    .expect("we're executing on myself"),
+                                idx,
+                            }) {
+                                Ok(()) => {
+                                    trace!("handed `idx` to a waiter");
+                                    return;
+                                }
+                                Err(_) => {
+                                    // the future requesting wakeup got dropped. wake up next one
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            // submit side is plugged already
+                            break;
+                        }
+                    }
+                }
+                trace!("no waiters, returning idx to unused_indices");
+                inner.unused_indices.push(idx);
+            }
+            OpsInner::Draining(inner) => {
+                return_slot(&mut inner.storage[idx]);
+                trace!("draining, returning idx to unused_indices");
+                inner.unused_indices.push(idx);
+            }
+        }
     }
 }

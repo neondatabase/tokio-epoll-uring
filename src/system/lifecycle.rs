@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     os::fd::AsRawFd,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
@@ -9,12 +10,13 @@ pub mod handle;
 use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
-use crate::system::{submission::SubmitSideOpen, Ops, RING_SIZE};
+use crate::system::{submission::SubmitSideOpen, Ops, OpsInnerDraining, RING_SIZE};
 
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
     submission::{SubmitSide, SubmitSideNewArgs},
+    OpsInner, OpsInnerOpen,
 };
 
 /// The live system. Not constructible or accessible by user code. Use [`SystemHandle`] to interact.
@@ -99,10 +101,13 @@ impl std::future::Future for Launch {
                     let ops = Arc::new_cyclic(|myself| {
                         Mutex::new(Ops {
                             id,
-                            storage: array_macro::array![_ => None; RING_SIZE as usize],
-                            unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
-                            waiters_rx,
-                            myself: Weak::clone(&myself),
+                            inner: Arc::new(Mutex::new(OpsInner::Open(Box::new(OpsInnerOpen {
+                                id,
+                                storage: array_macro::array![_ => None; RING_SIZE as usize],
+                                unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
+                                waiters_rx,
+                                myself: Weak::clone(&myself),
+                            })))),
                         })
                     });
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
@@ -113,7 +118,6 @@ impl std::future::Future for Launch {
                         id,
                         cq,
                         ops: ops.clone(),
-                        submit_side: Weak::new(),
                     }));
 
                     let submit_side = SubmitSide::new(SubmitSideNewArgs {
@@ -200,12 +204,7 @@ pub(crate) fn poller_impl_finish_shutdown(
     let completion_side = Mutex::into_inner(completion_side).unwrap();
 
     // Unsplit the uring
-    let CompletionSide {
-        id: _,
-        cq,
-        ops,
-        submit_side: _,
-    } = { completion_side }; // scope to make the `x: _` destructuring drop.
+    let CompletionSide { id: _, cq, ops } = { completion_side }; // scope to make the `x: _` destructuring drop.
 
     // compile-time-ensure we've got the owned types here by declaring the types explicitly
     let mut sq: SubmissionQueue<'_> = sq;
@@ -218,22 +217,34 @@ pub(crate) fn poller_impl_finish_shutdown(
     assert_eq!(cq.len(), 0, "cqe: {:?}", cq.next());
     sq.sync();
     assert_eq!(sq.len(), 0);
-    assert_eq!(
-        ops.try_lock().unwrap().unused_indices.len(),
-        RING_SIZE.try_into().unwrap()
-    );
     let ops = Arc::try_unwrap(ops)
         .ok()
         .expect("we got back all slots during the preemptible phase of shutdown");
-    let ops = Mutex::into_inner(ops).unwrap();
-    let Ops {
+    let Ops { id: _, inner } = Mutex::into_inner(ops).unwrap();
+    let inner = Arc::try_unwrap(inner)
+        .ok()
+        .expect("we got back all slots during the preemptible phase of shutdown");
+    let inner = Mutex::into_inner(inner).unwrap();
+    let inner = match inner {
+        OpsInner::Undefined => unreachable!(),
+        OpsInner::Open(_open) => panic!("we should be Draining by now"),
+        OpsInner::Draining(inner) => inner,
+    };
+    assert_eq!(inner.unused_indices.len(), RING_SIZE.try_into().unwrap());
+    assert_eq!(
+        inner
+            .unused_indices
+            .iter()
+            .cloned()
+            .collect::<HashSet<usize>>(),
+        (0..RING_SIZE.try_into().unwrap()).collect::<HashSet<usize>>()
+    );
+    let OpsInnerDraining {
         id: _,
         storage: _,
         unused_indices: _,
-        waiters_rx: _,
-        myself: _,
-    } = { ops }; // scope to make the `x: _` destructuring drop.
-                 // final assertions done, do the unsplitting
+    } = { *inner }; // scope to make the `x: _` destructuring drop.
+                    // final assertions done, do the unsplitting
     drop(cq);
     drop(sq);
     drop(submitter);

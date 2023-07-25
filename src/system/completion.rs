@@ -1,17 +1,16 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 
 use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::system::{OpStateInner, RING_SIZE};
+use crate::system::{OpStateInner, OpsInner, RING_SIZE};
 
 use super::{
     lifecycle::{ShutdownRequest, System},
-    submission::SubmitSideInner,
     Ops,
 };
 
@@ -21,8 +20,6 @@ pub(crate) struct CompletionSide {
     pub(crate) id: usize,
     pub(crate) cq: CompletionQueue<'static>,
     pub(crate) ops: Arc<Mutex<Ops>>,
-    // TODO refactor: do we really need this?
-    pub(crate) submit_side: Weak<Mutex<SubmitSideInner>>,
 }
 
 unsafe impl Send for CompletionSide {}
@@ -35,7 +32,13 @@ impl CompletionSide {
             trace!("got cqe: {:?}", cqe);
             let idx: u64 = unsafe { std::mem::transmute(cqe.user_data()) };
             let mut ops_guard = self.ops.lock().unwrap();
-            let op_state = &mut ops_guard.storage[idx as usize];
+            let mut ops_inner = ops_guard.inner.lock().unwrap();
+            let storage = match &mut *ops_inner {
+                OpsInner::Undefined => unreachable!(),
+                OpsInner::Open(inner) => &mut inner.storage,
+                OpsInner::Draining(inner) => &mut inner.storage,
+            };
+            let op_state = &mut storage[usize::try_from(idx).unwrap()];
             let mut op_state_inner = op_state.as_ref().unwrap().0.lock().unwrap();
             let cur = std::mem::replace(&mut *op_state_inner, OpStateInner::Undefined);
             match cur {
@@ -52,19 +55,16 @@ impl CompletionSide {
                 OpStateInner::PendingButFutureDropped {
                     resources_owned_by_kernel,
                 } => {
-                    *op_state_inner = OpStateInner::ReadyButFutureDropped;
-                    drop(op_state_inner);
-                    *op_state = None;
                     drop(resources_owned_by_kernel);
-                    let submit_side = Weak::upgrade(&self.submit_side)
-                        .expect("completion gets shut down after submission");
-                    ops_guard.return_slot_and_wake(submit_side, idx as usize);
+                    *op_state_inner = OpStateInner::Ready {
+                        result: cqe.result(),
+                    };
+                    drop(op_state_inner);
+                    drop(ops_inner);
+                    ops_guard.return_slot_and_wake(idx as usize);
                 }
-                OpStateInner::ReadyButFutureDropped => {
-                    unreachable!("can't be ready twice")
-                }
-                OpStateInner::Ready { .. } => {
-                    unreachable!("can't be ready twice")
+                OpStateInner::Ready { .. } | OpStateInner::ReadyConsumed => {
+                    unreachable!("can't be ready twice: {:?}", cur.discriminant_str())
                 }
             }
         }
@@ -356,10 +356,17 @@ async fn poller_impl(
             let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
             let ops_guard = completion_side_guard.ops.lock().unwrap();
-            if ops_guard.unused_indices.len() == RING_SIZE as usize {
+            let ops_inner = ops_guard.inner.lock().unwrap();
+            let unused_indices = match &*ops_inner {
+                OpsInner::Undefined => unreachable!(),
+                OpsInner::Open(inner) => &inner.unused_indices,
+                OpsInner::Draining(inner) => &inner.unused_indices,
+            };
+            if unused_indices.len() == RING_SIZE as usize {
                 break;
             }
-            drop(ops_guard);
+            drop(ops_inner);
+            drop(ops_guard); // process_completions locks ops again
             completion_side_guard.process_completions();
         }
         // If we get cancelled here, e.g., because the runtime is getting dropped,
@@ -455,6 +462,7 @@ async fn poller_impl_impl(
                 rx = shutdown_rx.wait_for_shutdown_request()  => {
                     match rx {
                         crate::shutdown_request::WaitForShutdownResult::ExplicitRequest(req) => {
+                            tracing::debug!("got explicit shutdown request");
                             return req;
                         }
                         crate::shutdown_request::WaitForShutdownResult::ExplicitRequestObservedEarlier => {
@@ -481,9 +489,16 @@ async fn poller_impl_impl(
         let mut completion_side_guard = completion_side.lock().unwrap();
         completion_side_guard.process_completions(); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
         if is_timeout_wakeup {
+            // TODO: only do this if some env var is set?
             let ops = completion_side_guard.ops.lock().unwrap();
+            let ops_inner = ops.inner.lock().unwrap();
+            let (storage, unused_indices) = match &*ops_inner {
+                OpsInner::Undefined => unreachable!(),
+                OpsInner::Open(inner) => (&inner.storage, &inner.unused_indices),
+                OpsInner::Draining(inner) => (&inner.storage, &inner.unused_indices),
+            };
             let mut by_state_discr = HashMap::new();
-            for s in &ops.storage {
+            for s in storage {
                 match s {
                     Some(opstate) => {
                         let opstate_inner = opstate.0.lock().unwrap();
@@ -503,7 +518,7 @@ async fn poller_impl_impl(
             }
             debug!(
                 "poller task got timeout: ops free slots = {} by_ops_state: {:?}",
-                ops.unused_indices.len(),
+                unused_indices.len(),
                 by_state_discr
             );
         }
