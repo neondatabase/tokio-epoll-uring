@@ -11,8 +11,6 @@ use crate::{
 use super::{completion::CompletionSide, OpStateInner, Ops, TryGetSlotResult};
 
 pub(crate) struct SubmitSideNewArgs {
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)]
     pub(crate) id: usize,
     pub(crate) submitter: Submitter<'static>,
     pub(crate) sq: SubmissionQueue<'static>,
@@ -530,8 +528,6 @@ pub(crate) enum SubmitSideInner {
 }
 
 pub(crate) struct SubmitSideOpen {
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)]
     id: usize,
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,

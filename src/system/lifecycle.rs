@@ -21,8 +21,6 @@ use super::{
 
 /// The live system. Not constructible or accessible by user code. Use [`SystemHandle`] to interact.
 pub struct System {
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)]
     id: usize,
     split_uring: *mut io_uring::IoUring,
     // poller_heartbeat: (), // TODO
