@@ -7,7 +7,7 @@ use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::system::{OpStateInner, OpsInner, RING_SIZE};
+use crate::system::{OpStateInner, OpsInner, OpsInnerDraining, OpsInnerOpen, RING_SIZE};
 
 use super::{
     lifecycle::{ShutdownRequest, System},
@@ -88,6 +88,7 @@ pub(crate) struct PollerNewArgs {
     pub uring_fd: std::os::fd::RawFd,
     pub completion_side: Arc<Mutex<CompletionSide>>,
     pub system: System,
+    pub ops: Arc<Mutex<Ops>>,
     pub preempt: Option<PollerTesting>,
 }
 
@@ -100,6 +101,7 @@ impl Poller {
             uring_fd,
             completion_side,
             system,
+            ops,
             preempt: poller_preempt,
         } = args;
         let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
@@ -109,6 +111,7 @@ impl Poller {
                 uring_fd,
                 completion_side,
                 system,
+                ops,
                 shutdown_rx,
             }))),
         }));
@@ -154,6 +157,7 @@ struct PollerStateInner {
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
+    ops: Arc<Mutex<Ops>>,
     shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
 }
 
@@ -350,7 +354,36 @@ async fn poller_impl(
     // 4. Drop the IoUring struct, cleaning up the underlying kernel resources.
 
     // 1. Prevent new ops from being submitted:
-    // Already plugged the sumit side in SystemHandle::drop / SystemHandle::shutdown;
+    // We already plugged the sumit side in SystemHandle::drop / SystemHandle::shutdown;
+    // But what actually matters is to transition Ops into Draining state.
+    // TODO: remove the SubmitSide plugged state, it's redundant to Ops::Draining.
+    {
+        let inner_guard = inner_shared.lock().unwrap();
+        let ops_guard = inner_guard.ops.lock().unwrap();
+        let mut ops_inner_guard = ops_guard.inner.lock().unwrap();
+        let cur = std::mem::replace(&mut *ops_inner_guard, OpsInner::Undefined);
+        match cur {
+            OpsInner::Undefined => unreachable!(),
+            x @ OpsInner::Draining(_) => {
+                // can happen if poller task gets cancelled and we switch to thread
+                *ops_inner_guard = x;
+            }
+            OpsInner::Open(open) => {
+                let OpsInnerOpen {
+                    id,
+                    storage,
+                    unused_indices,
+                    waiters_rx: _,
+                    myself: _,
+                } = *open;
+                *ops_inner_guard = OpsInner::Draining(Box::new(OpsInnerDraining {
+                    id,
+                    storage,
+                    unused_indices,
+                }));
+            }
+        }
+    }
 
     // Wait for all inflight ops to finish.
     if let Some(tx) = shutdown_loop_reached {
@@ -365,7 +398,7 @@ async fn poller_impl(
             let ops_inner = ops_guard.inner.lock().unwrap();
             let unused_indices = match &*ops_inner {
                 OpsInner::Undefined => unreachable!(),
-                OpsInner::Open(inner) => &inner.unused_indices,
+                OpsInner::Open(_inner) => unreachable!("we transitioned above"),
                 OpsInner::Draining(inner) => &inner.unused_indices,
             };
             if unused_indices.len() == RING_SIZE as usize {
@@ -382,7 +415,7 @@ async fn poller_impl(
     }
 
     // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
-    // (See comment on `yield_now().await` above why preemption is safe)
+    // (See comment on `yield_now().await` above why cancellation is safe earlier.)
     // Use a closure to enforce it.
     (move || {
         let mut poller_guard = poller.lock().unwrap();
@@ -414,10 +447,16 @@ async fn poller_impl(
                     uring_fd: _,
                     completion_side,
                     system,
+                    ops,
                     shutdown_rx: _,
                 } = { inner_owned }; // scope to make the `x: _` destructuring drop.
 
-                crate::system::lifecycle::poller_impl_finish_shutdown(system, completion_side, req);
+                crate::system::lifecycle::poller_impl_finish_shutdown(
+                    system,
+                    ops,
+                    completion_side,
+                    req,
+                );
             }
         };
         poller.lock().unwrap().state = PollerState::ShutDown;
@@ -435,6 +474,7 @@ async fn poller_impl_impl(
             uring_fd,
             completion_side,
             system: _,
+            ops: _,
             shutdown_rx: ref mut shutdown,
         } = &mut *inner_guard;
         (*uring_fd, Arc::clone(completion_side), shutdown.clone())

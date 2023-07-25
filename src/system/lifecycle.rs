@@ -25,7 +25,6 @@ pub struct System {
     #[allow(dead_code)]
     id: usize,
     split_uring: *mut io_uring::IoUring,
-    ops: Arc<Mutex<Ops>>,
     // poller_heartbeat: (), // TODO
 }
 
@@ -127,20 +126,20 @@ impl std::future::Future for Launch {
                         id,
                         submitter,
                         sq,
+                        ops: Arc::clone(&ops),
                         completion_side: Arc::clone(&completion_side),
-                        ops: ops.clone(),
                         waiters_tx,
                     });
                     let system = System {
                         id,
                         split_uring: uring,
-                        ops: Arc::clone(&ops),
                     };
                     let poller_ready_fut = Poller::launch(PollerNewArgs {
                         id,
                         uring_fd,
                         completion_side,
                         system,
+                        ops,
                         preempt: poller_preempt,
                     });
                     myself.state = LaunchState::WaitForPollerTaskToStart {
@@ -187,6 +186,7 @@ pub(crate) struct ShutdownRequest {
 
 pub(crate) fn poller_impl_finish_shutdown(
     system: System,
+    ops: Arc<Mutex<Ops>>,
     completion_side: Arc<Mutex<CompletionSide>>,
     req: ShutdownRequest,
 ) {
@@ -194,11 +194,7 @@ pub(crate) fn poller_impl_finish_shutdown(
     scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
     scopeguard::defer_on_unwind! {tracing::error!("poller shutdown panic")};
 
-    let System {
-        id: _,
-        split_uring,
-        ops,
-    } = { system };
+    let System { id: _, split_uring } = { system };
 
     let ShutdownRequest {
         done_tx,

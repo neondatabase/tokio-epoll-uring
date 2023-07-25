@@ -8,7 +8,7 @@ use crate::{
     ResourcesOwnedByKernel,
 };
 
-use super::{completion::CompletionSide, OpStateInner, Ops, OpsInnerDraining, OpsInnerOpen};
+use super::{completion::CompletionSide, OpStateInner, Ops};
 
 pub(crate) struct SubmitSideNewArgs {
     #[cfg(debug_assertions)]
@@ -37,8 +37,8 @@ impl SubmitSide {
                 id,
                 submitter,
                 sq,
-                completion_side: Arc::clone(&completion_side),
                 ops,
+                completion_side: Arc::clone(&completion_side),
                 waiters_tx,
                 myself: Weak::clone(myself),
             }))
@@ -574,32 +574,7 @@ impl SubmitSideInner {
         match cur {
             SubmitSideInner::Undefined => panic!("implementation error"),
             SubmitSideInner::Open(open) => {
-                let ops_guard = open.ops.lock().unwrap();
-                let mut ops_inner_guard = ops_guard.inner.lock().unwrap();
-                let cur = std::mem::replace(&mut *ops_inner_guard, OpsInner::Undefined);
-                match cur {
-                    OpsInner::Undefined => unreachable!(),
-                    OpsInner::Draining(_) => {
-                        panic!("cannot plug submit side, ops is draining")
-                    }
-                    OpsInner::Open(open) => {
-                        let OpsInnerOpen {
-                            id,
-                            storage,
-                            unused_indices,
-                            waiters_rx: _,
-                            myself: _,
-                        } = *open;
-                        *ops_inner_guard = OpsInner::Draining(Box::new(OpsInnerDraining {
-                            id,
-                            storage,
-                            unused_indices,
-                        }));
-                    }
-                }
                 *self = SubmitSideInner::Plugged;
-                drop(ops_inner_guard);
-                drop(ops_guard);
                 Ok(open)
             }
             SubmitSideInner::Plugged => Err(PlugError::AlreadyPlugged),
