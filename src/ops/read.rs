@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::{ResourcesOwnedByKernel, SubmitSideProvider};
+use crate::{ResourcesOwnedByKernel, SubmitSideProvider, SystemLauncher};
 
 use super::OpTrait;
 
@@ -12,7 +12,7 @@ pub async fn read<'a, L, P, B>(
     buf: B,
 ) -> (OwnedFd, B, std::io::Result<usize>)
 where
-    L: std::future::Future<Output = P> + Unpin,
+    L: SystemLauncher<P> + Unpin,
     P: SubmitSideProvider,
     B: tokio_uring::buf::IoBufMut + Send + 'a,
 {
