@@ -4,8 +4,8 @@ use futures::{Future, FutureExt};
 
 use crate::{
     system::submission::{
-        GetOpsSlotError, GetOpsSlotFut, InflightOpHandle, NotInflightSlotHandleSubmitError,
-        NotInflightSlotHandleSubmitErrorKind, SubmitSide,
+        GetOpsSlotError, GetOpsSlotFut, InflightOpHandle, InflightOpHandleError,
+        NotInflightSlotHandleSubmitError, NotInflightSlotHandleSubmitErrorKind, SubmitSide,
     },
     ResourcesOwnedByKernel, SubmitSideProvider,
 };
@@ -39,10 +39,12 @@ pub(crate) trait OpTrait: ResourcesOwnedByKernel + Sized + Send + 'static {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpSubmitError {
-    #[error("get an ops slot")]
-    GetOpsSlotError(#[source] GetOpsSlotError),
-    #[error("submit the op")]
-    SubmitError(#[source] NotInflightSlotHandleSubmitErrorKind),
+    #[error("get slot")]
+    GetOpsSlot(#[source] GetOpsSlotError),
+    #[error("submission")]
+    Submission(#[source] NotInflightSlotHandleSubmitErrorKind),
+    #[error("completion")]
+    Completion(#[source] InflightOpHandleError),
 }
 
 impl<L, P, O> std::future::Future for OpFut<L, P, O>
@@ -101,7 +103,7 @@ where
                                     *myself = OpFut::ReadyPolled;
                                     return std::task::Poll::Ready(Err((
                                         rsrc,
-                                        OpSubmitError::SubmitError(kind),
+                                        OpSubmitError::Submission(kind),
                                     )));
                                 }
                             };
@@ -112,15 +114,22 @@ where
                         *myself = OpFut::ReadyPolled;
                         return std::task::Poll::Ready(Err((
                             make_op,
-                            OpSubmitError::GetOpsSlotError(e),
+                            OpSubmitError::GetOpsSlot(e),
                         )));
                     }
                 },
                 OpFut::Submitted(mut submit_fut) => match submit_fut.poll_unpin(cx) {
-                    std::task::Poll::Ready(output) => {
-                        let output: O::OpResult = output;
+                    std::task::Poll::Ready(Ok(op_result)) => {
+                        let output: O::OpResult = op_result;
                         *myself = OpFut::ReadyPolled;
                         return std::task::Poll::Ready(Ok(output));
+                    }
+                    std::task::Poll::Ready(Err((resource, err))) => {
+                        *myself = OpFut::ReadyPolled;
+                        return std::task::Poll::Ready(Err((
+                            resource,
+                            OpSubmitError::Completion(err),
+                        )));
                     }
                     std::task::Poll::Pending => {
                         *myself = OpFut::Submitted(submit_fut);

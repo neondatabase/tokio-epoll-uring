@@ -51,7 +51,7 @@ impl SubmitSideOpen {
         return GetOpsSlotFut {
             state: GetOpsSlotFutState::NotPolled {
                 submit_side_weak: Weak::clone(&self.myself),
-                ops: Arc::clone(&self.ops),
+                ops_weak: Arc::downgrade(&self.ops),
             },
         };
     }
@@ -73,14 +73,19 @@ impl SubmitSideOpen {
 }
 
 pub(crate) struct UnsafeOpsSlotHandle {
-    pub(crate) ops: Arc<Mutex<Ops>>,
+    pub(crate) ops_weak: Weak<Mutex<Ops>>,
     pub(crate) idx: usize,
 }
 
-enum UnsafeOpsSlotHandleSubmitError {
-    SubmitSidePlugged(UnsafeOpsSlotHandle),
-    // TODO: technically same cause as SubmitSidePlugged
-    OpsDraining(UnsafeOpsSlotHandle),
+#[derive(Debug, thiserror::Error)]
+// TODO: all of these are the same cause, i.e., system shutdown
+pub(crate) enum UnsafeOpsSlotHandleSubmitError {
+    #[error("submit side is plugged")]
+    SubmitSidePlugged,
+    #[error("ops draining")]
+    OpsDraining,
+    #[error("ops dropped")]
+    OpsDropped,
 }
 
 impl UnsafeOpsSlotHandle {
@@ -89,7 +94,7 @@ impl UnsafeOpsSlotHandle {
         submit_side: Arc<Mutex<SubmitSideInner>>,
         mut rsrc: R,
         make_sqe: MakeSqe,
-    ) -> Result<InflightOpHandle<R>, UnsafeOpsSlotHandleSubmitError>
+    ) -> Result<InflightOpHandle<R>, (Self, R, UnsafeOpsSlotHandleSubmitError)>
     where
         R: ResourcesOwnedByKernel + Send + 'static,
         MakeSqe: FnOnce(&mut R) -> io_uring::squeue::Entry,
@@ -101,12 +106,22 @@ impl UnsafeOpsSlotHandle {
         let submit_side_open = match &mut *submit_side_guard {
             SubmitSideInner::Open(open) => open,
             SubmitSideInner::Plugged => {
-                return Err(UnsafeOpsSlotHandleSubmitError::SubmitSidePlugged(self));
+                return Err((
+                    self,
+                    rsrc,
+                    UnsafeOpsSlotHandleSubmitError::SubmitSidePlugged,
+                ));
             }
             SubmitSideInner::Undefined => todo!(),
         };
 
-        let ops_guard = self.ops.lock().unwrap();
+        let ops = match Weak::upgrade(&self.ops_weak) {
+            Some(ops) => ops,
+            None => {
+                return Err((self, rsrc, UnsafeOpsSlotHandleSubmitError::OpsDropped));
+            }
+        };
+        let ops_guard = ops.lock().unwrap();
         let mut ops_inner_guard = ops_guard.inner.lock().unwrap();
         let ops_open = match &mut *ops_inner_guard {
             OpsInner::Undefined => unreachable!(),
@@ -114,7 +129,7 @@ impl UnsafeOpsSlotHandle {
             OpsInner::Draining(_) => {
                 drop(ops_inner_guard);
                 drop(ops_guard);
-                return Err(UnsafeOpsSlotHandleSubmitError::OpsDraining(self));
+                return Err((self, rsrc, UnsafeOpsSlotHandleSubmitError::OpsDraining));
             }
         };
         assert!(ops_open.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
@@ -181,7 +196,13 @@ impl UnsafeOpsSlotHandle {
 
 impl UnsafeOpsSlotHandle {
     fn poll(self, cx: &mut std::task::Context<'_>) -> OwnedSlotPollResult {
-        let mut ops_guard = self.ops.lock().unwrap();
+        let ops = match Weak::upgrade(&self.ops_weak) {
+            Some(ops) => ops,
+            None => {
+                return OwnedSlotPollResult::OpsDropped;
+            }
+        };
+        let mut ops_guard = ops.lock().unwrap();
         let mut ops_inner_guard = ops_guard.inner.lock().unwrap();
         let storage = match &mut *ops_inner_guard {
             OpsInner::Undefined => unreachable!(),
@@ -253,6 +274,8 @@ where
 pub(crate) enum NotInflightSlotHandleSubmitErrorKind {
     #[error("submit side is already dropped")]
     SubmitSideDropped,
+    #[error("submit error")]
+    SubmitError(#[source] UnsafeOpsSlotHandleSubmitError),
 }
 
 impl NotInflightSlotHandle {
@@ -283,14 +306,12 @@ impl NotInflightSlotHandle {
                 };
                 match slot.submit(submit_side, rsrc, make_sqe) {
                     Ok(inflight_op_handle) => Ok(inflight_op_handle),
-                    Err(UnsafeOpsSlotHandleSubmitError::SubmitSidePlugged(slot))
-                    | Err(UnsafeOpsSlotHandleSubmitError::OpsDraining(slot)) => {
-                        // put back so we run the Drop handler
-                        self.state = NotInflightSlotHandleState::Usable {
-                            submit_side_weak,
-                            slot,
-                        };
-                        panic!("cannot use slot for submission, SubmitSide is already plugged")
+                    Err((slot, rsrc, err)) => {
+                        self.state = NotInflightSlotHandleState::Error { slot };
+                        return Err(NotInflightSlotHandleSubmitError {
+                            rsrc,
+                            kind: NotInflightSlotHandleSubmitErrorKind::SubmitError(err),
+                        });
                     }
                 }
             }
@@ -310,8 +331,12 @@ impl Drop for NotInflightSlotHandle {
                 slot,
                 submit_side_weak: _,
             } => {
-                let mut ops = slot.ops.lock().unwrap();
-                ops.return_slot_and_wake(slot.idx);
+                let ops = match Weak::upgrade(&slot.ops_weak) {
+                    Some(ops) => ops,
+                    None => return,
+                };
+                let mut ops_guard = ops.lock().unwrap();
+                ops_guard.return_slot_and_wake(slot.idx);
             }
             NotInflightSlotHandleState::Used => (),
             NotInflightSlotHandleState::Dropped => unreachable!("implementation error"),
@@ -326,7 +351,7 @@ enum GetOpsSlotFutState {
     Undefined,
     NotPolled {
         submit_side_weak: Weak<Mutex<SubmitSideInner>>,
-        ops: Arc<Mutex<Ops>>,
+        ops_weak: Weak<Mutex<Ops>>,
     },
     EnqueuedWaiter {
         submit_side_weak: Weak<Mutex<SubmitSideInner>>,
@@ -351,6 +376,8 @@ impl GetOpsSlotFut {
 pub(crate) enum GetOpsSlotError {
     #[error("ops is draining")]
     OpsDraining,
+    #[error("ops dropped")]
+    OpsDropped,
     #[error("submit side got plugged while doing opportunistic completion processing to get submit slot")]
     SubmitSidePluggedWhileDoingOpportunisticCompletionProcessingToGetSubmitSlot,
     #[error("submit side got dropped while doing opportunistic completion processing to get submit slot")]
@@ -373,9 +400,16 @@ impl std::future::Future for GetOpsSlotFut {
             match cur {
                 GetOpsSlotFutState::Undefined => unreachable!("implementation error"),
                 GetOpsSlotFutState::NotPolled {
-                    ops,
+                    ops_weak,
                     submit_side_weak,
                 } => {
+                    let ops = match Weak::upgrade(&ops_weak) {
+                        Some(ops) => ops,
+                        None => {
+                            self.state = GetOpsSlotFutState::ReadyPolled;
+                            return std::task::Poll::Ready(Err(GetOpsSlotError::OpsDropped));
+                        }
+                    };
                     let ops_guard = ops.lock().unwrap();
                     let mut ops_inner_guard = ops_guard.inner.lock().unwrap();
                     let open = match &mut *ops_inner_guard {
@@ -394,7 +428,7 @@ impl std::future::Future for GetOpsSlotFut {
                             return std::task::Poll::Ready(Ok(NotInflightSlotHandle {
                                 state: NotInflightSlotHandleState::Usable {
                                     submit_side_weak,
-                                    slot: UnsafeOpsSlotHandle { ops, idx },
+                                    slot: UnsafeOpsSlotHandle { ops_weak, idx },
                                 },
                             }));
                         }
@@ -496,6 +530,7 @@ impl std::future::Future for GetOpsSlotFut {
 enum OwnedSlotPollResult {
     Ready(i32),
     Pending(UnsafeOpsSlotHandle),
+    OpsDropped,
 }
 
 #[derive(Clone)]
@@ -581,7 +616,9 @@ impl SubmitSideInner {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum SubmitError {
+    #[error("queue full")]
     QueueFull,
 }
 
@@ -603,8 +640,14 @@ enum InflightOpHandleState {
     Dropped,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InflightOpHandleError {
+    #[error("ops dropped")]
+    OpsDropped,
+}
+
 impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightOpHandle<R> {
-    type Output = R::OpResult;
+    type Output = Result<R::OpResult, (R, InflightOpHandleError)>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -626,6 +669,22 @@ impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightO
                             poll_count: poll_count + 1,
                         };
                         return std::task::Poll::Pending;
+                    }
+                    OwnedSlotPollResult::OpsDropped => {
+                        self.state = InflightOpHandleState::DoneAndPolled;
+                        // SAFETY:
+                        // This future has an outdated view of the system; it shut down in the meantime.
+                        // Shutdown makes sure that all inflight ops complete, so,
+                        // these resources are no longer owned by the kernel and can be returned as an error.
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            let resources_owned_by_kernel =
+                                self.resources_owned_by_kernel.take().unwrap();
+                            return std::task::Poll::Ready(Err((
+                                resources_owned_by_kernel,
+                                InflightOpHandleError::OpsDropped,
+                            )));
+                        }
                     }
                 };
 
@@ -665,16 +724,15 @@ impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightO
                     }
                 }
                 self.state = InflightOpHandleState::DoneAndPolled;
-                return std::task::Poll::Ready(rsrc.on_op_completion(res));
+                return std::task::Poll::Ready(Ok(rsrc.on_op_completion(res)));
             }
             InflightOpHandleState::DoneButYieldingToExecutorForFairness { result } => {
                 self.state = InflightOpHandleState::DoneAndPolled;
-                return std::task::Poll::Ready(
-                    self.resources_owned_by_kernel
-                        .take()
-                        .unwrap()
-                        .on_op_completion(result),
-                );
+                return std::task::Poll::Ready(Ok(self
+                    .resources_owned_by_kernel
+                    .take()
+                    .unwrap()
+                    .on_op_completion(result)));
             }
         }
     }
@@ -697,7 +755,21 @@ where
                 slot,
                 poll_count: _,
             } => {
-                let mut ops_guard = slot.ops.lock().unwrap();
+                let ops = match Weak::upgrade(&slot.ops_weak) {
+                    Some(ops) => ops,
+                    None => {
+                        // SAFETY:
+                        // This future has an outdated view of the system; it shut down in the meantime.
+                        // Shutdown makes sure that all inflight ops complete, so, it is safe to drop the resources owned by kernel at this point.
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            let resources_owned_by_kernel = self.resources_owned_by_kernel.take();
+                            drop(resources_owned_by_kernel);
+                        }
+                        return;
+                    }
+                };
+                let mut ops_guard = ops.lock().unwrap();
                 let mut ops_inner_guard = ops_guard.inner.lock().unwrap();
                 let storage = match &mut *ops_inner_guard {
                     OpsInner::Undefined => unreachable!(),

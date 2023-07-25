@@ -25,6 +25,7 @@ pub struct System {
     #[allow(dead_code)]
     id: usize,
     split_uring: *mut io_uring::IoUring,
+    ops: Arc<Mutex<Ops>>,
     // poller_heartbeat: (), // TODO
 }
 
@@ -119,23 +120,21 @@ impl std::future::Future for Launch {
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
                     let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
 
-                    let completion_side = Arc::new(Mutex::new(CompletionSide {
-                        id,
-                        cq,
-                        ops: ops.clone(),
-                    }));
+                    let completion_side =
+                        Arc::new(Mutex::new(CompletionSide::new(id, cq, ops.clone())));
 
                     let submit_side = SubmitSide::new(SubmitSideNewArgs {
                         id,
                         submitter,
                         sq,
                         completion_side: Arc::clone(&completion_side),
-                        ops,
+                        ops: ops.clone(),
                         waiters_tx,
                     });
                     let system = System {
                         id,
                         split_uring: uring,
+                        ops: Arc::clone(&ops),
                     };
                     let poller_ready_fut = Poller::launch(PollerNewArgs {
                         id,
@@ -195,7 +194,11 @@ pub(crate) fn poller_impl_finish_shutdown(
     scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
     scopeguard::defer_on_unwind! {tracing::error!("poller shutdown panic")};
 
-    let System { id: _, split_uring } = { system };
+    let System {
+        id: _,
+        split_uring,
+        ops,
+    } = { system };
 
     let ShutdownRequest {
         done_tx,
@@ -209,12 +212,10 @@ pub(crate) fn poller_impl_finish_shutdown(
     let completion_side = Mutex::into_inner(completion_side).unwrap();
 
     // Unsplit the uring
-    let CompletionSide { id: _, cq, ops } = { completion_side }; // scope to make the `x: _` destructuring drop.
-
-    // compile-time-ensure we've got the owned types here by declaring the types explicitly
+    // explicit type to ensure we get compile-time-errors if we don't have the owned io_uring crate types
+    let mut cq: CompletionQueue<'_> = completion_side.deconstruct();
     let mut sq: SubmissionQueue<'_> = sq;
     let submitter: Submitter<'_> = submitter;
-    let mut cq: CompletionQueue<'_> = cq;
     // We now own all the parts from the IoUring::split() again.
     // Some final assertions, then drop them all, unleak the IoUring, and drop it as well.
     // That cleans up the SQ, CQs, registrations, etc.

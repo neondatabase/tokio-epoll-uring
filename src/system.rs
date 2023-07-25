@@ -103,8 +103,7 @@ impl Ops {
                         }
                         Ok(waiter) => {
                             match waiter.send(UnsafeOpsSlotHandle {
-                                ops: Weak::upgrade(&inner.myself)
-                                    .expect("we're executing on myself"),
+                                ops_weak: Weak::clone(&inner.myself),
                                 idx,
                             }) {
                                 Ok(()) => {

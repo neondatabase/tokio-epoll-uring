@@ -61,7 +61,7 @@ async fn submit_errors_after_shutdown() {
         shutdown_started_rx.await.unwrap();
         match submit_mock_op(slot) {
             Ok(_inflight) => panic!("submissions should fail after shutdown initiated"),
-            Err(NotInflightSlotHandleSubmitErrorKind::SubmitSideDropped) => {}
+            Err(e) => info!("submission failed as expected: {e:#}"),
         }
     });
     let wait_shutdown = system.initiate_shutdown();
@@ -96,7 +96,7 @@ async fn shutdown_waits_for_ongoing_ops() {
         }
     }
     println!("waiting submit_fut");
-    let _: () = submit_fut.await;
+    let _: () = submit_fut.await.ok().unwrap();
     println!("submit_fut is done");
     tokio::select! {
         // TODO don't rely on timing

@@ -15,16 +15,22 @@ use super::{
 };
 
 pub(crate) struct CompletionSide {
-    #[cfg(debug_assertions)]
     #[allow(dead_code)]
-    pub(crate) id: usize,
-    pub(crate) cq: CompletionQueue<'static>,
-    pub(crate) ops: Arc<Mutex<Ops>>,
+    id: usize,
+    cq: CompletionQueue<'static>,
+    ops: Arc<Mutex<Ops>>,
 }
 
 unsafe impl Send for CompletionSide {}
 
 impl CompletionSide {
+    pub(crate) fn new(id: usize, cq: CompletionQueue<'static>, ops: Arc<Mutex<Ops>>) -> Self {
+        Self { id, cq, ops }
+    }
+    pub(crate) fn deconstruct(self) -> CompletionQueue<'static> {
+        let Self { id: _, cq, ops: _ } = { self };
+        cq
+    }
     pub(crate) fn process_completions(&mut self) {
         let cq = &mut self.cq;
         cq.sync();
