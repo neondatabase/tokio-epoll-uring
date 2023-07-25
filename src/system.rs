@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, Weak},
+};
 
 pub(super) mod completion;
 pub(super) mod lifecycle;
@@ -6,6 +9,7 @@ pub(super) mod submission;
 #[cfg(test)]
 mod tests;
 
+use tokio::sync::oneshot;
 use tracing::trace;
 
 use self::submission::UnsafeOpsSlotHandle;
@@ -56,8 +60,7 @@ struct OpsInnerOpen {
     id: usize,
     storage: [Option<OpState>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
-    waiters_rx:
-        tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
+    waiters: VecDeque<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
     myself: Weak<Mutex<Ops>>,
 }
 
@@ -68,7 +71,37 @@ struct OpsInnerDraining {
     unused_indices: Vec<usize>,
 }
 
+enum TryGetSlotResult {
+    GotSlot(UnsafeOpsSlotHandle),
+    NoSlots(oneshot::Receiver<UnsafeOpsSlotHandle>),
+    Draining,
+}
+
 impl Ops {
+    fn try_get_slot(&mut self) -> TryGetSlotResult {
+        let mut ops_inner_guard = self.inner.lock().unwrap();
+        let open = match &mut *ops_inner_guard {
+            OpsInner::Undefined => unreachable!(),
+            OpsInner::Open(open) => open,
+            OpsInner::Draining(_) => {
+                return TryGetSlotResult::Draining;
+            }
+        };
+        match open.unused_indices.pop() {
+            Some(idx) => TryGetSlotResult::GotSlot({
+                UnsafeOpsSlotHandle {
+                    ops_weak: open.myself.clone(),
+                    idx,
+                }
+            }),
+            None => {
+                let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
+                open.waiters.push_back(wake_up_tx);
+                TryGetSlotResult::NoSlots(wake_up_rx)
+            }
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(system=%self.id, idx=%idx))]
     fn return_slot_and_wake(&mut self, idx: usize) {
         fn return_slot(op_state_ref: &mut Option<OpState>) {
@@ -96,29 +129,18 @@ impl Ops {
             OpsInner::Undefined => unreachable!(),
             OpsInner::Open(inner) => {
                 return_slot(&mut inner.storage[idx]);
-                loop {
-                    match inner.waiters_rx.try_recv() {
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                            break;
+                while let Some(waiter) = inner.waiters.pop_front() {
+                    match waiter.send(UnsafeOpsSlotHandle {
+                        ops_weak: Weak::clone(&inner.myself),
+                        idx,
+                    }) {
+                        Ok(()) => {
+                            trace!("handed `idx` to a waiter");
+                            return;
                         }
-                        Ok(waiter) => {
-                            match waiter.send(UnsafeOpsSlotHandle {
-                                ops_weak: Weak::clone(&inner.myself),
-                                idx,
-                            }) {
-                                Ok(()) => {
-                                    trace!("handed `idx` to a waiter");
-                                    return;
-                                }
-                                Err(_) => {
-                                    // the future requesting wakeup got dropped. wake up next one
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            // submit side is plugged already
-                            break;
+                        Err(_) => {
+                            // the future requesting wakeup got dropped. wake up next one
+                            continue;
                         }
                     }
                 }

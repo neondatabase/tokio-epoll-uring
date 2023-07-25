@@ -373,7 +373,7 @@ async fn poller_impl(
                     id,
                     storage,
                     unused_indices,
-                    waiters_rx: _,
+                    waiters: _, // cancels all waiters
                     myself: _,
                 } = *open;
                 *ops_inner_guard = OpsInner::Draining(Box::new(OpsInnerDraining {

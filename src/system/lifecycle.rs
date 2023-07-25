@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     os::fd::AsRawFd,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
@@ -102,7 +102,6 @@ impl std::future::Future for Launch {
                 LaunchState::Undefined => unreachable!("implementation error"),
                 LaunchState::Init { poller_preempt } => {
                     // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
-                    let (waiters_tx, waiters_rx) = tokio::sync::mpsc::unbounded_channel();
                     let ops = Arc::new_cyclic(|myself| {
                         Mutex::new(Ops {
                             id,
@@ -110,7 +109,7 @@ impl std::future::Future for Launch {
                                 id,
                                 storage: array_macro::array![_ => None; RING_SIZE as usize],
                                 unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
-                                waiters_rx,
+                                waiters: VecDeque::new(),
                                 myself: Weak::clone(&myself),
                             })))),
                         })
@@ -128,7 +127,6 @@ impl std::future::Future for Launch {
                         sq,
                         ops: Arc::clone(&ops),
                         completion_side: Arc::clone(&completion_side),
-                        waiters_tx,
                     });
                     let system = System {
                         id,

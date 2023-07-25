@@ -8,7 +8,7 @@ use crate::{
     ResourcesOwnedByKernel,
 };
 
-use super::{completion::CompletionSide, OpStateInner, Ops};
+use super::{completion::CompletionSide, OpStateInner, Ops, TryGetSlotResult};
 
 pub(crate) struct SubmitSideNewArgs {
     #[cfg(debug_assertions)]
@@ -18,8 +18,6 @@ pub(crate) struct SubmitSideNewArgs {
     pub(crate) sq: SubmissionQueue<'static>,
     pub(crate) ops: Arc<Mutex<Ops>>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
-    pub(crate) waiters_tx:
-        tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
 }
 
 impl SubmitSide {
@@ -30,7 +28,6 @@ impl SubmitSide {
             sq,
             ops,
             completion_side,
-            waiters_tx,
         } = args;
         SubmitSide(Arc::new_cyclic(|myself| {
             Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
@@ -39,7 +36,6 @@ impl SubmitSide {
                 sq,
                 ops,
                 completion_side: Arc::clone(&completion_side),
-                waiters_tx,
                 myself: Weak::clone(myself),
             }))
         }))
@@ -410,33 +406,26 @@ impl std::future::Future for GetOpsSlotFut {
                             return std::task::Poll::Ready(Err(GetOpsSlotError::OpsDropped));
                         }
                     };
-                    let ops_guard = ops.lock().unwrap();
-                    let mut ops_inner_guard = ops_guard.inner.lock().unwrap();
-                    let open = match &mut *ops_inner_guard {
-                        OpsInner::Undefined => unreachable!(),
-                        OpsInner::Open(open) => open,
-                        OpsInner::Draining(_) => {
+                    let mut ops_guard = ops.lock().unwrap();
+                    match ops_guard.try_get_slot() {
+                        TryGetSlotResult::Draining => {
                             self.state = GetOpsSlotFutState::ReadyPolled;
                             return std::task::Poll::Ready(Err(GetOpsSlotError::OpsDraining));
                         }
-                    };
-                    match open.unused_indices.pop() {
-                        Some(idx) => {
+                        TryGetSlotResult::GotSlot(unsafe_slot) => {
                             self.state = GetOpsSlotFutState::ReadyPolled;
-                            drop(ops_inner_guard);
                             drop(ops_guard);
                             return std::task::Poll::Ready(Ok(NotInflightSlotHandle {
                                 state: NotInflightSlotHandleState::Usable {
                                     submit_side_weak,
-                                    slot: UnsafeOpsSlotHandle { ops_weak, idx },
+                                    slot: unsafe_slot,
                                 },
                             }));
                         }
-                        None => {
-                            // all slots are taken.
-                            // do some opportunistic completion processing to wake up futures that will release ops slots
-                            // then yield to executor
-                            drop(ops_inner_guard);
+                        TryGetSlotResult::NoSlots(waiter) => {
+                            // All slots are taken and we're waiting in line.
+                            // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
+                            // This is in the hope that we'll wake ourselves up.
                             drop(ops_guard); // so that  process_completions() can take it
                             let submit_side = match Weak::upgrade(&submit_side_weak) {
                                 Some(submit_side) => submit_side,
@@ -475,19 +464,9 @@ impl std::future::Future for GetOpsSlotFut {
                                     .unwrap()
                                     .process_completions();
                             }
-                            let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
-                            match submit_side_open.waiters_tx.send(wake_up_tx) {
-                                Ok(()) => (),
-                                Err(tokio::sync::mpsc::error::SendError(_)) => {
-                                    self.state = GetOpsSlotFutState::ReadyPolled;
-                                    return std::task::Poll::Ready(Err(
-                                        GetOpsSlotError::WaitersRxDropped,
-                                    ));
-                                }
-                            }
                             self.state = GetOpsSlotFutState::EnqueuedWaiter {
                                 submit_side_weak,
-                                waiter: wake_up_rx,
+                                waiter,
                             };
                             continue;
                         }
@@ -500,23 +479,31 @@ impl std::future::Future for GetOpsSlotFut {
                     match {
                         let waiter = std::pin::Pin::new(&mut waiter);
                         waiter.poll(cx)
-                    }{
+                    } {
                         std::task::Poll::Ready(res) => match res {
                             Ok(slot_handle) => {
                                 self.state = GetOpsSlotFutState::ReadyPolled;
-                                return std::task::Poll::Ready(
-                                    Ok(NotInflightSlotHandle {
-                                         state: NotInflightSlotHandleState::Usable {
-                                            submit_side_weak,
-                                            slot: slot_handle
-                                        }}));
+                                return std::task::Poll::Ready(Ok(NotInflightSlotHandle {
+                                    state: NotInflightSlotHandleState::Usable {
+                                        submit_side_weak,
+                                        slot: slot_handle,
+                                    },
+                                }));
                             }
-                            Err(_waiter_dropped) => unreachable!("system dropped before all GetOpsSlotFut were dropped; type system should prevent this"),
+                            Err(_waiter_dropped) => {
+                                self.state = GetOpsSlotFutState::ReadyPolled;
+                                return std::task::Poll::Ready(Err(
+                                    GetOpsSlotError::WaitersRxDropped,
+                                ));
+                            }
                         },
                         std::task::Poll::Pending => {
-                            self.state = GetOpsSlotFutState::EnqueuedWaiter{ waiter, submit_side_weak};
+                            self.state = GetOpsSlotFutState::EnqueuedWaiter {
+                                waiter,
+                                submit_side_weak,
+                            };
                             return std::task::Poll::Pending;
-                        },
+                        }
                     }
                 }
                 GetOpsSlotFutState::ReadyPolled => {
@@ -550,8 +537,6 @@ pub(crate) struct SubmitSideOpen {
     sq: SubmissionQueue<'static>,
     ops: Arc<Mutex<Ops>>,
     completion_side: Arc<Mutex<CompletionSide>>,
-    waiters_tx:
-        tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
     myself: Weak<Mutex<SubmitSideInner>>,
 }
 
