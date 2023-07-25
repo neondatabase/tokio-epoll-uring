@@ -2,7 +2,10 @@ use std::{marker::PhantomData, task::Poll};
 
 use futures::FutureExt;
 
-use crate::system::{Launch, SubmitSide, SubmitSideProvider, System, SystemHandle};
+use crate::{
+    system::{lifecycle::Launch, submission::SubmitSide},
+    SubmitSideProvider, System, SystemHandle,
+};
 
 /// [`SystemLauncher`](crate::SystemLauncher) impl that provides executor-thread-local submission.
 #[derive(Clone, Copy)]

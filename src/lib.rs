@@ -208,9 +208,8 @@ pub mod ops;
 pub use ops::read::read;
 
 mod system;
-pub use system::System;
-pub use system::SystemHandle;
-pub use system::SystemLauncher;
+pub use system::lifecycle::handle::SystemHandle;
+pub use system::lifecycle::System;
 
 pub(crate) mod shutdown_request;
 
@@ -218,4 +217,36 @@ mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
 
 mod thread_local_system_handle;
+use system::submission::SubmitSide;
+use thread_local_system_handle::ThreadLocalSubmitSideProvider;
 pub use thread_local_system_handle::ThreadLocalSystemLauncher;
+
+/// An indirection to allow [`crate::ops`] to be generic over which [`System`] to use.
+///
+/// Check the "Implementors" section for the list of available [`System`]s.
+/// Check any [`crate::ops`] function or the crate's examples to see where you need this.
+///
+/// The name of this trait is subject to debate.
+pub trait SystemLauncher<P>: std::future::Future<Output = P>
+where
+    P: SubmitSideProvider,
+{
+}
+impl<'a> SystemLauncher<&'a SystemHandle> for std::future::Ready<&'a SystemHandle> {}
+impl SystemLauncher<ThreadLocalSubmitSideProvider> for crate::ThreadLocalSystemLauncher {}
+impl SystemLauncher<SharedSystemHandle> for std::future::Ready<SharedSystemHandle> {}
+
+impl SubmitSideProvider for &'_ SystemHandle {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
+        f(self.state.guaranteed_live().submit_side.clone())
+    }
+}
+
+pub trait SubmitSideProvider: Unpin {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R;
+}
+
+pub(crate) trait ResourcesOwnedByKernel {
+    type OpResult;
+    fn on_op_completion(self, res: i32) -> Self::OpResult;
+}

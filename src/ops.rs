@@ -1,9 +1,11 @@
-
 pub mod read;
 
 use futures::{Future, FutureExt};
 
-use crate::system::{ResourcesOwnedByKernel, SubmitSide, SubmitSideProvider};
+use crate::{
+    system::submission::{GetOpsSlotFut, InflightOpHandle, SubmitSide},
+    ResourcesOwnedByKernel, SubmitSideProvider,
+};
 
 pub(crate) enum OpFut<L, P, O>
 where
@@ -12,15 +14,9 @@ where
     O: OpTrait + Send + 'static,
 {
     Undefined,
-    NeedLaunch {
-        system_launcher: L,
-        make_op: O,
-    },
-    NeedSlot {
-        slot_fut: crate::system::GetOpsSlotFut,
-        make_op: O,
-    },
-    Submitted(crate::system::InflightOpHandle<O>),
+    NeedLaunch { system_launcher: L, make_op: O },
+    NeedSlot { slot_fut: GetOpsSlotFut, make_op: O },
+    Submitted(InflightOpHandle<O>),
     ReadyPolled,
 }
 

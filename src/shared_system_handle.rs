@@ -2,8 +2,10 @@ use std::sync::{Arc, RwLock};
 
 use futures::Future;
 
-use crate::system::{SubmitSide, SystemHandle, SystemHandleState};
-use crate::system::{SubmitSideProvider, System};
+use crate::{
+    system::{lifecycle::handle::SystemHandleState, submission::SubmitSide},
+    SubmitSideProvider, System, SystemHandle,
+};
 
 /// [`Clone`]-able wrapper around [`SystemHandle`] for sharing between threads / tokio tasks.
 ///
