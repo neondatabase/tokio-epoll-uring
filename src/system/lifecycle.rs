@@ -33,6 +33,7 @@ unsafe impl Send for System {}
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
 unsafe impl Sync for System {}
 
+/// See [`System::launch`].
 pub struct Launch {
     id: usize,
     state: LaunchState,
@@ -57,6 +58,10 @@ enum LaunchState {
 }
 
 impl System {
+    /// Returns a future that, when polled, sets up an io_uring instance
+    /// and a corresponding *poller task* on the current tokio runtime.
+    /// The future resolves to a [`SystemHandle`] that can be used to
+    /// interact with the system.
     pub fn launch() -> Launch {
         static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);

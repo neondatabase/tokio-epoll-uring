@@ -220,14 +220,11 @@ pub use shared_system_handle::SharedSystemHandle;
 
 mod thread_local_system_handle;
 use system::submission::SubmitSide;
-use thread_local_system_handle::ThreadLocalSubmitSideProvider;
+pub use thread_local_system_handle::ThreadLocalSubmitSideProvider;
 pub use thread_local_system_handle::ThreadLocalSystemLauncher;
 
-/// An indirection to allow [`crate::ops`] to be generic over which [`System`] to use.
-///
-/// Check the "Implementors" section for the list of available [`System`]s.
-/// Check any [`crate::ops`] function or the crate's examples to see where you need this.
-///
+/// An indirection to allow [`crate::ops`] to be generic over which [`System`] instance to use for submitting operations.
+//
 /// The name of this trait is subject to debate.
 pub trait SystemLauncher<P>: std::future::Future<Output = P>
 where

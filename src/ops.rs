@@ -61,7 +61,7 @@ where
         loop {
             let cur = std::mem::replace(&mut *myself, OpFut::Undefined);
             match cur {
-                OpFut::Undefined => todo!(),
+                OpFut::Undefined => unreachable!(),
                 OpFut::ReadyPolled => unreachable!(),
                 OpFut::NeedLaunch {
                     mut system_launcher,

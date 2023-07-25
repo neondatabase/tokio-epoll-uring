@@ -2,15 +2,18 @@ use crate::system::submission::PlugError;
 
 use super::{ShutdownRequest, SubmitSide};
 
-/// Owned handle to the [`System`] launched by [`SystemLauncher`].
+/// Owned handle to the [`System`](crate::System) created by [`System::launch`](crate::System::launch).
 ///
-/// The only use of this handle is to shut down the [`System`].
+/// Users of this crate typically don't use the [`SystemHandle`] directly,
+/// but instead use one of the [`SystemLauncher`](crate::SystemLauncher) implementations.
+///
+/// The only use of this handle is to shut down the [`System`](crate::System).
 /// Call [`initiate_shutdown`](SystemHandle::initiate_shutdown) for explicit shutdown with ability to wait for shutdown completion.
 ///
 /// Alternatively, `drop` will also request shutdown, but not wait for completion of shutdown.
 ///
 /// This handle is [`Send`] but not [`Clone`].
-/// If you need to share it between threads, use [`crate::SharedSystemHandle`].
+/// If you need to share it between threads, use [`SharedSystemHandle`](crate::SharedSystemHandle).
 pub struct SystemHandle {
     pub(crate) state: SystemHandleState,
 }
@@ -57,15 +60,27 @@ impl Drop for SystemHandle {
 impl SystemHandle {
     /// Initiate system shtudown and return a future to await completion of shutdown.
     ///
-    /// If this call returns Ok(), it is guaranteed that no new operations
-    /// will be allowed to start (TODO: not true right now, since poller task plugs the queue).
-    /// Currently, such attempts will cause a panic but we may change the behavior
-    /// to make it return a custom [`std::io::Error`] instead.
+    /// It is not necessary to poll the returned future to initiate shutdown; it is
+    /// just to await completion of orderly shutdown.
     ///
-    /// Shutdown must wait for all in-flight operations to finish..
-    /// Shutdown may spawn an `std::thread` for this purpose.
-    /// It would generally be unsafe to have "force shutdown" after a timeout because
-    /// in io_uring, the kernel owns resources such as memory buffers while operations are in flight.
+    /// After the call to this function returns, it is guaranteed that all subsequent attempts
+    /// to start new operations will fail with a custom [`std::io::Error`].
+    /// I.e., subsequent `crate::read().await` will fail with an error.
+    ///
+    /// Operations started before we initiated shutdown that have not been submitted
+    /// to the kernel yet will fail in the same way.
+    ///
+    /// Operations started before we initiated shutdown that *have* been submitted to the kernel
+    /// remain active. It is safe to drop future that awaits the operation, but
+    /// operation itself is not cancelled. When dropping, ownership of buffers or other
+    /// resources that are owned by the kernel while the operation is in-flight moves to the
+    /// [`System`](crate::System) until the operation completes.
+    /// (TODO: use io_uring features to cancel in-flight operations).
+    ///
+    /// If the poller task gets cancelled, e.g., because the tokio runtime is being shut down,
+    /// the shutdown procedure makes sure to continue in a new `std::thread`.
+    ///
+    /// So, it is safe to drop the tokio runtime on which the poller task runs.
     pub fn initiate_shutdown(mut self) -> impl std::future::Future<Output = ()> + Send + Unpin {
         let cur = std::mem::replace(
             &mut self.state,
