@@ -37,12 +37,12 @@ pub(crate) trait OpTrait: ResourcesOwnedByKernel + Sized + Send + 'static {
     }
 }
 
-pub(crate) enum OpSubmitError<O>
-where
-    O: OpTrait + Send + 'static,
-{
-    GetOpsSlotError(O, GetOpsSlotError),
-    SubmitError(O, NotInflightSlotHandleSubmitErrorKind),
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OpSubmitError {
+    #[error("get an ops slot")]
+    GetOpsSlotError(#[source] GetOpsSlotError),
+    #[error("submit the op")]
+    SubmitError(#[source] NotInflightSlotHandleSubmitErrorKind),
 }
 
 impl<L, P, O> std::future::Future for OpFut<L, P, O>
@@ -51,7 +51,7 @@ where
     P: SubmitSideProvider,
     O: OpTrait + Send + 'static + Unpin,
 {
-    type Output = Result<O::OpResult, OpSubmitError<O>>;
+    type Output = Result<O::OpResult, (O, OpSubmitError)>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -99,9 +99,10 @@ where
                                 Ok(submit_fut) => submit_fut,
                                 Err(NotInflightSlotHandleSubmitError { rsrc, kind }) => {
                                     *myself = OpFut::ReadyPolled;
-                                    return std::task::Poll::Ready(Err(
-                                        OpSubmitError::SubmitError(rsrc, kind),
-                                    ));
+                                    return std::task::Poll::Ready(Err((
+                                        rsrc,
+                                        OpSubmitError::SubmitError(kind),
+                                    )));
                                 }
                             };
                         *myself = OpFut::Submitted(submit_fut);
@@ -109,8 +110,9 @@ where
                     }
                     std::task::Poll::Ready(Err(e)) => {
                         *myself = OpFut::ReadyPolled;
-                        return std::task::Poll::Ready(Err(OpSubmitError::GetOpsSlotError(
-                            make_op, e,
+                        return std::task::Poll::Ready(Err((
+                            make_op,
+                            OpSubmitError::GetOpsSlotError(e),
                         )));
                     }
                 },

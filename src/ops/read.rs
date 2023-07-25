@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{ResourcesOwnedByKernel, SubmitSideProvider, SystemLauncher};
 
-use super::{OpSubmitError, OpTrait};
+use super::OpTrait;
 
 /// Read up to `buf.len()` bytes from a `file` into `buf` at the given `offset`.
 pub async fn read<'a, L, P, B>(
@@ -19,19 +19,7 @@ where
     let op = ReadOp { file, offset, buf };
     match op.into_fut(system_launcher).await {
         Ok(output) => output,
-        Err(OpSubmitError::GetOpsSlotError(
-            ReadOp {
-                file,
-                offset: _,
-                buf,
-            },
-            e,
-        )) => (
-            file,
-            buf,
-            Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-        ),
-        Err(OpSubmitError::SubmitError(
+        Err((
             ReadOp {
                 file,
                 offset: _,
