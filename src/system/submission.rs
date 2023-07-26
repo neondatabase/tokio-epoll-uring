@@ -2,13 +2,13 @@ use std::sync::{Arc, Mutex};
 
 use io_uring::{SubmissionQueue, Submitter};
 
-use super::{completion::CompletionSide, Ops};
+use super::{completion::CompletionSide, CoOwnedOps, OpsCoOwnerSubmitSide};
 
 pub(crate) struct SubmitSideNewArgs {
     pub(crate) id: usize,
     pub(crate) submitter: Submitter<'static>,
     pub(crate) sq: SubmissionQueue<'static>,
-    pub(crate) ops: Arc<Mutex<Ops>>,
+    pub(crate) ops: CoOwnedOps<OpsCoOwnerSubmitSide>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
@@ -65,7 +65,7 @@ pub(crate) struct SubmitSideOpen {
     id: usize,
     pub(crate) submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
-    pub(crate) ops: Arc<Mutex<Ops>>,
+    pub(crate) ops: CoOwnedOps<OpsCoOwnerSubmitSide>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 

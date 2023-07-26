@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     os::fd::AsRawFd,
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 
 pub mod handle;
@@ -10,13 +10,13 @@ pub mod handle;
 use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
-use crate::system::{submission::SubmitSideOpen, Ops, RING_SIZE};
+use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
     submission::{SubmitSide, SubmitSideNewArgs},
-    OpsInner, OpsInnerOpen,
+    CoOwnedOps, OpsCoOwnerPoller, OpsInner,
 };
 
 /// The live system. Not constructible or accessible by user code. Use [`SystemHandle`] to interact.
@@ -101,30 +101,19 @@ impl std::future::Future for Launch {
                 LaunchState::Undefined => unreachable!("implementation error"),
                 LaunchState::Init { poller_preempt } => {
                     // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
-                    let ops = Arc::new_cyclic(|myself| {
-                        Mutex::new(Ops {
-                            id,
-                            inner: Arc::new(Mutex::new(OpsInner::Open(Box::new(OpsInnerOpen {
-                                id,
-                                storage: array_macro::array![_ => None; RING_SIZE as usize],
-                                unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
-                                waiters: VecDeque::new(),
-                                myself: Weak::clone(&myself),
-                            })))),
-                        })
-                    });
+                    let (ops_submit_side, ops_completion_side, ops_poller) = super::new_ops(id);
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
                     let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
 
                     let completion_side =
-                        Arc::new(Mutex::new(CompletionSide::new(id, cq, ops.clone())));
+                        Arc::new(Mutex::new(CompletionSide::new(id, cq, ops_completion_side)));
 
                     let submit_side = SubmitSide::new(SubmitSideNewArgs {
                         id,
                         submitter,
                         sq,
-                        ops: Arc::clone(&ops),
+                        ops: ops_submit_side,
                         completion_side: Arc::clone(&completion_side),
                     });
                     let system = System {
@@ -136,7 +125,7 @@ impl std::future::Future for Launch {
                         uring_fd,
                         completion_side,
                         system,
-                        ops,
+                        ops: ops_poller,
                         preempt: poller_preempt,
                     });
                     myself.state = LaunchState::WaitForPollerTaskToStart {
@@ -183,7 +172,7 @@ pub(crate) struct ShutdownRequest {
 
 pub(crate) fn poller_impl_finish_shutdown(
     system: System,
-    ops: Arc<Mutex<Ops>>,
+    ops: CoOwnedOps<OpsCoOwnerPoller>,
     completion_side: Arc<Mutex<CompletionSide>>,
     req: ShutdownRequest,
 ) {
@@ -225,9 +214,8 @@ pub(crate) fn poller_impl_finish_shutdown(
         // So, it's guaranteed that `ops` will be dropped quite soon after we
         // drop our Arc.
 
-        let ops_guard = ops.lock().unwrap();
-        let ops_inner = ops_guard.inner.lock().unwrap();
-        let inner = match &*ops_inner {
+        let ops_inner_guard = ops.inner.lock().unwrap();
+        let inner = match &*ops_inner_guard {
             OpsInner::Undefined => unreachable!(),
             OpsInner::Open(_open) => panic!("we should be Draining by now"),
             OpsInner::Draining(inner) => inner,
@@ -245,8 +233,7 @@ pub(crate) fn poller_impl_finish_shutdown(
         );
         assert!(unused_indices.is_subset(&slots_owned_by_user_space));
         // drop our arc
-        drop(ops_inner);
-        drop(ops_guard);
+        drop(ops_inner_guard);
         drop(ops);
     }
     // final assertions done, do the unsplitting

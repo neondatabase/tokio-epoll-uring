@@ -171,7 +171,7 @@ where
                                 SubmitSideInner::Undefined => unreachable!(),
                             };
 
-                            let mut ops_guard = submit_side_open.ops.lock().unwrap();
+                            let mut ops_guard = submit_side_open.ops.inner.lock().unwrap();
                             match ops_guard.try_get_slot() {
                                 TryGetSlotResult::Draining => {
                                     *myself = OpFut::ReadyPolled;
@@ -248,18 +248,7 @@ where
                             Some(submit_side) => submit_side,
                             None => {
                                 *myself = OpFut::ReadyPolled;
-                                let ops = match Weak::upgrade(&unsafe_slot.ops_weak) {
-                                    Some(ops) => ops,
-                                    None => {
-                                        *myself = OpFut::ReadyPolled;
-                                        return std::task::Poll::Ready(Err((
-                                            op,
-                                            OpError::SystemIsShutDown,
-                                        )));
-                                    }
-                                };
-                                let mut ops_guard = ops.lock().unwrap();
-                                ops_guard.return_slot(unsafe_slot.idx);
+                                unsafe_slot.try_return();
                                 *myself = OpFut::ReadyPolled;
                                 return std::task::Poll::Ready(Err((
                                     op,
