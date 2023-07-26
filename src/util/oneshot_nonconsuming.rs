@@ -3,107 +3,73 @@
 
 use std::sync::{Arc, Mutex};
 
-struct State<T> {
-    nreceivers: usize,
-    inner: StateInner<T>,
-}
-enum StateInner<T> {
-    Undefined,
-    Waiting,
-    Posted(T),
+use tokio::sync::broadcast::{
+    self,
+    error::{RecvError, SendError},
+};
+
+enum State<T> {
+    NotSent,
+    SentNotTaken(T),
     Taken,
-    SenderDropped,
 }
-struct Shared<T> {
-    state: Mutex<State<T>>,
-    waiters: tokio::sync::Notify,
+struct Shared<T>(Arc<Mutex<State<T>>>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(Arc::clone(&self.0))
+    }
 }
 
 /// Create a new sender-receiver pair.
 pub fn channel<T>() -> (SendOnce<T>, Receiver<T>) {
-    let shared = Arc::new(Shared {
-        state: Mutex::new(State {
-            nreceivers: 1,
-            inner: StateInner::Waiting,
-        }),
-        waiters: tokio::sync::Notify::new(),
-    });
-    (SendOnce(shared.clone()), Receiver(shared))
+    let shared = Shared(Arc::new(Mutex::new(State::NotSent)));
+    let (sender, receiver) = broadcast::channel(1);
+    (
+        SendOnce(shared.clone(), sender),
+        Receiver(shared.clone(), receiver),
+    )
 }
 
 /// The sender half of the channel.
 ///
 /// More [`SendOnce::send`].
-pub struct SendOnce<T>(Arc<Shared<T>>);
+pub struct SendOnce<T>(Shared<T>, broadcast::Sender<()>);
 
 /// The receiver half of a oneshot channel.
 ///
 /// Clone-able for convenience. See [`Receiver::recv`].
-pub struct Receiver<T>(Arc<Shared<T>>);
+pub struct Receiver<T>(Shared<T>, broadcast::Receiver<()>);
 
 impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        self.0.state.lock().unwrap().nreceivers += 1;
-        Receiver(self.0.clone())
-    }
-}
-
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        self.0.state.lock().unwrap().nreceivers -= 1;
-    }
-}
-
-impl<T> Drop for Shared<T> {
-    fn drop(&mut self) {
-        assert_eq!(
-            self.state
-                .lock()
-                .map(|g| g.nreceivers)
-                .unwrap_or_else(|le| le.get_ref().nreceivers),
-            0
-        );
+        Receiver(self.0.clone(), self.1.resubscribe())
     }
 }
 
 impl<T> SendOnce<T> {
     /// Send the given value to the receiver(s).
     pub fn send(self, v: T) -> Result<(), T> {
-        let mut guard = self.0.state.lock().unwrap();
-        if guard.nreceivers == 0 {
-            return Err(v);
-        }
-        let cur = std::mem::replace(&mut guard.inner, StateInner::Undefined);
-        match cur {
-            StateInner::Undefined => panic!("implementation error"),
-            StateInner::Waiting => {
-                guard.inner = StateInner::Posted(v);
-            }
-            StateInner::Posted(_) => unreachable!("we only set it in this function"),
-            StateInner::Taken => unreachable!("we only set Taken after we set Posted"),
-            StateInner::SenderDropped => unreachable!("we're executing on self"),
-        }
-        self.0.waiters.notify_waiters();
-        Ok(())
-    }
-}
-
-impl<T> Drop for SendOnce<T> {
-    fn drop(&mut self) {
-        let mut guard = self.0.state.lock().unwrap();
-        let cur = std::mem::replace(&mut guard.inner, StateInner::Undefined);
-        match cur {
-            StateInner::Undefined => panic!("implementation error"),
-            StateInner::Waiting => {
-                guard.inner = StateInner::SenderDropped;
-            }
-            StateInner::SenderDropped => unreachable!("we only set it in this function"),
-            x @ StateInner::Posted(_) | x @ StateInner::Taken => {
-                guard.inner = x;
-            }
+        let mut guard = self.0 .0.lock().unwrap();
+        let prev = std::mem::replace(&mut *guard, State::SentNotTaken(v));
+        match prev {
+            State::NotSent => (),
+            State::SentNotTaken(_) => unreachable!(),
+            State::Taken => unreachable!(),
         }
         drop(guard);
-        self.0.waiters.notify_waiters();
+        match self.1.send(()) {
+            Ok(_) => Ok(()),
+            Err(SendError(())) => {
+                let mut guard = self.0 .0.lock().unwrap();
+                let prev = std::mem::replace(&mut *guard, State::NotSent);
+                match prev {
+                    State::NotSent => unreachable!(),
+                    State::SentNotTaken(v) => Err(v),
+                    State::Taken => unreachable!(),
+                }
+            }
+        }
     }
 }
 
@@ -119,40 +85,91 @@ pub enum RecvResult<T> {
 
 impl<T> Receiver<T> {
     /// See [`RecvResult`].
-    pub async fn recv(&self) -> RecvResult<T> {
-        let mut iter = 0;
-        loop {
-            let wait_notify = loop {
-                let mut guard = self.0.state.lock().unwrap();
-                let cur = std::mem::replace(&mut guard.inner, StateInner::Undefined);
-                assert!(iter < 2, "implementation error");
+    pub async fn recv(&mut self) -> RecvResult<T> {
+        match self.1.recv().await {
+            Ok(()) => {
+                let mut guard = self.0 .0.lock().unwrap();
+                let cur = std::mem::replace(&mut *guard, State::Taken);
                 match cur {
-                    StateInner::Undefined => panic!("implementation error"),
-                    StateInner::Waiting => {
-                        // FIXME: allocation on the hot path
-                        let mut notified = Box::pin(self.0.waiters.notified());
-                        notified.as_mut().enable();
-                        guard.inner = StateInner::Waiting;
-                        drop(guard);
-                        break notified;
+                    State::NotSent => {
+                        unreachable!("we only send after we've transitited out of this state")
                     }
-                    StateInner::Posted(v) => {
-                        guard.inner = StateInner::Taken;
-                        return RecvResult::FirstRecv(v);
-                    }
-                    StateInner::Taken => {
-                        guard.inner = StateInner::Taken;
-                        return RecvResult::NotFirstRecv;
-                    }
-                    StateInner::SenderDropped => {
-                        guard.inner = StateInner::SenderDropped;
-                        return RecvResult::SenderDropped;
-                    }
+                    State::SentNotTaken(v) => RecvResult::FirstRecv(v),
+                    State::Taken => RecvResult::NotFirstRecv,
                 }
-            };
-            wait_notify.await;
-            iter += 1;
-            continue;
+            }
+            Err(RecvError::Closed) => {
+                let mut guard = self.0 .0.lock().unwrap();
+                let cur = std::mem::replace(&mut *guard, State::Taken);
+                match cur {
+                    State::NotSent => RecvResult::SenderDropped,
+                    State::SentNotTaken(v) => RecvResult::FirstRecv(v),
+                    State::Taken => RecvResult::NotFirstRecv,
+                }
+            }
+            Err(RecvError::Lagged(_)) => {
+                unreachable!("we only send once, and the channel has capacity of 1")
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sender_dropped_before_sending() {
+        let (sender, mut receiver) = super::channel::<()>();
+        drop(sender);
+        assert!(matches!(
+            receiver.recv().await,
+            super::RecvResult::SenderDropped
+        ));
+    }
+    #[tokio::test]
+    async fn first_recv() {
+        let (sender, mut receiver) = super::channel::<()>();
+        sender.send(()).unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            super::RecvResult::FirstRecv(())
+        ));
+    }
+    #[tokio::test]
+    async fn concurrent_recv() {
+        let (sender, mut receiver1) = super::channel::<()>();
+        let mut receiver2 = receiver1.clone();
+        let r1 = tokio::task::spawn(async move { receiver1.recv().await });
+        let r2 = tokio::task::spawn(async move { receiver2.recv().await });
+        tokio::time::sleep(Duration::from_secs(1)).await; // TODO: don't rely on timing
+        sender.send(()).unwrap();
+        let results = [r1.await.unwrap(), r2.await.unwrap()];
+        assert_eq!(
+            1,
+            results
+                .iter()
+                .filter(|r| matches!(r, super::RecvResult::FirstRecv(())))
+                .count()
+        );
+        assert_eq!(
+            1,
+            results
+                .iter()
+                .filter(|r| matches!(r, super::RecvResult::NotFirstRecv))
+                .count()
+        );
+    }
+    #[tokio::test]
+    async fn receive_on_receiver_cloned_after_send() {
+        let (sender, mut orig_receiver) = super::channel::<()>();
+        sender.send(()).unwrap();
+        let mut cloned_receiver = orig_receiver.clone();
+        let res = cloned_receiver.recv().await;
+        assert!(matches!(res, super::RecvResult::FirstRecv(())));
+        assert!(matches!(
+            orig_receiver.recv().await,
+            super::RecvResult::NotFirstRecv
+        ));
     }
 }

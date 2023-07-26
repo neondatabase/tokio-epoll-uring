@@ -410,7 +410,7 @@ async fn poller_impl_impl(
     inner: Arc<Mutex<PollerStateInner>>,
     mut preempt_in_epoll: Option<tokio::sync::broadcast::Receiver<mpsc::UnboundedSender<()>>>,
 ) -> ShutdownRequest {
-    let (uring_fd, completion_side, shutdown_rx) = {
+    let (uring_fd, completion_side, mut shutdown_rx) = {
         let mut inner_guard = inner.lock().unwrap();
         let PollerStateInner {
             uring_fd,
