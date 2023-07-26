@@ -46,7 +46,9 @@ enum LaunchState {
         poller_ready_fut: Pin<
             Box<
                 dyn Send
-                    + std::future::Future<Output = crate::shutdown_request::Sender<ShutdownRequest>>,
+                    + std::future::Future<
+                        Output = crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
+                    >,
             >,
         >,
         submit_side: SubmitSide,

@@ -7,6 +7,8 @@ use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
+use crate::util::oneshot_nonconsuming;
+
 use super::{
     lifecycle::{ShutdownRequest, System},
     slots::{CoOwnerCompletionSide, CoOwnerPoller, Slots},
@@ -66,7 +68,7 @@ pub(crate) struct PollerNewArgs {
 impl Poller {
     pub(crate) async fn launch(
         args: PollerNewArgs,
-    ) -> crate::shutdown_request::Sender<ShutdownRequest> {
+    ) -> oneshot_nonconsuming::SendOnce<ShutdownRequest> {
         let PollerNewArgs {
             id,
             uring_fd,
@@ -75,7 +77,7 @@ impl Poller {
             slots: ops,
             testing,
         } = args;
-        let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
+        let (shutdown_tx, shutdown_rx) = oneshot_nonconsuming::channel();
         let poller_task_state = Arc::new(Mutex::new(Poller {
             id,
             state: PollerState::RunningInTask(Arc::new(Mutex::new(PollerStateInner {
@@ -129,7 +131,7 @@ struct PollerStateInner {
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
     pub slots: Slots<CoOwnerPoller>,
-    shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
+    shutdown_rx: oneshot_nonconsuming::Receiver<ShutdownRequest>,
 }
 
 pub(crate) struct PollerTesting {
@@ -445,16 +447,16 @@ async fn poller_impl_impl(
                 } => {
                     unreachable!("see above");
                 }
-                rx = shutdown_rx.wait_for_shutdown_request()  => {
+                rx = shutdown_rx.recv()  => {
                     match rx {
-                        crate::shutdown_request::WaitForShutdownResult::ExplicitRequest(req) => {
+                        crate::util::oneshot_nonconsuming::RecvResult::FirstRecv(req) => {
                             tracing::debug!("got explicit shutdown request");
                             return req;
                         }
-                        crate::shutdown_request::WaitForShutdownResult::ExplicitRequestObservedEarlier => {
+                        crate::util::oneshot_nonconsuming::RecvResult::NotFirstRecv => {
                             panic!("once we observe a shutdown request, we return it and the caller does through with shutdown, without a chance for the executor to intervene")
                         }
-                        crate::shutdown_request::WaitForShutdownResult::SenderDropped => {
+                        crate::util::oneshot_nonconsuming::RecvResult::SenderDropped => {
                             panic!("implementation error: SystemHandle _must_ send shutdown request");
                         }
                     }

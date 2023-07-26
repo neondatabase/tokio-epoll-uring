@@ -29,7 +29,7 @@ pub(crate) struct SystemHandleLive {
     #[allow(dead_code)]
     pub(super) id: usize,
     pub(crate) submit_side: SubmitSide,
-    pub(super) shutdown_tx: crate::shutdown_request::Sender<ShutdownRequest>,
+    pub(super) shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
 }
 
 impl Drop for SystemHandle {
@@ -164,7 +164,10 @@ impl SystemHandleLive {
             open_state,
             done_tx,
         };
-        shutdown_tx.shutdown(req);
+        shutdown_tx
+            .send(req)
+            .ok()
+            .expect("implementation error: poller task must not die before SystemHandle");
         WaitShutdownFut { done_rx }
     }
 }

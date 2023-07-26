@@ -213,7 +213,7 @@ mod system;
 pub use system::lifecycle::handle::SystemHandle;
 pub use system::lifecycle::System;
 
-pub(crate) mod shutdown_request;
+pub(crate) mod util;
 
 mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
