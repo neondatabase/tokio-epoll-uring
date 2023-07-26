@@ -9,9 +9,7 @@ use tokio::sync::oneshot;
 use crate::{
     system::{
         completion::ProcessCompletionsCause,
-        slots::{
-            ClaimError, InflightOpHandle, InflightOpHandleError, SlotHandle, TryGetSlotResult,
-        },
+        slots::{self, InflightOpHandle, InflightOpHandleError, SlotHandle, TryGetSlotResult},
         submission::{SubmitError, SubmitSide, SubmitSideInner, SubmitSideOpen},
     },
     ResourcesOwnedByKernel, SubmitSideProvider,
@@ -53,33 +51,26 @@ pub(crate) trait OpTrait: ResourcesOwnedByKernel + Sized + Send + 'static {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpError {
-    #[error("draining")]
-    Draining,
-    #[error("claim")]
-    Claim(#[source] ClaimError),
+    #[error("shutting down")]
+    SystemShuttingDown,
     #[error("system is shut down")]
     SystemIsShutDown,
 }
 
 pub(crate) fn finish_submit<O>(
-    mut op: O,
+    op: O,
     unsafe_slot: SlotHandle,
     submit_side_open: &mut SubmitSideOpen,
 ) -> Result<InflightOpHandle<O>, (O, OpError)>
 where
     O: OpTrait + Send + 'static + Unpin,
 {
-    let sqe = op.make_sqe();
-    let sqe = sqe.user_data(u64::try_from(unsafe_slot.idx).unwrap());
-
-    let inflight_op_fut = match unsafe_slot.claim(op) {
-        Ok(inflight_op_handle) => inflight_op_handle,
-        Err((op, err)) => {
-            return Err((op, OpError::Claim(err)));
+    let (sqe, inflight_op_fut) = match unsafe_slot.use_for_op(op) {
+        Ok((sqe, inflight_op_handle)) => (sqe, inflight_op_handle),
+        Err((op, slots::UseError::SlotsDropped)) => {
+            return Err((op, OpError::SystemIsShutDown));
         }
     };
-
-    // we got the slot, so, can now submit
 
     lazy_static::lazy_static! {
         static ref PROCESS_URING_ON_SUBMIT: bool =
@@ -110,7 +101,7 @@ where
                 // So, we could just submit_and_wait here. But, that'd prevent the
                 // current executor thread from making progress on other tasks.
                 //
-                // So, for now, keep SQ size == inflight ops size.
+                // So, for now, keep SQ size == inflight ops size == Slots size.
                 // This potentially limits throughput if SQ size is chosen too small.
                 unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
             }
@@ -172,12 +163,12 @@ where
                                 SubmitSideInner::Undefined => unreachable!(),
                             };
 
-                            let mut ops_guard = submit_side_open.ops.inner.lock().unwrap();
+                            let mut ops_guard = submit_side_open.slots.inner.lock().unwrap();
                             match ops_guard.try_get_slot() {
                                 TryGetSlotResult::Draining => {
                                     *myself = OpFut::ReadyPolled;
                                     return Action::Return(Err(
-                                        (make_op, OpError::Draining),
+                                        (make_op, OpError::SystemShuttingDown),
                                     ));
                                 }
                                 TryGetSlotResult::GotSlot(unsafe_slot) => {

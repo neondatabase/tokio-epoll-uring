@@ -14,7 +14,7 @@ use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
-    slots::{Slots, SlotsCoOwnerPoller},
+    slots::{Slots, CoOwnerPoller},
     submission::{SubmitSide, SubmitSideNewArgs},
 };
 
@@ -112,7 +112,7 @@ impl std::future::Future for Launch {
                         id,
                         submitter,
                         sq,
-                        ops: ops_submit_side,
+                        slots: ops_submit_side,
                         completion_side: Arc::clone(&completion_side),
                     });
                     let system = System {
@@ -124,7 +124,7 @@ impl std::future::Future for Launch {
                         uring_fd,
                         completion_side,
                         system,
-                        ops: ops_poller,
+                        slots: ops_poller,
                         preempt: poller_preempt,
                     });
                     myself.state = LaunchState::WaitForPollerTaskToStart {
@@ -171,7 +171,7 @@ pub(crate) struct ShutdownRequest {
 
 pub(crate) fn poller_impl_finish_shutdown(
     system: System,
-    ops: Slots<SlotsCoOwnerPoller>,
+    ops: Slots<CoOwnerPoller>,
     completion_side: Arc<Mutex<CompletionSide>>,
     req: ShutdownRequest,
 ) {

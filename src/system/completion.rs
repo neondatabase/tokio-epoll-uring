@@ -11,14 +11,14 @@ use crate::system::{slots::SlotsInner, RING_SIZE};
 
 use super::{
     lifecycle::{ShutdownRequest, System},
-    slots::{Slots, SlotsCoOwnerCompletionSide, SlotsCoOwnerPoller},
+    slots::{CoOwnerCompletionSide, CoOwnerPoller, Slots},
 };
 
 pub(crate) struct CompletionSide {
     #[allow(dead_code)]
     id: usize,
     cq: CompletionQueue<'static>,
-    ops: Slots<SlotsCoOwnerCompletionSide>,
+    ops: Slots<CoOwnerCompletionSide>,
 }
 
 unsafe impl Send for CompletionSide {}
@@ -32,7 +32,7 @@ impl CompletionSide {
     pub(crate) fn new(
         id: usize,
         cq: CompletionQueue<'static>,
-        ops: Slots<SlotsCoOwnerCompletionSide>,
+        ops: Slots<CoOwnerCompletionSide>,
     ) -> Self {
         Self { id, cq, ops }
     }
@@ -46,9 +46,7 @@ impl CompletionSide {
         let mut inner_guard = self.ops.inner.lock().unwrap();
         for cqe in &mut *cq {
             trace!("got cqe: {:?}", cqe);
-            let idx: u64 = cqe.user_data();
-            let idx = usize::try_from(idx).unwrap();
-            inner_guard.process_completion(idx, cqe.result());
+            inner_guard.process_completion(&cqe);
         }
         drop(inner_guard);
         cq.sync();
@@ -65,7 +63,7 @@ pub(crate) struct PollerNewArgs {
     pub uring_fd: std::os::fd::RawFd,
     pub completion_side: Arc<Mutex<CompletionSide>>,
     pub system: System,
-    pub(crate) ops: Slots<SlotsCoOwnerPoller>,
+    pub(crate) slots: Slots<CoOwnerPoller>,
     pub preempt: Option<PollerTesting>,
 }
 
@@ -78,7 +76,7 @@ impl Poller {
             uring_fd,
             completion_side,
             system,
-            ops,
+            slots: ops,
             preempt: poller_preempt,
         } = args;
         let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
@@ -88,7 +86,7 @@ impl Poller {
                 uring_fd,
                 completion_side,
                 system,
-                ops,
+                slots: ops,
                 shutdown_rx,
             }))),
         }));
@@ -134,7 +132,7 @@ struct PollerStateInner {
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
-    pub ops: Slots<SlotsCoOwnerPoller>,
+    pub slots: Slots<CoOwnerPoller>,
     shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
 }
 
@@ -336,7 +334,7 @@ async fn poller_impl(
     // TODO: remove the SubmitSide plugged state, it's redundant to Ops::Draining.
     {
         let inner_guard = inner_shared.lock().unwrap();
-        inner_guard.ops.transition_to_draining();
+        inner_guard.slots.transition_to_draining();
     }
 
     // Wait for all inflight ops to finish.
@@ -403,7 +401,7 @@ async fn poller_impl(
                     uring_fd: _,
                     completion_side,
                     system,
-                    ops,
+                    slots: ops,
                     shutdown_rx: _,
                 } = { inner_owned }; // scope to make the `x: _` destructuring drop.
 
@@ -430,7 +428,7 @@ async fn poller_impl_impl(
             uring_fd,
             completion_side,
             system: _,
-            ops: _,
+            slots: _,
             shutdown_rx: ref mut shutdown,
         } = &mut *inner_guard;
         (*uring_fd, Arc::clone(completion_side), shutdown.clone())

@@ -4,14 +4,14 @@ use io_uring::{SubmissionQueue, Submitter};
 
 use super::{
     completion::CompletionSide,
-    slots::{Slots, SlotsCoOwnerSubmitSide},
+    slots::{CoOwnerSubmitSide, Slots},
 };
 
 pub(crate) struct SubmitSideNewArgs {
     pub(crate) id: usize,
     pub(crate) submitter: Submitter<'static>,
     pub(crate) sq: SubmissionQueue<'static>,
-    pub(crate) ops: Slots<SlotsCoOwnerSubmitSide>,
+    pub(crate) slots: Slots<CoOwnerSubmitSide>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
@@ -21,7 +21,7 @@ impl SubmitSide {
             id,
             submitter,
             sq,
-            ops,
+            slots: ops,
             completion_side,
         } = args;
         SubmitSide(Arc::new(Mutex::new(SubmitSideInner::Open(
@@ -29,7 +29,7 @@ impl SubmitSide {
                 id,
                 submitter,
                 sq,
-                ops,
+                slots: ops,
                 completion_side: Arc::clone(&completion_side),
             },
         ))))
@@ -68,7 +68,7 @@ pub(crate) struct SubmitSideOpen {
     id: usize,
     pub(crate) submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
-    pub(crate) ops: Slots<SlotsCoOwnerSubmitSide>,
+    pub(crate) slots: Slots<CoOwnerSubmitSide>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
