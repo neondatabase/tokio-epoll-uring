@@ -15,8 +15,8 @@ use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
+    slots::{CoOwnedOps, OpsCoOwnerPoller, OpsInner},
     submission::{SubmitSide, SubmitSideNewArgs},
-    CoOwnedOps, OpsCoOwnerPoller, OpsInner,
 };
 
 /// The live system. Not constructible or accessible by user code. Use [`SystemHandle`] to interact.
@@ -101,7 +101,8 @@ impl std::future::Future for Launch {
                 LaunchState::Undefined => unreachable!("implementation error"),
                 LaunchState::Init { poller_preempt } => {
                     // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
-                    let (ops_submit_side, ops_completion_side, ops_poller) = super::new_ops(id);
+                    let (ops_submit_side, ops_completion_side, ops_poller) =
+                        super::slots::new_ops(id);
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
                     let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
@@ -213,28 +214,8 @@ pub(crate) fn poller_impl_finish_shutdown(
         // drop their upgraded Arc quite soon.
         // So, it's guaranteed that `ops` will be dropped quite soon after we
         // drop our Arc.
-
         let ops_inner_guard = ops.inner.lock().unwrap();
-        let inner = match &*ops_inner_guard {
-            OpsInner::Undefined => unreachable!(),
-            OpsInner::Open(_open) => panic!("we should be Draining by now"),
-            OpsInner::Draining(inner) => inner,
-        };
-        let slots_owned_by_user_space = inner.slots_owned_by_user_space().collect::<HashSet<_>>();
-        let unused_indices = inner
-            .unused_indices
-            .iter()
-            .cloned()
-            .collect::<HashSet<usize>>();
-        // at this time, all slots must be either in unused_indices (their state is None) or they must be in Ready state
-        assert_eq!(
-            inner.slots_owned_by_user_space().count(),
-            RING_SIZE.try_into().unwrap()
-        );
-        assert!(unused_indices.is_subset(&slots_owned_by_user_space));
-        // drop our arc
-        drop(ops_inner_guard);
-        drop(ops);
+        ops_inner_guard.shutdown_assertions();
     }
     // final assertions done, do the unsplitting
     drop(cq);

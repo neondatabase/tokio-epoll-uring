@@ -8,11 +8,14 @@ use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::system::{OpState, OpsInner, OpsInnerDraining, OpsInnerOpen, RING_SIZE};
+use crate::system::{
+    slots::{OpState, OpsInner, OpsInnerDraining, OpsInnerOpen},
+    RING_SIZE,
+};
 
 use super::{
     lifecycle::{ShutdownRequest, System},
-    CoOwnedOps, OpsCoOwnerCompletionSide, OpsCoOwnerPoller,
+    slots::{CoOwnedOps, OpsCoOwnerCompletionSide, OpsCoOwnerPoller},
 };
 
 pub(crate) struct CompletionSide {
@@ -44,46 +47,14 @@ impl CompletionSide {
     pub(crate) fn process_completions(&mut self, _cause: ProcessCompletionsCause) {
         let cq = &mut self.cq;
         cq.sync();
+        let mut inner_guard = self.ops.inner.lock().unwrap();
         for cqe in &mut *cq {
             trace!("got cqe: {:?}", cqe);
-            let idx: u64 = unsafe { std::mem::transmute(cqe.user_data()) };
-            let mut inner_guard = self.ops.inner.lock().unwrap();
-            let storage = match &mut *inner_guard {
-                OpsInner::Undefined => unreachable!(),
-                OpsInner::Open(inner) => &mut inner.storage,
-                OpsInner::Draining(inner) => &mut inner.storage,
-            };
-            let op_state = &mut storage[usize::try_from(idx).unwrap()];
-            let op_state_inner = op_state.as_mut().unwrap();
-            let cur = std::mem::replace(&mut *op_state_inner, OpState::Undefined);
-            match cur {
-                OpState::Undefined => unreachable!("implementation error"),
-                OpState::Pending { waker } => {
-                    *op_state_inner = OpState::Ready {
-                        result: cqe.result(),
-                    };
-                    if let Some(waker) = waker {
-                        trace!("waking up future");
-                        waker.wake();
-                    }
-                }
-                OpState::PendingButFutureDropped {
-                    resources_owned_by_kernel,
-                } => {
-                    drop(resources_owned_by_kernel);
-                    *op_state_inner = OpState::Ready {
-                        result: cqe.result(),
-                    };
-                    inner_guard.return_slot(idx as usize);
-                }
-                OpState::Ready { .. } => {
-                    unreachable!(
-                        "completions only come in once: {:?}",
-                        cur.discriminant_str()
-                    )
-                }
-            }
+            let idx: u64 = cqe.user_data();
+            let idx = usize::try_from(idx).unwrap();
+            inner_guard.process_completion(idx, cqe.result());
         }
+        drop(inner_guard);
         cq.sync();
     }
 }
@@ -369,29 +340,7 @@ async fn poller_impl(
     // TODO: remove the SubmitSide plugged state, it's redundant to Ops::Draining.
     {
         let inner_guard = inner_shared.lock().unwrap();
-        let mut ops_inner_guard = inner_guard.ops.inner.lock().unwrap();
-        let cur = std::mem::replace(&mut *ops_inner_guard, OpsInner::Undefined);
-        match cur {
-            OpsInner::Undefined => unreachable!(),
-            x @ OpsInner::Draining(_) => {
-                // can happen if poller task gets cancelled and we switch to thread
-                *ops_inner_guard = x;
-            }
-            OpsInner::Open(open) => {
-                let OpsInnerOpen {
-                    id,
-                    storage,
-                    unused_indices,
-                    waiters: _, // cancels all waiters
-                    myself: _,
-                } = *open;
-                *ops_inner_guard = OpsInner::Draining(Box::new(OpsInnerDraining {
-                    id,
-                    storage,
-                    unused_indices,
-                }));
-            }
-        }
+        inner_guard.ops.transition_to_draining();
     }
 
     // Wait for all inflight ops to finish.
@@ -544,36 +493,7 @@ async fn poller_impl_impl(
         let mut completion_side_guard = completion_side.lock().unwrap();
         completion_side_guard.process_completions(ProcessCompletionsCause::Regular); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
         if is_timeout_wakeup {
-            // TODO: only do this if some env var is set?
-            let ops_inner = (&completion_side_guard.ops).inner.lock().unwrap();
-            let (storage, unused_indices) = match &*ops_inner {
-                OpsInner::Undefined => unreachable!(),
-                OpsInner::Open(inner) => (&inner.storage, &inner.unused_indices),
-                OpsInner::Draining(inner) => (&inner.storage, &inner.unused_indices),
-            };
-            let mut by_state_discr = HashMap::new();
-            for s in storage {
-                match s {
-                    Some(opstate) => {
-                        let state_discr = opstate.discriminant_str();
-                        by_state_discr
-                            .entry(state_discr)
-                            .and_modify(|v| *v += 1)
-                            .or_insert(1);
-                    }
-                    None => {
-                        by_state_discr
-                            .entry("None")
-                            .and_modify(|v| *v += 1)
-                            .or_insert(1);
-                    }
-                }
-            }
-            debug!(
-                "poller task got timeout: ops free slots = {} by_ops_state: {:?}",
-                unused_indices.len(),
-                by_state_discr
-            );
+            completion_side_guard.ops.poller_timeout_debug_dump();
         }
         drop(completion_side_guard);
     }

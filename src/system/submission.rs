@@ -2,7 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use io_uring::{SubmissionQueue, Submitter};
 
-use super::{completion::CompletionSide, CoOwnedOps, OpsCoOwnerSubmitSide};
+use super::{
+    completion::CompletionSide,
+    slots::{CoOwnedOps, OpsCoOwnerSubmitSide},
+};
 
 pub(crate) struct SubmitSideNewArgs {
     pub(crate) id: usize,

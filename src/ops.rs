@@ -9,9 +9,11 @@ use tokio::sync::oneshot;
 use crate::{
     system::{
         completion::ProcessCompletionsCause,
+        slots::{
+            InflightOpHandle, InflightOpHandleError, TryGetSlotResult, UnsafeOpsSlotHandle,
+            UnsafeOpsSlotHandleSubmitError,
+        },
         submission::{SubmitError, SubmitSide, SubmitSideInner, SubmitSideOpen},
-        InflightOpHandle, InflightOpHandleError, TryGetSlotResult, UnsafeOpsSlotHandle,
-        UnsafeOpsSlotHandleSubmitError,
     },
     ResourcesOwnedByKernel, SubmitSideProvider,
 };
