@@ -14,7 +14,7 @@ use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
-    slots::{Slots, CoOwnerPoller},
+    slots::{CoOwnerPoller, Slots},
     submission::{SubmitSide, SubmitSideNewArgs},
 };
 
@@ -125,7 +125,7 @@ impl std::future::Future for Launch {
                         completion_side,
                         system,
                         slots: ops_poller,
-                        preempt: poller_preempt,
+                        testing: poller_preempt,
                     });
                     myself.state = LaunchState::WaitForPollerTaskToStart {
                         poller_ready_fut: Box::pin(poller_ready_fut),
@@ -212,8 +212,7 @@ pub(crate) fn poller_impl_finish_shutdown(
         // drop their upgraded Arc quite soon.
         // So, it's guaranteed that `ops` will be dropped quite soon after we
         // drop our Arc.
-        let ops_inner_guard = ops.inner.lock().unwrap();
-        ops_inner_guard.shutdown_assertions();
+        ops.shutdown_assertions();
     }
     // final assertions done, do the unsplitting
     drop(cq);

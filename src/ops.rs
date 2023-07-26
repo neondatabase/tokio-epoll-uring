@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use crate::{
     system::{
         completion::ProcessCompletionsCause,
-        slots::{self, InflightOpHandle, InflightOpHandleError, SlotHandle, TryGetSlotResult},
+        slots::{self, InflightHandle, InflightHandleError, SlotHandle, TryGetSlotResult},
         submission::{SubmitError, SubmitSide, SubmitSideInner, SubmitSideOpen},
     },
     ResourcesOwnedByKernel, SubmitSideProvider,
@@ -31,7 +31,7 @@ where
         waiter: oneshot::Receiver<SlotHandle>,
         make_op: O,
     },
-    Submitted(InflightOpHandle<O>),
+    Submitted(InflightHandle<O>),
     ReadyPolled,
 }
 
@@ -61,7 +61,7 @@ pub(crate) fn finish_submit<O>(
     op: O,
     unsafe_slot: SlotHandle,
     submit_side_open: &mut SubmitSideOpen,
-) -> Result<InflightOpHandle<O>, (O, OpError)>
+) -> Result<InflightHandle<O>, (O, OpError)>
 where
     O: OpTrait + Send + 'static + Unpin,
 {
@@ -163,8 +163,7 @@ where
                                 SubmitSideInner::Undefined => unreachable!(),
                             };
 
-                            let mut ops_guard = submit_side_open.slots.inner.lock().unwrap();
-                            match ops_guard.try_get_slot() {
+                            match submit_side_open.slots.try_get_slot() {
                                 TryGetSlotResult::Draining => {
                                     *myself = OpFut::ReadyPolled;
                                     return Action::Return(Err(
@@ -172,7 +171,6 @@ where
                                     ));
                                 }
                                 TryGetSlotResult::GotSlot(unsafe_slot) => {
-                                    drop(ops_guard);
                                     let fut = match finish_submit(make_op, unsafe_slot, submit_side_open) {
                                         Ok(fut) => fut,
                                         Err((make_op, err)) => {
@@ -187,7 +185,6 @@ where
                                     // All slots are taken and we're waiting in line.
                                     // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
                                     // This is in the hope that we'll wake ourselves up.
-                                    drop(ops_guard); // so that  process_completions() can take it
 
                                     lazy_static::lazy_static! {
                                         static ref PROCESS_URING_ON_QUEUE_FULL: bool =
@@ -276,10 +273,7 @@ where
                         *myself = OpFut::ReadyPolled;
                         return std::task::Poll::Ready(Ok(output));
                     }
-                    std::task::Poll::Ready(Err((
-                        resource,
-                        InflightOpHandleError::SlotsDropped,
-                    ))) => {
+                    std::task::Poll::Ready(Err((resource, InflightHandleError::SlotsDropped))) => {
                         *myself = OpFut::ReadyPolled;
                         return std::task::Poll::Ready(Err((resource, OpError::SystemIsShutDown)));
                     }

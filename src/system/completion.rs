@@ -7,8 +7,6 @@ use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::system::{slots::SlotsInner, RING_SIZE};
-
 use super::{
     lifecycle::{ShutdownRequest, System},
     slots::{CoOwnerCompletionSide, CoOwnerPoller, Slots},
@@ -18,7 +16,7 @@ pub(crate) struct CompletionSide {
     #[allow(dead_code)]
     id: usize,
     cq: CompletionQueue<'static>,
-    ops: Slots<CoOwnerCompletionSide>,
+    slots: Slots<CoOwnerCompletionSide>,
 }
 
 unsafe impl Send for CompletionSide {}
@@ -34,22 +32,20 @@ impl CompletionSide {
         cq: CompletionQueue<'static>,
         ops: Slots<CoOwnerCompletionSide>,
     ) -> Self {
-        Self { id, cq, ops }
+        Self { id, cq, slots: ops }
     }
     pub(crate) fn deconstruct(self) -> CompletionQueue<'static> {
-        let Self { id: _, cq, ops: _ } = { self };
+        let Self {
+            id: _,
+            cq,
+            slots: _,
+        } = { self };
         cq
     }
     pub(crate) fn process_completions(&mut self, _cause: ProcessCompletionsCause) {
-        let cq = &mut self.cq;
-        cq.sync();
-        let mut inner_guard = self.ops.inner.lock().unwrap();
-        for cqe in &mut *cq {
-            trace!("got cqe: {:?}", cqe);
-            inner_guard.process_completion(&cqe);
-        }
-        drop(inner_guard);
-        cq.sync();
+        self.cq.sync();
+        self.slots.process_completions(&mut self.cq);
+        self.cq.sync();
     }
 }
 
@@ -64,7 +60,7 @@ pub(crate) struct PollerNewArgs {
     pub completion_side: Arc<Mutex<CompletionSide>>,
     pub system: System,
     pub(crate) slots: Slots<CoOwnerPoller>,
-    pub preempt: Option<PollerTesting>,
+    pub testing: Option<PollerTesting>,
 }
 
 impl Poller {
@@ -77,7 +73,7 @@ impl Poller {
             completion_side,
             system,
             slots: ops,
-            preempt: poller_preempt,
+            testing,
         } = args;
         let (shutdown_tx, shutdown_rx) = crate::shutdown_request::new();
         let poller_task_state = Arc::new(Mutex::new(Poller {
@@ -94,7 +90,7 @@ impl Poller {
         tokio::task::spawn(poller_task(
             Arc::clone(&poller_task_state),
             poller_ready_tx,
-            poller_preempt,
+            testing,
         ));
         poller_ready_rx
             .await
@@ -321,51 +317,41 @@ async fn poller_impl(
     };
 
     // We got the shutdown request; what do we need to do?
-    // 1. Prevent new ops from being submitted.
-    // 2. Wait for all inflight ops to finish.
-    // 3. Unsplit the uring by
-    //      3.1. By dropping Submitter, SubmissionQueue, CompletionQueue
-    //      3 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
-    // 4. Drop the IoUring struct, cleaning up the underlying kernel resources.
+    // 1. Prevent new ops from being submitted and wait for all inflight ops to finish.
+    // 2. Unsplit the uring by
+    //      2.1. By dropping Submitter, SubmissionQueue, CompletionQueue
+    //      2 2. Box::from_raw'ing the IoUring stored as a raw pointer in the System struct
+    // 3. Drop the IoUring struct, cleaning up the underlying kernel resources.
 
-    // 1. Prevent new ops from being submitted:
-    // We already plugged the sumit side in SystemHandle::drop / SystemHandle::shutdown;
-    // But what actually matters is to transition Ops into Draining state.
-    // TODO: remove the SubmitSide plugged state, it's redundant to Ops::Draining.
-    {
-        let inner_guard = inner_shared.lock().unwrap();
-        inner_guard.slots.transition_to_draining();
-    }
-
-    // Wait for all inflight ops to finish.
     if let Some(tx) = shutdown_loop_reached {
         // receiver must ensure that clone doesn't outlive the try_unwrap during shutdown
         tx.send(Arc::clone(&poller)).ok().unwrap();
     }
+
+    // 1. Prevent new ops from being submitted and wait for all inflight ops to finish.
+    // We already plugged the sumit side in SystemHandle::drop / SystemHandle::shutdown;
+    // But what actually matters is to transition Ops into Draining state.
+    // TODO: remove the SubmitSide plugged state, it's redundant to Ops::Draining.
     loop {
         {
             let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
-            let ops_inner_guard = completion_side_guard.ops.inner.lock().unwrap();
-            let ring_size = usize::try_from(RING_SIZE).unwrap();
-            let slots_pending = match &*ops_inner_guard {
-                SlotsInner::Undefined => unreachable!(),
-                SlotsInner::Open(_inner) => unreachable!("we transitioned above"),
-                SlotsInner::Draining(inner) => {
-                    ring_size - inner.slots_owned_by_user_space().count()
-                }
-            };
-            if slots_pending == 0 {
+            let pending_count = completion_side_guard
+                .slots
+                .set_draining_and_get_pending_slot_count();
+            debug!(pending_count, "waiting for pending operations to complete");
+            if pending_count == 0 {
                 break;
             }
-            debug!(slots_pending, "waiting for pending ops to finish");
-            drop(ops_inner_guard); // process_completions locks ops again
             completion_side_guard.process_completions(ProcessCompletionsCause::Shutdown);
+            drop(completion_side_guard);
+            drop(inner_guard);
         }
         // If we get cancelled here, e.g., because the runtime is getting dropped,
         // the Poller is in state ShuttingDown.
         // The scopeguard in our caller will spawn an OS thread and re-run this function.
-        tokio::time::sleep(Duration::from_millis(100)).await; // TODO continue to epoll
+        // TODO instead of timeout, reconfigure the slots to wake us up here.
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
@@ -489,7 +475,7 @@ async fn poller_impl_impl(
         let mut completion_side_guard = completion_side.lock().unwrap();
         completion_side_guard.process_completions(ProcessCompletionsCause::Regular); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
         if is_timeout_wakeup {
-            completion_side_guard.ops.poller_timeout_debug_dump();
+            completion_side_guard.slots.poller_timeout_debug_dump();
         }
         drop(completion_side_guard);
     }
