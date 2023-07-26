@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     os::fd::AsRawFd,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -15,7 +14,7 @@ use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
-    slots::{CoOwnedOps, OpsCoOwnerPoller, OpsInner},
+    slots::{CoOwnedOps, OpsCoOwnerPoller},
     submission::{SubmitSide, SubmitSideNewArgs},
 };
 

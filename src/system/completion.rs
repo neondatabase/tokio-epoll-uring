@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -8,10 +7,7 @@ use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::system::{
-    slots::{OpState, OpsInner, OpsInnerDraining, OpsInnerOpen},
-    RING_SIZE,
-};
+use crate::system::{slots::OpsInner, RING_SIZE};
 
 use super::{
     lifecycle::{ShutdownRequest, System},
