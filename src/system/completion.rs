@@ -7,18 +7,18 @@ use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::system::{slots::OpsInner, RING_SIZE};
+use crate::system::{slots::SlotsInner, RING_SIZE};
 
 use super::{
     lifecycle::{ShutdownRequest, System},
-    slots::{CoOwnedOps, OpsCoOwnerCompletionSide, OpsCoOwnerPoller},
+    slots::{Slots, SlotsCoOwnerCompletionSide, SlotsCoOwnerPoller},
 };
 
 pub(crate) struct CompletionSide {
     #[allow(dead_code)]
     id: usize,
     cq: CompletionQueue<'static>,
-    ops: CoOwnedOps<OpsCoOwnerCompletionSide>,
+    ops: Slots<SlotsCoOwnerCompletionSide>,
 }
 
 unsafe impl Send for CompletionSide {}
@@ -32,7 +32,7 @@ impl CompletionSide {
     pub(crate) fn new(
         id: usize,
         cq: CompletionQueue<'static>,
-        ops: CoOwnedOps<OpsCoOwnerCompletionSide>,
+        ops: Slots<SlotsCoOwnerCompletionSide>,
     ) -> Self {
         Self { id, cq, ops }
     }
@@ -65,7 +65,7 @@ pub(crate) struct PollerNewArgs {
     pub uring_fd: std::os::fd::RawFd,
     pub completion_side: Arc<Mutex<CompletionSide>>,
     pub system: System,
-    pub(crate) ops: CoOwnedOps<OpsCoOwnerPoller>,
+    pub(crate) ops: Slots<SlotsCoOwnerPoller>,
     pub preempt: Option<PollerTesting>,
 }
 
@@ -134,7 +134,7 @@ struct PollerStateInner {
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
-    pub ops: CoOwnedOps<OpsCoOwnerPoller>,
+    pub ops: Slots<SlotsCoOwnerPoller>,
     shutdown_rx: crate::shutdown_request::Receiver<ShutdownRequest>,
 }
 
@@ -351,9 +351,11 @@ async fn poller_impl(
             let ops_inner_guard = completion_side_guard.ops.inner.lock().unwrap();
             let ring_size = usize::try_from(RING_SIZE).unwrap();
             let slots_pending = match &*ops_inner_guard {
-                OpsInner::Undefined => unreachable!(),
-                OpsInner::Open(_inner) => unreachable!("we transitioned above"),
-                OpsInner::Draining(inner) => ring_size - inner.slots_owned_by_user_space().count(),
+                SlotsInner::Undefined => unreachable!(),
+                SlotsInner::Open(_inner) => unreachable!("we transitioned above"),
+                SlotsInner::Draining(inner) => {
+                    ring_size - inner.slots_owned_by_user_space().count()
+                }
             };
             if slots_pending == 0 {
                 break;

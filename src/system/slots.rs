@@ -10,7 +10,57 @@ use crate::ResourcesOwnedByKernel;
 
 use super::RING_SIZE;
 
-pub(super) enum OpState {
+pub(crate) trait SlotsCoOwner {}
+
+pub(crate) struct SlotsCoOwnerSubmitSide;
+impl SlotsCoOwner for SlotsCoOwnerSubmitSide {}
+pub(crate) struct SlotsCoOwnerCompletionSide;
+impl SlotsCoOwner for SlotsCoOwnerCompletionSide {}
+
+pub(crate) struct SlotsCoOwnerPoller;
+impl SlotsCoOwner for SlotsCoOwnerPoller {}
+
+pub(crate) struct Slots<O: SlotsCoOwner> {
+    _marker: std::marker::PhantomData<O>,
+    #[allow(dead_code)]
+    id: usize,
+    pub(crate) inner: Arc<Mutex<SlotsInner>>,
+}
+
+#[derive(Clone)]
+pub struct SlotsWeak {
+    #[allow(dead_code)]
+    id: usize,
+    inner_weak: Weak<Mutex<SlotsInner>>,
+}
+
+pub(crate) enum SlotsInner {
+    Open(Box<SlotsInnerOpen>),
+    Draining(Box<SlotsInnerDraining>),
+    Undefined,
+}
+
+pub(crate) struct SlotsInnerOpen {
+    id: usize,
+    storage: [Option<Slot>; RING_SIZE as usize],
+    unused_indices: Vec<usize>,
+    waiters: VecDeque<tokio::sync::oneshot::Sender<SlotHandle>>,
+    myself: SlotsWeak,
+}
+
+pub(crate) struct SlotsInnerDraining {
+    #[allow(dead_code)]
+    id: usize,
+    storage: [Option<Slot>; RING_SIZE as usize],
+    unused_indices: Vec<usize>,
+}
+
+pub(crate) struct SlotHandle {
+    pub(crate) slots_weak: SlotsWeak,
+    pub(crate) idx: usize,
+}
+
+pub(super) enum Slot {
     Undefined,
     Pending {
         waker: Option<std::task::Waker>, // None if it hasn't been polled yet
@@ -24,72 +74,37 @@ pub(super) enum OpState {
     },
 }
 
-impl OpState {
-    pub(super) fn discriminant_str(&self) -> &'static str {
-        match self {
-            OpState::Undefined => "Undefined",
-            OpState::Pending { .. } => "Pending",
-            OpState::PendingButFutureDropped { .. } => "PendingButFutureDropped",
-            OpState::Ready { .. } => "Ready",
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct WeakOps {
-    #[allow(dead_code)]
-    id: usize,
-    inner_weak: Weak<Mutex<OpsInner>>,
-}
-
-pub(crate) trait OpsCoOwner {}
-
-pub(crate) struct OpsCoOwnerSubmitSide;
-impl OpsCoOwner for OpsCoOwnerSubmitSide {}
-pub(crate) struct OpsCoOwnerCompletionSide;
-impl OpsCoOwner for OpsCoOwnerCompletionSide {}
-
-pub(crate) struct OpsCoOwnerPoller;
-impl OpsCoOwner for OpsCoOwnerPoller {}
-
-pub(crate) struct CoOwnedOps<O: OpsCoOwner> {
-    _marker: std::marker::PhantomData<O>,
-    #[allow(dead_code)]
-    id: usize,
-    pub(crate) inner: Arc<Mutex<OpsInner>>,
-}
-
-pub(super) fn new_ops(
+pub(super) fn new(
     id: usize,
 ) -> (
-    CoOwnedOps<OpsCoOwnerSubmitSide>,
-    CoOwnedOps<OpsCoOwnerCompletionSide>,
-    CoOwnedOps<OpsCoOwnerPoller>,
+    Slots<SlotsCoOwnerSubmitSide>,
+    Slots<SlotsCoOwnerCompletionSide>,
+    Slots<SlotsCoOwnerPoller>,
 ) {
     let inner = Arc::new_cyclic(|inner_weak| {
-        Mutex::new(OpsInner::Open(Box::new(OpsInnerOpen {
+        Mutex::new(SlotsInner::Open(Box::new(SlotsInnerOpen {
             id,
             storage: array_macro::array![_ => None; RING_SIZE as usize],
             unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
             waiters: VecDeque::new(),
-            myself: WeakOps {
+            myself: SlotsWeak {
                 id,
                 inner_weak: inner_weak.clone(),
             },
         })))
     });
     (
-        CoOwnedOps {
+        Slots {
             _marker: std::marker::PhantomData,
             id,
             inner: Arc::clone(&inner),
         },
-        CoOwnedOps {
+        Slots {
             _marker: std::marker::PhantomData,
             id,
             inner: Arc::clone(&inner),
         },
-        CoOwnedOps {
+        Slots {
             _marker: std::marker::PhantomData,
             id,
             inner: Arc::clone(&inner),
@@ -97,10 +112,10 @@ pub(super) fn new_ops(
     )
 }
 
-impl WeakOps {
+impl SlotsWeak {
     fn try_upgrade_mut<F, R>(&self, f: F) -> Result<R, ()>
     where
-        F: FnOnce(&mut OpsInner) -> R,
+        F: FnOnce(&mut SlotsInner) -> R,
     {
         match Weak::upgrade(&self.inner_weak) {
             Some(inner_strong) => {
@@ -112,46 +127,25 @@ impl WeakOps {
     }
 }
 
-pub(crate) enum OpsInner {
-    Open(Box<OpsInnerOpen>),
-    Draining(Box<OpsInnerDraining>),
-    Undefined,
-}
-
-pub(crate) struct OpsInnerOpen {
-    id: usize,
-    storage: [Option<OpState>; RING_SIZE as usize],
-    unused_indices: Vec<usize>,
-    waiters: VecDeque<tokio::sync::oneshot::Sender<UnsafeOpsSlotHandle>>,
-    myself: WeakOps,
-}
-
-pub(crate) struct OpsInnerDraining {
-    #[allow(dead_code)]
-    id: usize,
-    storage: [Option<OpState>; RING_SIZE as usize],
-    unused_indices: Vec<usize>,
-}
-
 pub(crate) enum TryGetSlotResult {
-    GotSlot(UnsafeOpsSlotHandle),
-    NoSlots(oneshot::Receiver<UnsafeOpsSlotHandle>),
+    GotSlot(SlotHandle),
+    NoSlots(oneshot::Receiver<SlotHandle>),
     Draining,
 }
 
-impl OpsInner {
+impl SlotsInner {
     pub(crate) fn try_get_slot(&mut self) -> TryGetSlotResult {
         let open = match self {
-            OpsInner::Undefined => unreachable!(),
-            OpsInner::Open(open) => open,
-            OpsInner::Draining(_) => {
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(open) => open,
+            SlotsInner::Draining(_) => {
                 return TryGetSlotResult::Draining;
             }
         };
         match open.unused_indices.pop() {
             Some(idx) => TryGetSlotResult::GotSlot({
-                UnsafeOpsSlotHandle {
-                    ops_weak: open.myself.clone(),
+                SlotHandle {
+                    slots_weak: open.myself.clone(),
                     idx,
                 }
             }),
@@ -165,30 +159,30 @@ impl OpsInner {
 
     pub(super) fn process_completion(&mut self, idx: usize, result: i32) {
         let storage = match self {
-            OpsInner::Undefined => unreachable!(),
-            OpsInner::Open(inner) => &mut inner.storage,
-            OpsInner::Draining(inner) => &mut inner.storage,
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(inner) => &mut inner.storage,
+            SlotsInner::Draining(inner) => &mut inner.storage,
         };
         let op_state = &mut storage[usize::try_from(idx).unwrap()];
         let op_state_inner = op_state.as_mut().unwrap();
-        let cur = std::mem::replace(&mut *op_state_inner, OpState::Undefined);
+        let cur = std::mem::replace(&mut *op_state_inner, Slot::Undefined);
         match cur {
-            OpState::Undefined => unreachable!("implementation error"),
-            OpState::Pending { waker } => {
-                *op_state_inner = OpState::Ready { result };
+            Slot::Undefined => unreachable!("implementation error"),
+            Slot::Pending { waker } => {
+                *op_state_inner = Slot::Ready { result };
                 if let Some(waker) = waker {
                     trace!("waking up future");
                     waker.wake();
                 }
             }
-            OpState::PendingButFutureDropped {
+            Slot::PendingButFutureDropped {
                 resources_owned_by_kernel,
             } => {
                 drop(resources_owned_by_kernel);
-                *op_state_inner = OpState::Ready { result };
+                *op_state_inner = Slot::Ready { result };
                 self.return_slot(idx as usize);
             }
-            OpState::Ready { .. } => {
+            Slot::Ready { .. } => {
                 unreachable!(
                     "completions only come in once: {:?}",
                     cur.discriminant_str()
@@ -198,15 +192,15 @@ impl OpsInner {
     }
 
     pub(crate) fn return_slot(&mut self, idx: usize) {
-        fn clear_slot(op_state_ref: &mut Option<OpState>) {
+        fn clear_slot(op_state_ref: &mut Option<Slot>) {
             match op_state_ref {
                 None => (),
                 Some(op_state) => match op_state {
-                    OpState::Undefined => unreachable!(),
-                    OpState::Pending { .. } | OpState::PendingButFutureDropped { .. } => {
+                    Slot::Undefined => unreachable!(),
+                    Slot::Pending { .. } | Slot::PendingButFutureDropped { .. } => {
                         panic!("implementation error: potential memory unsafety: we must not return a slot that is still pending  {:?}", op_state.discriminant_str());
                     }
-                    OpState::Ready { .. } => {
+                    Slot::Ready { .. } => {
                         *op_state_ref = None;
                     }
                 },
@@ -214,12 +208,12 @@ impl OpsInner {
         }
 
         match self {
-            OpsInner::Undefined => unreachable!(),
-            OpsInner::Open(inner) => {
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(inner) => {
                 clear_slot(&mut inner.storage[idx]);
                 while let Some(waiter) = inner.waiters.pop_front() {
-                    match waiter.send(UnsafeOpsSlotHandle {
-                        ops_weak: inner.myself.clone(),
+                    match waiter.send(SlotHandle {
+                        slots_weak: inner.myself.clone(),
                         idx,
                     }) {
                         Ok(()) => {
@@ -235,7 +229,7 @@ impl OpsInner {
                 trace!("no waiters, returning idx to unused_indices");
                 inner.unused_indices.push(idx);
             }
-            OpsInner::Draining(inner) => {
+            SlotsInner::Draining(inner) => {
                 clear_slot(&mut inner.storage[idx]);
                 trace!("draining, returning idx to unused_indices");
                 inner.unused_indices.push(idx);
@@ -245,9 +239,9 @@ impl OpsInner {
 
     pub(super) fn shutdown_assertions(&self) {
         let inner = match self {
-            OpsInner::Undefined => unreachable!(),
-            OpsInner::Open(_open) => panic!("we should be Draining by now"),
-            OpsInner::Draining(inner) => inner,
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(_open) => panic!("we should be Draining by now"),
+            SlotsInner::Draining(inner) => inner,
         };
         let slots_owned_by_user_space = inner.slots_owned_by_user_space().collect::<HashSet<_>>();
         let unused_indices = inner
@@ -264,22 +258,22 @@ impl OpsInner {
     }
 }
 
-impl<O: OpsCoOwner> CoOwnedOps<O> {
+impl<O: SlotsCoOwner> Slots<O> {
     pub(super) fn poller_timeout_debug_dump(&self) {
-        let ops_inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         // TODO: only do this if some env var is set?
-        let (storage, unused_indices) = match &*ops_inner {
-            OpsInner::Undefined => unreachable!(),
-            OpsInner::Open(inner) => (&inner.storage, &inner.unused_indices),
-            OpsInner::Draining(inner) => (&inner.storage, &inner.unused_indices),
+        let (storage, unused_indices) = match &*inner {
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(inner) => (&inner.storage, &inner.unused_indices),
+            SlotsInner::Draining(inner) => (&inner.storage, &inner.unused_indices),
         };
         let mut by_state_discr = HashMap::new();
         for s in storage {
             match s {
-                Some(opstate) => {
-                    let state_discr = opstate.discriminant_str();
+                Some(slot) => {
+                    let discr = slot.discriminant_str();
                     by_state_discr
-                        .entry(state_discr)
+                        .entry(discr)
                         .and_modify(|v| *v += 1)
                         .or_insert(1);
                 }
@@ -292,32 +286,32 @@ impl<O: OpsCoOwner> CoOwnedOps<O> {
             }
         }
         debug!(
-            "poller task got timeout: ops free slots = {} by_ops_state: {:?}",
+            "poller task got timeout: free slots = {} by state: {:?}",
             unused_indices.len(),
             by_state_discr
         );
     }
 }
 
-impl CoOwnedOps<OpsCoOwnerPoller> {
+impl Slots<SlotsCoOwnerPoller> {
     pub(super) fn transition_to_draining(&self) {
-        let mut ops_inner_guard = self.inner.lock().unwrap();
-        let cur = std::mem::replace(&mut *ops_inner_guard, OpsInner::Undefined);
+        let mut inner = self.inner.lock().unwrap();
+        let cur = std::mem::replace(&mut *inner, SlotsInner::Undefined);
         match cur {
-            OpsInner::Undefined => unreachable!(),
-            x @ OpsInner::Draining(_) => {
+            SlotsInner::Undefined => unreachable!(),
+            x @ SlotsInner::Draining(_) => {
                 // can happen if poller task gets cancelled and we switch to thread
-                *ops_inner_guard = x;
+                *inner = x;
             }
-            OpsInner::Open(open) => {
-                let OpsInnerOpen {
+            SlotsInner::Open(open) => {
+                let SlotsInnerOpen {
                     id,
                     storage,
                     unused_indices,
                     waiters: _, // cancels all waiters
                     myself: _,
                 } = *open;
-                *ops_inner_guard = OpsInner::Draining(Box::new(OpsInnerDraining {
+                *inner = SlotsInner::Draining(Box::new(SlotsInnerDraining {
                     id,
                     storage,
                     unused_indices,
@@ -327,39 +321,31 @@ impl CoOwnedOps<OpsCoOwnerPoller> {
     }
 }
 
-pub(crate) struct UnsafeOpsSlotHandle {
-    pub(crate) ops_weak: WeakOps,
-    pub(crate) idx: usize,
-}
-
 #[derive(Debug, thiserror::Error)]
 // TODO: all of these are the same cause, i.e., system shutdown
-pub(crate) enum UnsafeOpsSlotHandleSubmitError {
-    #[error("ops dropped")]
-    OpsDropped,
+pub(crate) enum ClaimError {
+    #[error("slots dropped, the handle was stale, system is likely shutting/shut down")]
+    SlotsDropped,
 }
 
-impl UnsafeOpsSlotHandle {
-    pub(crate) fn claim<R>(
-        self,
-        rsrc: R,
-    ) -> Result<InflightOpHandle<R>, (R, UnsafeOpsSlotHandleSubmitError)>
+impl SlotHandle {
+    pub(crate) fn claim<R>(self, rsrc: R) -> Result<InflightOpHandle<R>, (R, ClaimError)>
     where
         R: ResourcesOwnedByKernel + Send + 'static,
     {
-        let res = self.ops_weak.try_upgrade_mut(|inner| match inner {
-            OpsInner::Undefined => unreachable!(),
-            OpsInner::Open(open) => {
+        let res = self.slots_weak.try_upgrade_mut(|inner| match inner {
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(open) => {
                 assert!(open.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
-                open.storage[self.idx] = Some(OpState::Pending { waker: None });
+                open.storage[self.idx] = Some(Slot::Pending { waker: None });
             }
-            OpsInner::Draining(_) => {
+            SlotsInner::Draining(_) => {
                 inner.return_slot(self.idx);
             }
         });
         match res {
             Err(()) => {
-                return Err((rsrc, UnsafeOpsSlotHandleSubmitError::OpsDropped));
+                return Err((rsrc, ClaimError::SlotsDropped));
             }
             Ok(()) => (),
         };
@@ -371,16 +357,17 @@ impl UnsafeOpsSlotHandle {
             },
         })
     }
+
     pub(crate) fn try_return(self) {
-        // can only fail if ops got dropped, which means system is shut down
+        // can only fail if SlotsInner got dropped, which means system is shut down
         // which means the handle was stale already
         let _ = self
-            .ops_weak
+            .slots_weak
             .try_upgrade_mut(|inner| inner.return_slot(self.idx));
     }
 }
 
-impl OpsInnerDraining {
+impl SlotsInnerDraining {
     pub(super) fn slots_owned_by_user_space(&self) -> impl Iterator<Item = usize> + '_ {
         self.storage
             .iter()
@@ -388,10 +375,10 @@ impl OpsInnerDraining {
             .filter_map(|(idx, x)| match x {
                 None => Some(idx),
                 Some(op_state) => match op_state {
-                    OpState::Undefined => unreachable!(),
-                    OpState::Pending { .. } => None,
-                    OpState::PendingButFutureDropped { .. } => None,
-                    OpState::Ready { .. } => Some(idx),
+                    Slot::Undefined => unreachable!(),
+                    Slot::Pending { .. } => None,
+                    Slot::PendingButFutureDropped { .. } => None,
+                    Slot::Ready { .. } => Some(idx),
                 },
             })
     }
@@ -404,60 +391,55 @@ pub(crate) struct InflightOpHandle<R: ResourcesOwnedByKernel + Send + 'static> {
 
 enum InflightOpHandleState {
     Undefined,
-    Inflight {
-        slot: UnsafeOpsSlotHandle,
-        poll_count: usize,
-    },
-    DoneButYieldingToExecutorForFairness {
-        result: i32,
-    },
+    Inflight { slot: SlotHandle, poll_count: usize },
+    DoneButYieldingToExecutorForFairness { result: i32 },
     DoneAndPolled,
     Dropped,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InflightOpHandleError {
-    #[error("ops dropped")]
-    OpsDropped,
+    #[error("slots dropped")]
+    SlotsDropped,
 }
 
 enum OwnedSlotPollResult {
     Ready(i32),
-    Pending(UnsafeOpsSlotHandle),
+    Pending(SlotHandle),
     ShutDown,
 }
 
-impl UnsafeOpsSlotHandle {
+impl SlotHandle {
     fn poll(self, cx: &mut std::task::Context<'_>) -> OwnedSlotPollResult {
-        let weak_ops = self.ops_weak.clone();
-        let res = weak_ops.try_upgrade_mut(move |inner| {
+        let slots_weak = self.slots_weak.clone();
+        let res = slots_weak.try_upgrade_mut(move |inner| {
             let storage = match inner {
-                OpsInner::Undefined => unreachable!(),
-                OpsInner::Open(inner) => &mut inner.storage,
-                OpsInner::Draining(inner) => &mut inner.storage,
+                SlotsInner::Undefined => unreachable!(),
+                SlotsInner::Open(inner) => &mut inner.storage,
+                SlotsInner::Draining(inner) => &mut inner.storage,
             };
 
             let op_state = &mut storage[self.idx];
             let op_state_inner = op_state.as_mut().unwrap();
 
-            let cur: OpState = std::mem::replace(&mut *op_state_inner, OpState::Undefined);
+            let cur: Slot = std::mem::replace(&mut *op_state_inner, Slot::Undefined);
             match cur {
-                OpState::Undefined => panic!("future is in undefined state"),
-                OpState::Pending {
+                Slot::Undefined => panic!("future is in undefined state"),
+                Slot::Pending {
                     waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
                 } => {
                     trace!("op is still pending, storing waker in it");
-                    *op_state_inner = OpState::Pending {
+                    *op_state_inner = Slot::Pending {
                         waker: Some(cx.waker().clone()),
                     };
                     return OwnedSlotPollResult::Pending(self);
                 }
-                OpState::PendingButFutureDropped { .. } => {
+                Slot::PendingButFutureDropped { .. } => {
                     unreachable!("if it's dropped, it's not pollable")
                 }
-                OpState::Ready { result: res } => {
+                Slot::Ready { result: res } => {
                     trace!("op is ready, returning resources to user");
-                    *op_state_inner = OpState::Ready { result: res };
+                    *op_state_inner = Slot::Ready { result: res };
                     inner.return_slot(self.idx);
                     return OwnedSlotPollResult::Ready(res);
                 }
@@ -508,7 +490,7 @@ impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightO
                                 self.resources_owned_by_kernel.take().unwrap();
                             return std::task::Poll::Ready(Err((
                                 resources_owned_by_kernel,
-                                InflightOpHandleError::OpsDropped,
+                                InflightOpHandleError::SlotsDropped,
                             )));
                         }
                     }
@@ -581,18 +563,18 @@ where
                 slot,
                 poll_count: _,
             } => {
-                let res = slot.ops_weak.try_upgrade_mut(|inner| {
+                let res = slot.slots_weak.try_upgrade_mut(|inner| {
                     let storage = match inner {
-                        OpsInner::Undefined => unreachable!(),
-                        OpsInner::Open(inner) => &mut inner.storage,
-                        OpsInner::Draining(inner) => &mut inner.storage,
+                        SlotsInner::Undefined => unreachable!(),
+                        SlotsInner::Open(inner) => &mut inner.storage,
+                        SlotsInner::Draining(inner) => &mut inner.storage,
                     };
                     let op_state = &mut storage[slot.idx];
                     let op_state_inner = op_state.as_mut().unwrap();
-                    let cur = std::mem::replace(&mut *op_state_inner, OpState::Undefined);
+                    let cur = std::mem::replace(&mut *op_state_inner, Slot::Undefined);
                     match cur {
-                        OpState::Undefined => unreachable!("implementation error"),
-                        OpState::Pending { .. } => {
+                        Slot::Undefined => unreachable!("implementation error"),
+                        Slot::Pending { .. } => {
                             // Up until now, Self held the resources that the uring op is operating on.
                             // Now Self is getting dropped, but the uring op is still ongoing.
                             // We must prevent the resources from getting dropped, otherwise the kernel will operate on the dropped resource.
@@ -607,18 +589,18 @@ where
                             // Since dropping of inflight IOs is generally rare, the allocations should be fine.
                             // Could optimize by making erause a trait method on ResourcesOwnedByKernel; it could then use a slab allcoator or similar.
                             let rsrc: Box<dyn std::any::Any + Send> = Box::new(rsrc);
-                            *op_state_inner = OpState::PendingButFutureDropped {
+                            *op_state_inner = Slot::PendingButFutureDropped {
                                 resources_owned_by_kernel: rsrc,
                             };
                         }
-                        OpState::Ready { result } => {
+                        Slot::Ready { result } => {
                             // The op completed and called the waker that would eventually cause this future to be polled
                             // and transition from Inflight to one of the Done states. But this future got dropped first.
                             // So, it's our job to drop the slot.
-                            *op_state_inner = OpState::Ready { result };
+                            *op_state_inner = Slot::Ready { result };
                             inner.return_slot(slot.idx);
                         }
-                        OpState::PendingButFutureDropped { .. } => {
+                        Slot::PendingButFutureDropped { .. } => {
                             unreachable!("above is the only transition into this state, and this function only runs once")
                         }
                     }
@@ -638,6 +620,17 @@ where
                     }
                 }
             }
+        }
+    }
+}
+
+impl Slot {
+    pub(super) fn discriminant_str(&self) -> &'static str {
+        match self {
+            Slot::Undefined => "Undefined",
+            Slot::Pending { .. } => "Pending",
+            Slot::PendingButFutureDropped { .. } => "PendingButFutureDropped",
+            Slot::Ready { .. } => "Ready",
         }
     }
 }

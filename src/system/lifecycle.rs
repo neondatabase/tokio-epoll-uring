@@ -14,7 +14,7 @@ use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
-    slots::{CoOwnedOps, OpsCoOwnerPoller},
+    slots::{Slots, SlotsCoOwnerPoller},
     submission::{SubmitSide, SubmitSideNewArgs},
 };
 
@@ -100,8 +100,7 @@ impl std::future::Future for Launch {
                 LaunchState::Undefined => unreachable!("implementation error"),
                 LaunchState::Init { poller_preempt } => {
                     // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
-                    let (ops_submit_side, ops_completion_side, ops_poller) =
-                        super::slots::new_ops(id);
+                    let (ops_submit_side, ops_completion_side, ops_poller) = super::slots::new(id);
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
                     let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
@@ -172,7 +171,7 @@ pub(crate) struct ShutdownRequest {
 
 pub(crate) fn poller_impl_finish_shutdown(
     system: System,
-    ops: CoOwnedOps<OpsCoOwnerPoller>,
+    ops: Slots<SlotsCoOwnerPoller>,
     completion_side: Arc<Mutex<CompletionSide>>,
     req: ShutdownRequest,
 ) {

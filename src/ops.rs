@@ -10,8 +10,7 @@ use crate::{
     system::{
         completion::ProcessCompletionsCause,
         slots::{
-            InflightOpHandle, InflightOpHandleError, TryGetSlotResult, UnsafeOpsSlotHandle,
-            UnsafeOpsSlotHandleSubmitError,
+            ClaimError, InflightOpHandle, InflightOpHandleError, SlotHandle, TryGetSlotResult,
         },
         submission::{SubmitError, SubmitSide, SubmitSideInner, SubmitSideOpen},
     },
@@ -31,7 +30,7 @@ where
     },
     WaitForSlot {
         submit_side_weak: Weak<Mutex<SubmitSideInner>>,
-        waiter: oneshot::Receiver<UnsafeOpsSlotHandle>,
+        waiter: oneshot::Receiver<SlotHandle>,
         make_op: O,
     },
     Submitted(InflightOpHandle<O>),
@@ -57,14 +56,14 @@ pub(crate) enum OpError {
     #[error("draining")]
     Draining,
     #[error("claim")]
-    Claim(#[source] UnsafeOpsSlotHandleSubmitError),
+    Claim(#[source] ClaimError),
     #[error("system is shut down")]
     SystemIsShutDown,
 }
 
 pub(crate) fn finish_submit<O>(
     mut op: O,
-    unsafe_slot: UnsafeOpsSlotHandle,
+    unsafe_slot: SlotHandle,
     submit_side_open: &mut SubmitSideOpen,
 ) -> Result<InflightOpHandle<O>, (O, OpError)>
 where
@@ -286,7 +285,10 @@ where
                         *myself = OpFut::ReadyPolled;
                         return std::task::Poll::Ready(Ok(output));
                     }
-                    std::task::Poll::Ready(Err((resource, InflightOpHandleError::OpsDropped))) => {
+                    std::task::Poll::Ready(Err((
+                        resource,
+                        InflightOpHandleError::SlotsDropped,
+                    ))) => {
                         *myself = OpFut::ReadyPolled;
                         return std::task::Poll::Ready(Err((resource, OpError::SystemIsShutDown)));
                     }
