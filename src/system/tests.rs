@@ -16,8 +16,8 @@ impl OpTrait for MockOp {
     }
 }
 impl ResourcesOwnedByKernel for MockOp {
-    type OpResult = ();
-    fn on_op_completion(self, _res: i32) -> Self::OpResult {}
+    type Success = ();
+    fn on_op_completion(self, _res: i32) -> Self::Success {}
 }
 
 // TODO: turn into a does-not-compile test
@@ -101,16 +101,6 @@ async fn basic() {
     let sz = res.unwrap();
     assert_eq!(sz, 1);
     assert_eq!(buf, vec![1]);
-
-    system.initiate_shutdown().await;
-}
-
-#[tokio::test]
-async fn nop() {
-    let system = SharedSystemHandle::launch().await;
-
-    let res = crate::ops::nop::nop(std::future::ready(system.clone())).await;
-    assert!(res.is_ok());
 
     system.initiate_shutdown().await;
 }

@@ -439,14 +439,13 @@ enum InflightHandleState {
     Dropped,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum InflightHandleError {
-    #[error("slots dropped")]
+pub(crate) enum InflightHandleError<R: ResourcesOwnedByKernel> {
     SlotsDropped,
+    Completion(R::Error),
 }
 
 impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightHandle<R> {
-    type Output = Result<R::OpResult, (R, InflightHandleError)>;
+    type Output = (R::Resources, Result<R::Success, InflightHandleError<R>>);
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -479,10 +478,10 @@ impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightH
                         unsafe {
                             let resources_owned_by_kernel =
                                 self.resources_owned_by_kernel.take().unwrap();
-                            return std::task::Poll::Ready(Err((
-                                resources_owned_by_kernel,
-                                InflightHandleError::SlotsDropped,
-                            )));
+                            return std::task::Poll::Ready((
+                                resources_owned_by_kernel.on_failed_submission(),
+                                Err(InflightHandleError::SlotsDropped),
+                            ));
                         }
                     }
                 };
@@ -523,15 +522,20 @@ impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightH
                     }
                 }
                 self.state = InflightHandleState::DoneAndPolled;
-                return std::task::Poll::Ready(Ok(rsrc.on_op_completion(res)));
+                let (resources, res) = rsrc.on_op_completion(res);
+                return std::task::Poll::Ready((
+                    resources,
+                    res.map_err(InflightHandleError::Completion),
+                ));
             }
             InflightHandleState::DoneButYieldingToExecutorForFairness { result } => {
                 self.state = InflightHandleState::DoneAndPolled;
-                return std::task::Poll::Ready(Ok(self
-                    .resources_owned_by_kernel
-                    .take()
-                    .unwrap()
-                    .on_op_completion(result)));
+                let rsrc = self.resources_owned_by_kernel.take().unwrap();
+                let (resources, res) = rsrc.on_op_completion(result);
+                return std::task::Poll::Ready((
+                    resources,
+                    res.map_err(InflightHandleError::Completion),
+                ));
             }
         }
     }

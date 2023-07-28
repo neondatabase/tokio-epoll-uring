@@ -207,7 +207,10 @@
 
 /// The operations that this crate supports. Use these as an entrypoint to learn the API.
 pub mod ops;
-pub use ops::read::read;
+use std::os::fd::OwnedFd;
+
+use ops::read::ReadOp;
+use ops::OpFut;
 
 mod system;
 pub use system::lifecycle::handle::SystemHandle;
@@ -222,30 +225,27 @@ mod thread_local_system_handle;
 use system::submission::SubmitSide;
 pub use thread_local_system_handle::ThreadLocalSubmitSideProvider;
 pub use thread_local_system_handle::ThreadLocalSystemLauncher;
+use tokio_uring::buf::IoBufMut;
 
-/// An indirection to allow [`crate::ops`] to be generic over which [`System`] instance to use for submitting operations.
-//
-/// The name of this trait is subject to debate.
-pub trait SystemLauncher<P>: std::future::Future<Output = P>
-where
-    P: SubmitSideProvider,
-{
-}
-impl<'a> SystemLauncher<&'a SystemHandle> for std::future::Ready<&'a SystemHandle> {}
-impl SystemLauncher<ThreadLocalSubmitSideProvider> for crate::ThreadLocalSystemLauncher {}
-impl SystemLauncher<SharedSystemHandle> for std::future::Ready<SharedSystemHandle> {}
-
-impl SubmitSideProvider for &'_ SystemHandle {
-    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
+impl SubmitSideProvider for SystemHandle {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R {
         f(self.state.guaranteed_live().submit_side.clone())
     }
 }
 
-pub trait SubmitSideProvider: Unpin {
-    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R;
+pub trait SubmitSideProvider: Unpin + Sized {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R;
+    fn read<B: IoBufMut + Send>(self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
+        let op = ReadOp { file, offset, buf };
+        self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
+    }
 }
 
-pub(crate) trait ResourcesOwnedByKernel {
-    type OpResult;
-    fn on_op_completion(self, res: i32) -> Self::OpResult;
+
+pub trait ResourcesOwnedByKernel {
+    type Resources;
+    type Success;
+    type Error;
+    fn on_failed_submission(self) -> Self::Resources;
+    fn on_op_completion(self, res: i32) -> (Self::Resources, Result<Self::Success, Self::Error>);
 }

@@ -1,46 +1,16 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::{ResourcesOwnedByKernel, SubmitSideProvider, SystemLauncher};
+use crate::ResourcesOwnedByKernel;
 
 use super::OpTrait;
 
-/// Read up to `buf.len()` bytes from a `file` into `buf` at the given `offset`.
-pub async fn read<'a, L, P, B>(
-    system_launcher: L,
-    file: OwnedFd,
-    offset: u64,
-    buf: B,
-) -> (OwnedFd, B, std::io::Result<usize>)
-where
-    L: SystemLauncher<P> + Unpin + Send,
-    P: SubmitSideProvider + Unpin,
-    B: tokio_uring::buf::IoBufMut + Send + 'a,
-{
-    let op = ReadOp { file, offset, buf };
-    match op.into_fut(system_launcher).await {
-        Ok(output) => output,
-        Err((
-            ReadOp {
-                file,
-                offset: _,
-                buf,
-            },
-            e,
-        )) => (
-            file,
-            buf,
-            Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-        ),
-    }
-}
-
-struct ReadOp<B>
+pub struct ReadOp<B>
 where
     B: tokio_uring::buf::IoBufMut + Send,
 {
-    file: OwnedFd,
-    offset: u64,
-    buf: B,
+    pub(crate) file: OwnedFd,
+    pub(crate) offset: u64,
+    pub(crate) buf: B,
 }
 
 impl<B> OpTrait for ReadOp<B>
@@ -62,9 +32,17 @@ impl<B> ResourcesOwnedByKernel for ReadOp<B>
 where
     B: tokio_uring::buf::IoBufMut + Send,
 {
-    type OpResult = (OwnedFd, B, std::io::Result<usize>);
+    type Resources = (OwnedFd, B);
+    type Success = usize;
+    type Error = std::io::Error;
 
-    fn on_op_completion(mut self, res: i32) -> Self::OpResult {
+    fn on_failed_submission(self) -> Self::Resources {
+        (self.file, self.buf)
+    }
+    fn on_op_completion(
+        mut self,
+        res: i32,
+    ) -> (Self::Resources, Result<Self::Success, Self::Error>) {
         // https://man.archlinux.org/man/io_uring_prep_read.3.en
         let res = if res < 0 {
             Err(std::io::Error::from_raw_os_error(-res))
@@ -72,6 +50,6 @@ where
             unsafe { tokio_uring::buf::IoBufMut::set_init(&mut self.buf, res as usize) };
             Ok(res as usize)
         };
-        (self.file, self.buf, res)
+        ((self.file, self.buf), res)
     }
 }

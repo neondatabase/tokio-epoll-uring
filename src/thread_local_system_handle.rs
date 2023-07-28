@@ -85,7 +85,7 @@ impl std::future::Future for ThreadLocalSystemLauncher {
 }
 
 impl SubmitSideProvider for ThreadLocalSubmitSideProvider {
-    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R {
         THREAD_LOCAL.with(|local_state| {
             let mut local_state = local_state.borrow_mut();
             match &mut local_state.0 {

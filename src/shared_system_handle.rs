@@ -16,7 +16,7 @@ use crate::{
 pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
 
 impl SubmitSideProvider for SharedSystemHandle {
-    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(self, f: F) -> R {
+    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R {
         f({
             let guard = self.0.read().unwrap();
             let guard = guard
