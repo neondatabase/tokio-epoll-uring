@@ -1,9 +1,14 @@
 pub mod read;
 
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    os::fd::OwnedFd,
+    pin::Pin,
+    sync::{Arc, Mutex, Weak},
+};
 
 use futures::FutureExt;
 use tokio::sync::oneshot;
+use tokio_uring::buf::IoBufMut;
 
 use crate::{
     system::{
@@ -11,8 +16,10 @@ use crate::{
         slots::{self, InflightHandle, InflightHandleError, SlotHandle, TryGetSlotResult},
         submission::{SubmitError, SubmitSide, SubmitSideInner, SubmitSideOpen},
     },
-    ResourcesOwnedByKernel,
+    Ops, ResourcesOwnedByKernel, SubmitSideProvider, System, SystemHandle,
 };
+
+use self::read::ReadOp;
 
 pub struct OpFut<O>
 where
@@ -25,6 +32,14 @@ where
     O: OpTrait + Send + 'static,
 {
     Undefined,
+    // only entered by thread-lcoal
+    WaitForThreadLocal {
+        make_op: O,
+        try_again_rx: Pin<Box<dyn Send + std::future::Future<Output = ()>>>,
+    },
+    TryAgainThreadLocal {
+        make_op: O,
+    },
     WaitForSlot {
         submit_side_weak: Weak<Mutex<SubmitSideInner>>,
         waiter: oneshot::Receiver<SlotHandle>,
@@ -207,6 +222,36 @@ where
                         Err(Error::System(err)),
                     ));
                 }
+                OpFutState::WaitForThreadLocal {
+                    make_op,
+                    mut try_again_rx,
+                } => match try_again_rx.poll_unpin(cx) {
+                    std::task::Poll::Ready(()) => {
+                        myself.state = OpFutState::TryAgainThreadLocal { make_op };
+                        continue;
+                    }
+                    std::task::Poll::Pending => {
+                        myself.state = OpFutState::WaitForThreadLocal {
+                            make_op,
+                            try_again_rx,
+                        }
+                    }
+                },
+                OpFutState::TryAgainThreadLocal { make_op } => {
+                    let res = try_with_thread_local_submit_side(make_op, |make_op, submit_side| {
+                        OpFut::new(make_op, submit_side)
+                    });
+                    match res {
+                        TryThreadLocalSubmitResult::Submitted(op) => *myself = op,
+                        TryThreadLocalSubmitResult::WaitingForThreadLocal(op, waiter) => {
+                            myself.state = OpFutState::WaitForThreadLocal {
+                                make_op: op,
+                                try_again_rx: waiter,
+                            }
+                        }
+                    }
+                    continue;
+                }
                 OpFutState::WaitForSlot {
                     submit_side_weak,
                     mut waiter,
@@ -290,4 +335,93 @@ where
             }
         }
     }
+}
+
+pub struct ThreadLocal;
+
+impl Ops for ThreadLocal {
+    fn read<B: IoBufMut + Send>(self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
+        let op = ReadOp { file, offset, buf };
+        OpFut {
+            state: OpFutState::TryAgainThreadLocal { make_op: op },
+        }
+    }
+}
+
+enum ThreadLocalState {
+    Uninit,
+    Launching(tokio::sync::broadcast::Sender<()>),
+    Launched(SystemHandle),
+    Undefined,
+}
+
+thread_local! {
+    static THREAD_LOCAL: std::sync::Arc<Mutex<ThreadLocalState>> = Arc::new(Mutex::new(ThreadLocalState::Uninit));
+}
+
+enum TryThreadLocalSubmitResult<O: OpTrait + Send + Unpin, R: Send> {
+    Submitted(R),
+    WaitingForThreadLocal(O, Pin<Box<dyn Send + std::future::Future<Output = ()>>>),
+}
+
+fn try_with_thread_local_submit_side<O, F, R>(op: O, f: F) -> TryThreadLocalSubmitResult<O, R>
+where
+    O: OpTrait + Send + Unpin,
+    F: Send + FnOnce(O, SubmitSide) -> R,
+    R: Send,
+{
+    THREAD_LOCAL.with(move |local_state_arc| {
+        let mut local_state = local_state_arc.lock().unwrap();
+        let cur = std::mem::replace(&mut *local_state, ThreadLocalState::Undefined);
+        match cur {
+            ThreadLocalState::Undefined => unreachable!(),
+            ThreadLocalState::Uninit => {
+                let weak_self = Arc::downgrade(local_state_arc);
+                let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+                *local_state = ThreadLocalState::Launching(tx);
+                tokio::spawn(async move {
+                    let system_handle = System::launch().await;
+                    match Weak::upgrade(&weak_self) {
+                        None => {
+                            // thread / thread-local got destroyed while we were launching
+                            drop(system_handle);
+                        }
+                        Some(local_state_arc) => {
+                            let mut local_state_guard = local_state_arc.lock().unwrap();
+                            let cur = std::mem::replace(
+                                &mut *local_state_guard,
+                                ThreadLocalState::Undefined,
+                            );
+                            let tx = match cur {
+                                ThreadLocalState::Launching(tx) => {
+                                    *local_state_guard = ThreadLocalState::Launched(system_handle);
+                                    tx
+                                }
+                                ThreadLocalState::Uninit
+                                | ThreadLocalState::Launched(_)
+                                | ThreadLocalState::Undefined => unreachable!(),
+                            };
+                            drop(local_state_guard);
+                            drop(tx);
+                        }
+                    }
+                });
+                TryThreadLocalSubmitResult::WaitingForThreadLocal(
+                    op,
+                    Box::pin(async move {
+                        let _ = rx.recv();
+                    }),
+                )
+            }
+            ThreadLocalState::Launching(tx) => TryThreadLocalSubmitResult::WaitingForThreadLocal(
+                op,
+                Box::pin(async move {
+                    let _ = tx.subscribe();
+                }),
+            ),
+            ThreadLocalState::Launched(system) => TryThreadLocalSubmitResult::Submitted(
+                system.with_submit_side(|submit_side| f(op, submit_side)),
+            ),
+        }
+    })
 }

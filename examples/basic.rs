@@ -1,3 +1,5 @@
+use tokio_epoll_uring::Ops;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -17,7 +19,6 @@ async fn main() {
     let system = tokio_epoll_uring::System::launch().await;
 
     let buf = vec![0; 2048];
-    use tokio_epoll_uring::SubmitSideProvider;
     let ((_file, buf), res) = system.read(file.into(), 512, buf).await;
     let read = res.unwrap();
     assert_eq!(read, 2048, "not expecting short read");
