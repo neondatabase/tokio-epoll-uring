@@ -208,6 +208,7 @@
 /// The operations that this crate supports. Use these as an entrypoint to learn the API.
 pub mod ops;
 use std::os::fd::OwnedFd;
+pub mod thread_local;
 
 use ops::read::ReadOp;
 use ops::OpFut;
@@ -221,10 +222,7 @@ pub(crate) mod util;
 mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
 
-mod thread_local_system_handle;
 use system::submission::SubmitSide;
-pub use thread_local_system_handle::ThreadLocalSubmitSideProvider;
-pub use thread_local_system_handle::ThreadLocalSystemLauncher;
 
 use tokio_uring::buf::IoBufMut;
 
@@ -240,11 +238,6 @@ pub trait SubmitSideProvider: Unpin + Sized {
         let op = ReadOp { file, offset, buf };
         self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
     }
-}
-
-pub fn new_read<B: IoBufMut + Send>(file: OwnedFd, offset: u64, buf: B) -> ReadOp<B> {
-    let op = ReadOp { file, offset, buf };
-    op
 }
 
 pub trait ResourcesOwnedByKernel {
