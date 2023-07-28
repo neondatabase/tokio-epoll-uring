@@ -225,6 +225,7 @@ mod thread_local_system_handle;
 use system::submission::SubmitSide;
 pub use thread_local_system_handle::ThreadLocalSubmitSideProvider;
 pub use thread_local_system_handle::ThreadLocalSystemLauncher;
+
 use tokio_uring::buf::IoBufMut;
 
 impl SubmitSideProvider for SystemHandle {
@@ -241,6 +242,10 @@ pub trait SubmitSideProvider: Unpin + Sized {
     }
 }
 
+pub fn new_read<B: IoBufMut + Send>(file: OwnedFd, offset: u64, buf: B) -> ReadOp<B> {
+    let op = ReadOp { file, offset, buf };
+    op
+}
 
 pub trait ResourcesOwnedByKernel {
     type Resources;

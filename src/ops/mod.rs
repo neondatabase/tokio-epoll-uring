@@ -122,7 +122,7 @@ where
             state: OpFutState::Err { make_op, err },
         }
     }
-    pub(crate) fn new(make_op: O, submit_side: SubmitSide) -> Self {
+    pub fn new(make_op: O, submit_side: SubmitSide) -> Self {
         let mut submit_side_guard = submit_side.0.lock().unwrap();
         let submit_side_open = match &mut *submit_side_guard {
             SubmitSideInner::Undefined => unreachable!(),
