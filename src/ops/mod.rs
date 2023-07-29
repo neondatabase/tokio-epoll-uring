@@ -1,6 +1,7 @@
 pub mod read;
 
 use std::{
+    fmt::Display,
     os::fd::OwnedFd,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
@@ -198,6 +199,21 @@ where
 pub enum Error<T> {
     System(OpError),
     Op(T),
+}
+
+impl<T: Display> Display for Error<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::System(e) => {
+                if f.alternate() {
+                    write!(f, "tokio-epoll-uring: {e:#}")
+                } else {
+                    write!(f, "tokio-epoll-uring: {e}")
+                }
+            }
+            Error::Op(op) => Display::fmt(op, f),
+        }
+    }
 }
 
 impl<O> std::future::Future for OpFut<O>

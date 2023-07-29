@@ -6,19 +6,7 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{ops::OpTrait, ResourcesOwnedByKernel, SharedSystemHandle, System};
-
-struct MockOp {}
-
-impl OpTrait for MockOp {
-    fn make_sqe(&mut self) -> io_uring::squeue::Entry {
-        io_uring::opcode::Nop::new().build()
-    }
-}
-impl ResourcesOwnedByKernel for MockOp {
-    type Success = ();
-    fn on_op_completion(self, _res: i32) -> Self::Success {}
-}
+use crate::{Ops, SharedSystemHandle, System};
 
 // TODO: turn into a does-not-compile test
 // #[tokio::test]
@@ -51,12 +39,7 @@ async fn op_state_pending_but_future_dropped() {
     let reader = unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
 
     let buf = vec![0; 1];
-    let mut read_fut = Box::pin(crate::read(
-        std::future::ready(system.clone()),
-        reader,
-        0,
-        buf,
-    ));
+    let mut read_fut = Box::pin(system.read(reader, 0, buf));
     let stop_polling_read_fut = CancellationToken::new();
     let jh = tokio::spawn({
         let stop_polling_read_fut = stop_polling_read_fut.clone();
@@ -97,7 +80,7 @@ async fn basic() {
     writer.write_all(&[1]).unwrap();
 
     let buf = vec![0; 1];
-    let (_, buf, res) = crate::read(std::future::ready(system.clone()), reader, 0, buf).await;
+    let ((_, buf), res) = system.read(reader, 0, buf).await;
     let sz = res.unwrap();
     assert_eq!(sz, 1);
     assert_eq!(buf, vec![1]);

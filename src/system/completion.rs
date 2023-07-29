@@ -497,7 +497,7 @@ mod tests {
             completion::{PollerState, PollerTesting},
             lifecycle::System,
         },
-        SharedSystemHandle,
+        Ops, SharedSystemHandle,
     };
 
     #[test]
@@ -529,12 +529,7 @@ mod tests {
 
         let (system, read_fut) = rt.block_on(async move {
             let system = SharedSystemHandle::launch_with_testing(testing).await;
-            let mut read_fut = Box::pin(crate::read(
-                std::future::ready(system.clone()),
-                reader,
-                0,
-                vec![1],
-            ));
+            let mut read_fut = Box::pin(system.read(reader, 0, vec![1]));
             tokio::select! {
                 _ = &mut read_fut => { panic!("we haven't written to the pipe yet") },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
@@ -602,7 +597,7 @@ mod tests {
             }
         });
 
-        let (_, _, res) = second_rt.block_on(read_fut);
+        let ((_, _), res) = second_rt.block_on(read_fut);
         let err = res.err().expect("when poller signals shutdown_done, it has dropped the Ops Arc; read_fut only holds a Weak to it and will fail to upgrade");
         assert_eq!(format!("{:#}", err), "system is shut down");
     }
@@ -638,13 +633,12 @@ mod tests {
                 let reader =
                     unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
                 let buf = vec![0; 1];
-                let (reader, buf, res) =
-                    crate::read(std::future::ready(&system), reader, 0, buf).await;
+                let ((reader, buf), res) = system.read(reader, 0, buf).await;
                 res.unwrap();
                 assert_eq!(buf, &[1]);
                 // now we know it has reached the epoll loop once
                 // next call is the one to be interrupted
-                let (_, buf, res) = crate::read(std::future::ready(&system), reader, 0, buf).await;
+                let ((_, buf), res) = system.read(reader, 0, buf).await;
                 res.unwrap();
                 assert_eq!(buf, &[2]);
                 system
