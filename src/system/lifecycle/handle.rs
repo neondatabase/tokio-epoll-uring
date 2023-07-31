@@ -4,9 +4,6 @@ use super::{ShutdownRequest, SubmitSide};
 
 /// Owned handle to the [`System`](crate::System) created by [`System::launch`](crate::System::launch).
 ///
-/// Users of this crate typically don't use the [`SystemHandle`] directly,
-/// but instead use one of the [`SystemLauncher`](crate::SystemLauncher) implementations.
-///
 /// The only use of this handle is to shut down the [`System`](crate::System).
 /// Call [`initiate_shutdown`](SystemHandle::initiate_shutdown) for explicit shutdown with ability to wait for shutdown completion.
 ///

@@ -9,7 +9,7 @@ use crate::{
 
 /// [`Clone`]-able wrapper around [`SystemHandle`] for sharing between threads / tokio tasks.
 ///
-/// The downside is that shutdown is no longer modeled through the type system, so,
+/// The downside over [`SystemHandle`] is that shutdown is no longer modeled through the type system, so,
 /// it's up to the user to ensure that shutdown is initiated at the right time.
 /// If they fail, we currently panic.
 #[derive(Clone)]

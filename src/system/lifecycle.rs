@@ -18,7 +18,7 @@ use super::{
     submission::{SubmitSide, SubmitSideNewArgs},
 };
 
-/// The live system. Not constructible or accessible by user code. Use [`SystemHandle`] to interact.
+/// A running `tokio_epoll_uring` system. Use [`SystemHandle`] to interact.
 pub struct System {
     #[allow(dead_code)]
     id: usize,
