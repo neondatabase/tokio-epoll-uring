@@ -3,8 +3,11 @@ use std::sync::{Arc, RwLock};
 use futures::Future;
 
 use crate::{
-    ops::{read::ReadOp, OpFut},
-    system::{lifecycle::handle::SystemHandleState, submission::SubmitSide},
+    ops::read::ReadOp,
+    system::{
+        lifecycle::handle::SystemHandleState,
+        submission::{op_fut::OpFut, SubmitSide},
+    },
     Ops, System, SystemHandle,
 };
 
@@ -39,12 +42,16 @@ impl SharedSystemHandle {
 }
 
 impl Ops for SharedSystemHandle {
+    fn nop(&self) -> OpFut<crate::ops::nop::Nop> {
+        let op = crate::ops::nop::Nop {};
+        self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
+    }
     fn read<B: tokio_uring::buf::IoBufMut + Send>(
         &self,
         file: std::os::fd::OwnedFd,
         offset: u64,
         buf: B,
-    ) -> crate::ops::OpFut<crate::ops::read::ReadOp<B>> {
+    ) -> OpFut<crate::ops::read::ReadOp<B>> {
         let op = ReadOp { buf, file, offset };
         self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
     }

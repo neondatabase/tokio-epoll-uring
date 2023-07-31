@@ -1,8 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::ResourcesOwnedByKernel;
-
-use super::OpTrait;
+use crate::system::submission::op_fut::OpTrait;
 
 pub struct ReadOp<B>
 where
@@ -17,6 +15,10 @@ impl<B> OpTrait for ReadOp<B>
 where
     B: tokio_uring::buf::IoBufMut + Send,
 {
+    type Resources = (OwnedFd, B);
+    type Success = usize;
+    type Error = std::io::Error;
+
     fn make_sqe(&mut self) -> io_uring::squeue::Entry {
         io_uring::opcode::Read::new(
             io_uring::types::Fd(self.file.as_raw_fd()),
@@ -26,19 +28,11 @@ where
         .offset(self.offset)
         .build()
     }
-}
-
-impl<B> ResourcesOwnedByKernel for ReadOp<B>
-where
-    B: tokio_uring::buf::IoBufMut + Send,
-{
-    type Resources = (OwnedFd, B);
-    type Success = usize;
-    type Error = std::io::Error;
 
     fn on_failed_submission(self) -> Self::Resources {
         (self.file, self.buf)
     }
+
     fn on_op_completion(
         mut self,
         res: i32,

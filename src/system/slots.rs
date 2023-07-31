@@ -25,9 +25,7 @@ use std::{
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
-use crate::{ops::OpTrait, ResourcesOwnedByKernel};
-
-use super::RING_SIZE;
+use super::{submission::op_fut::OpTrait, RING_SIZE};
 
 pub(crate) trait SlotsCoOwner {}
 
@@ -445,8 +443,9 @@ impl SlotsInnerDraining {
     }
 }
 
-pub(crate) struct InflightHandle<R: ResourcesOwnedByKernel + Send + 'static> {
-    resources_owned_by_kernel: Option<R>, // beocmes None in `drop()`, Some otherwise
+pub(crate) struct InflightHandle<O: OpTrait + Send + 'static> {
+    // TODO: misnomer
+    resources_owned_by_kernel: Option<O>, // beocmes None in `drop()`, Some otherwise
     state: InflightHandleState,
 }
 
@@ -458,13 +457,13 @@ enum InflightHandleState {
     Dropped,
 }
 
-pub(crate) enum InflightHandleError<R: ResourcesOwnedByKernel> {
+pub(crate) enum InflightHandleError<O: OpTrait> {
     SlotsDropped,
-    Completion(R::Error),
+    Completion(O::Error),
 }
 
-impl<R: ResourcesOwnedByKernel + Send + Unpin> std::future::Future for InflightHandle<R> {
-    type Output = (R::Resources, Result<R::Success, InflightHandleError<R>>);
+impl<O: OpTrait + Send + Unpin> std::future::Future for InflightHandle<O> {
+    type Output = (O::Resources, Result<O::Success, InflightHandleError<O>>);
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -614,9 +613,9 @@ impl SlotHandle {
 // SAFETY:
 // If the future gets dropped, we must ensure that the resources (memory, first and foremost)
 // stay alive until we get the operation's cqe. Otherwise we risk memory corruption by hands of the kernel.
-impl<R> Drop for InflightHandle<R>
+impl<O> Drop for InflightHandle<O>
 where
-    R: ResourcesOwnedByKernel + Send + 'static,
+    O: OpTrait + Send + 'static,
 {
     fn drop(&mut self) {
         let cur = std::mem::replace(&mut self.state, InflightHandleState::Dropped);

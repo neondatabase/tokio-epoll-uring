@@ -1,3 +1,5 @@
+pub(crate) mod op_fut;
+
 use std::sync::{Arc, Mutex};
 
 use io_uring::{SubmissionQueue, Submitter};

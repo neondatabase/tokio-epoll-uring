@@ -9,11 +9,11 @@ use std::{
 use futures::FutureExt;
 
 use crate::{
-    ops::{Error, OpFut, OpTrait},
+    system::submission::op_fut::{OpFut, OpTrait},
     System, SystemHandle,
 };
 
-/// Submit [`ops`](`crate::ops`) to a lazily launched [`System`]
+/// Submit [`crate::Ops`] to a lazily launched [`System`]
 /// that is thread-local to the current tokio executor thread.
 ///
 /// ```
@@ -70,7 +70,10 @@ where
     O: OpTrait + Unpin + Send,
     F: Unpin + Send + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
 {
-    type Output = (O::Resources, Result<O::Success, Error<O::Error>>);
+    type Output = (
+        O::Resources,
+        Result<O::Success, crate::system::submission::op_fut::Error<O::Error>>,
+    );
 
     fn poll(
         mut self: Pin<&mut Self>,
@@ -208,11 +211,7 @@ where
                     }),
                 )
             }
-            ThreadLocalState::Launched(system) => {
-                let res = TryThreadLocalSubmitResult::Submitted(f(&system));
-
-                res
-            }
+            ThreadLocalState::Launched(system) => TryThreadLocalSubmitResult::Submitted(f(&system)),
         }
     })
 }
