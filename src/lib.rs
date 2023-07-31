@@ -2,10 +2,10 @@
 //!
 //! # Usage
 //!
-//! 1. Launch a [`System`].
-//! 2. Call the method for the desired io_uring operation.
-//!    The [`Future`](std::future::Future) that is returned by the method
-//!    *owns* the resources required by the operation.
+//! 1. Launch a [`System`] to get a [`SystemHandle`].
+//! 2. On the handle, call the [`Ops`] method that corresponds to the desired io_uring operation.
+//!    The method/returned future will *own* resources such as buffers and file descriptors
+//!    until the operation completes.
 //! 4. Await the future returned by the invocation.
 //! 5. Get back the resources and a result.
 //! 6. Inspect the result and proceed accordingly.
@@ -13,9 +13,7 @@
 //! Transfer of ownership of resources is required with io_uring because
 //! the kernel owns the resources while the operation is in flight.
 //! This is different from `std` and `tokio` IO traits, which typically *borrow* resources.
-//! We can't do borrowing with io_uring because the kernel owns
-//! the resources while the operation is in flight.
-//! More background: withoutboats' [notes on io_uring](https://without.boats/blog/io-uring/).
+//! More background: withoutboats's [notes on io_uring](https://without.boats/blog/io-uring/).
 //!
 //! ## Example 1: Explicitly Launched System
 //!

@@ -2,12 +2,17 @@
 //!
 //! Table Of Contents:
 //!
-//! - [Motivation & Design](`motivation_and_design`)
+//! - [Motivation](`motivation`)
+//! - [Design](`design`)
 //! - [Benchmarks](`benchmarks`)
 
 pub mod benchmarks {
     #![doc = include_str!("benchmarks.md")]
 }
-pub mod motivation_and_design {
-    #![doc = include_str!("motivation_and_design.md")]
+pub mod motivation {
+    #![doc = include_str!("motivation.md")]
+}
+
+pub mod design {
+    #![doc = include_str!("design.md")]
 }

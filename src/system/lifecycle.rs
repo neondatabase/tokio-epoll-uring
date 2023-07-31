@@ -19,7 +19,7 @@ use super::{
     submission::{SubmitSide, SubmitSideNewArgs},
 };
 
-/// A running `tokio_epoll_uring` system. Use [`SystemHandle`] to interact.
+/// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
 pub struct System {
     #[allow(dead_code)]
     id: usize,
@@ -60,10 +60,12 @@ enum LaunchState {
 
 impl System {
     /// Returns a future that, when polled, sets up an io_uring instance
-    /// and a corresponding *poller task* on the current tokio runtime.
+    /// and a corresponding tokio-epoll-uring *poller task* on the current tokio runtime.
     /// The future resolves to a [`SystemHandle`] that can be used to
     /// interact with the system.
-    pub fn launch() -> Launch {
+    ///
+    /// The concept of *poller task* is described in [`crate::doc::design`].
+    pub fn launch() -> impl std::future::Future<Output = SystemHandle> {
         static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
