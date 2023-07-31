@@ -1,3 +1,22 @@
+//! Structure to keep track of in-flight operations.
+//!
+//! There is one [`Slots`] instance per [`crate::System`].
+//!
+//! An in-flight io_uring operation occupies a slot in a [`Slots`] instance.
+//!
+//! # Usage
+//!
+//! The consumer of this module is [`crate::ops::OpFut::new`].
+//! The role that this module plays in the op submission process:
+//!
+//! 1. Consumer gets a handle to a slot using [`Slots::try_get_slot`].
+//! 2. Consumer uses the slot, getting back an [`InflightHandle`].
+//! 3. Consumer submits the io_uring op to the [`SubmissionSide`].
+//! 4. Consumer `await`s the the [`InflightHandle`].
+//!
+//! The [`InflightHandle`] future that enforces correct
+//! ownership of the resources that the io_uring operation operates on.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, Weak},

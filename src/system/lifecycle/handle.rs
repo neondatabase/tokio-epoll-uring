@@ -1,4 +1,13 @@
-use crate::system::submission::PlugError;
+//! Owned handle to an explicitly [`System::launch`]ed system.
+
+use std::os::fd::OwnedFd;
+
+use tokio_uring::buf::IoBufMut;
+
+use crate::{
+    ops::{read::ReadOp, OpFut},
+    system::submission::PlugError, Ops,
+};
 
 use super::{ShutdownRequest, SubmitSide};
 
@@ -166,5 +175,18 @@ impl SystemHandleLive {
             .ok()
             .expect("implementation error: poller task must not die before SystemHandle");
         WaitShutdownFut { done_rx }
+    }
+}
+
+impl SystemHandle {
+    pub(crate) fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R {
+        f(self.state.guaranteed_live().submit_side.clone())
+    }
+}
+
+impl Ops for SystemHandle {
+    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
+        let op = ReadOp { file, offset, buf };
+        self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
     }
 }

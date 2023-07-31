@@ -61,6 +61,7 @@ mod system;
 use ops::read::ReadOp;
 use ops::OpFut;
 pub use system::lifecycle::handle::SystemHandle;
+pub use system::lifecycle::thread_local::with_thread_local_system;
 pub use system::lifecycle::System;
 
 pub(crate) mod util;
@@ -68,31 +69,11 @@ pub(crate) mod util;
 mod shared_system_handle;
 pub use shared_system_handle::SharedSystemHandle;
 
-use system::submission::SubmitSide;
-
 use tokio_uring::buf::IoBufMut;
-
-impl SubmitSideProvider for SystemHandle {
-    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R {
-        f(self.state.guaranteed_live().submit_side.clone())
-    }
-}
-
-pub trait SubmitSideProvider: Unpin + Sized {
-    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R;
-}
 
 pub trait Ops {
     fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>>;
 }
-
-impl<P: SubmitSideProvider> Ops for P {
-    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
-        let op = ReadOp { file, offset, buf };
-        self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
-    }
-}
-
 pub trait ResourcesOwnedByKernel {
     type Resources;
     type Success;

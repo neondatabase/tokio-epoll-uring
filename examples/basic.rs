@@ -1,6 +1,6 @@
 use std::os::fd::OwnedFd;
 
-use tokio_epoll_uring::Ops;
+use tokio_epoll_uring::prelude::*;
 
 #[tokio::main]
 async fn main() {

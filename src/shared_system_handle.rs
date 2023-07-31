@@ -3,8 +3,9 @@ use std::sync::{Arc, RwLock};
 use futures::Future;
 
 use crate::{
+    ops::{read::ReadOp, OpFut},
     system::{lifecycle::handle::SystemHandleState, submission::SubmitSide},
-    SubmitSideProvider, System, SystemHandle,
+    Ops, System, SystemHandle,
 };
 
 /// [`Clone`]-able wrapper around [`SystemHandle`] for sharing between threads / tokio tasks.
@@ -15,7 +16,7 @@ use crate::{
 #[derive(Clone)]
 pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
 
-impl SubmitSideProvider for SharedSystemHandle {
+impl SharedSystemHandle {
     fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R {
         f({
             let guard = self.0.read().unwrap();
@@ -34,6 +35,18 @@ impl SubmitSideProvider for SharedSystemHandle {
                 }
             }
         })
+    }
+}
+
+impl Ops for SharedSystemHandle {
+    fn read<B: tokio_uring::buf::IoBufMut + Send>(
+        &self,
+        file: std::os::fd::OwnedFd,
+        offset: u64,
+        buf: B,
+    ) -> crate::ops::OpFut<crate::ops::read::ReadOp<B>> {
+        let op = ReadOp { buf, file, offset };
+        self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
     }
 }
 

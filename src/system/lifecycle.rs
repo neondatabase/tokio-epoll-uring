@@ -5,6 +5,7 @@ use std::{
 };
 
 pub mod handle;
+pub mod thread_local;
 
 use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
