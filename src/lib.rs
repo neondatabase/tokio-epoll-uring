@@ -237,11 +237,11 @@ pub trait SubmitSideProvider: Unpin + Sized {
 }
 
 pub trait Ops {
-    fn read<B: IoBufMut + Send>(self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>>;
+    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>>;
 }
 
 impl<P: SubmitSideProvider> Ops for P {
-    fn read<B: IoBufMut + Send>(self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
+    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
         let op = ReadOp { file, offset, buf };
         self.with_submit_side(|submit_side| OpFut::new(op, submit_side))
     }

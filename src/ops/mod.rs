@@ -356,7 +356,7 @@ where
 pub struct ThreadLocal;
 
 impl Ops for ThreadLocal {
-    fn read<B: IoBufMut + Send>(self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
+    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
         let op = ReadOp { file, offset, buf };
         OpFut {
             state: OpFutState::TryAgainThreadLocal { make_op: op },
