@@ -72,11 +72,11 @@ where
 
     lazy_static::lazy_static! {
         static ref PROCESS_URING_ON_SUBMIT: bool =
-            std::env::var("PROCESS_URING_ON_SUBMIT")
+            std::env::var("EPOLL_URING_PROCESS_URING_ON_SUBMIT")
                 .map(|v| v == "1")
                 .unwrap_or_else(|e| match e {
                     std::env::VarError::NotPresent => false,
-                    std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_SUBMIT must be a unicode string"),
+                    std::env::VarError::NotUnicode(_) => panic!("EPOLL_URING_PROCESS_URING_ON_SUBMIT must be a unicode string"),
                 });
     }
     // if we're going to process completions immediately, get the lock on the CQ so that
@@ -155,11 +155,11 @@ where
 
                             lazy_static::lazy_static! {
                                 static ref PROCESS_URING_ON_QUEUE_FULL: bool =
-                                    std::env::var("PROCESS_URING_ON_QUEUE_FULL")
+                                    std::env::var("EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL")
                                         .map(|v| v == "1")
                                         .unwrap_or_else(|e| match e {
                                             std::env::VarError::NotPresent => false,
-                                            std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
+                                            std::env::VarError::NotUnicode(_) => panic!("EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
                                         });
                             }
                             if *PROCESS_URING_ON_QUEUE_FULL {

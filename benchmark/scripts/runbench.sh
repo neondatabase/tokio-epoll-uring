@@ -5,14 +5,39 @@ set -x
 
 run() {
 	engine="$1"
-	PROCESS_URING_ON_SUBMIT=1 PROCESS_URING_ON_QUEUE_FULL=1 YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL="${FORCE_YIELD:-dontcare}" \
-		RUST_LOG=warn RUST_BACKTRACE=1 \
-		/tmp/christian-filesystem-workers \
-		--run-duration "$RUNTIME" \
-       		"$NCLIENTS" 100 13 disk-access no-validate cached-io \
-               "$engine"	
+	common_args=(
+		RUST_LOG=warn
+		RUST_BACKTRACE=1
+		/tmp/benchmark
+		--run-duration "$RUNTIME"
+		"$NCLIENTS" 100 13 disk-access no-validate cached-io
+	)
+	case "$engine" in
+		tokio-epoll-uring--no-force-yield)
+			env EPOLL_URING_PROCESS_URING_ON_SUBMIT=1 \
+				EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL=1 \
+				EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL=0 \
+				"${common_args[@]}" "tokio-epoll-uring"
+			local filename="$engine"
+		;;
+		tokio-epoll-uring--force-yield)
+			env EPOLL_URING_PROCESS_URING_ON_SUBMIT=1 \
+				EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL=1 \
+				EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL=0 \
+				"${common_args[@]}" "tokio-epoll-uring"
+			local filename="$engine"
+		;;
+		tokio-spawn-blocking*)
+			env "${common_args[@]}" "tokio-spawn-blocking" "${engine#tokio-spawn-blocking--}"
+			local filename="$engine"
+		;;
+		*)
+			env "${common_args[@]}" "$engine"
+			local filename="$engine"
+			;;
+	esac
 	if [ "${SAVE_RESULT:-0}" = "1" ]; then
-		mv benchmark.output.json "${NCLIENTS}-${FORCE_YIELD}--${engine}.output.json"
+		mv benchmark.output.json "${NCLIENTS}--${filename}.output.json"
 	fi
 }
 
@@ -25,14 +50,14 @@ page_cache_size_mibs() {
 }
 
 create_files() {
-	FORCE_YIELD=0 RUNTIME=1s SAVE_RESULT=0 run std
+	EPOLL_URING_FORCE_YIELD=0 RUNTIME=1s SAVE_RESULT=0 run std
 }
 
 ensure_workload_in_page_cache() {
 	echo page cache warmup done
 	while true; do
 		before="$(kbs_read)"
-		FORCE_YIELD=0 RUNTIME=10s SAVE_RESULT=0 run std
+		EPOLL_URING_FORCE_YIELD=0 RUNTIME=10s SAVE_RESULT=0 run std
 		after="$(kbs_read)"
 		delta="$((after - before))"
 		if [ "$delta" -lt 10 ]; then
@@ -45,7 +70,7 @@ ensure_workload_in_page_cache() {
 ensure_page_cache_size_at_least() {
 	echo "loading up page cache to size ${TARGET_MIN_MIBS}"
 	while true; do
-		FORCE_YIELD=0 RUNTIME=10s SAVE_RESULT=0 run std
+		EPOLL_URING_FORCE_YIELD=0 RUNTIME=10s SAVE_RESULT=0 run std
 		after="$(page_cache_size_mibs)"
 		if [ "$after" -ge "${TARGET_MIN_MIBS}" ]; then
 			break
@@ -54,19 +79,32 @@ ensure_page_cache_size_at_least() {
 	echo "done"
 }
 
+compare_engines=(
+	tokio-epoll-uring--no-force-yield
+	tokio-epoll-uring--force-yield
+	tokio-spawn-blocking--512
+	tokio-uring
+)
+
 NCLIENTS=400
-TOTAL_IOS="1g-total-ios"
 create_files
 echo 3 > /proc/sys/vm/drop_caches
 ensure_workload_in_page_cache
-SAVE_RESULT=1 FORCE_YIELD=0 RUNTIME=20s run tokio-epoll-uring 
-SAVE_RESULT=1 FORCE_YIELD=1 RUNTIME=20s run tokio-epoll-uring 
+for engine in "${compare_engines[@]}"; do
+	date # for debugging
+	SAVE_RESULT=1 RUNTIME="100m-total-ios" run "$engine"
+done
+unset NCLIENTS
+exit
 
 NCLIENTS=1200
 create_files
 echo 3 > /proc/sys/vm/drop_caches
-TARGET_MIN_MIBS=$((58*1024)) ensure_page_cache_size_at_least 
-SAVE_RESULT=1 FORCE_YIELD=0 RUNTIME=20s run tokio-epoll-uring 
-SAVE_RESULT=1 FORCE_YIELD=1 RUNTIME=20s run tokio-epoll-uring 
+TARGET_MIN_MIBS=$((58*1024)) ensure_page_cache_size_at_least
+for engine in "${compare_engines[@]}"; do
+	date # for debugging
+	SAVE_RESULT=1 RUNTIME="10m-total-ios" run "$engine"
+done
+unset NCLIENTS
 
 echo benchmarks done
