@@ -18,7 +18,7 @@ use crossbeam_utils::CachePadded;
 use engines::{
     std_thread::EngineStd, tokio_epoll_uring::EngineTokioEpollUring,
     tokio_on_executor_thread::EngineTokioOnExecutorThread,
-    tokio_spawn_blocking::EngineTokioSpawnBlocking,
+    tokio_spawn_blocking::EngineTokioSpawnBlocking, tokio_uring::EngineTokioUring,
 };
 use itertools::Itertools;
 use rand::RngCore;
@@ -145,6 +145,7 @@ enum EngineKind {
         spawn_blocking_pool_size: NonZeroUsize,
     },
     TokioEpollUring,
+    TokioUring,
 }
 
 struct StatsState {
@@ -596,6 +597,7 @@ fn setup_engine(engine_kind: &EngineKind) -> Box<dyn Engine> {
             spawn_blocking_pool_size,
         } => Box::new(EngineTokioSpawnBlocking::new(*spawn_blocking_pool_size)),
         EngineKind::TokioEpollUring => Box::new(EngineTokioEpollUring::new()),
+        EngineKind::TokioUring => Box::new(EngineTokioUring::new()),
     }
 }
 

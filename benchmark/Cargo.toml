@@ -30,4 +30,5 @@ serde = { version = "1.0.176", features = ["serde_derive"] }
 serde_with = "3.1.0"
 humantime = "2.1.0"
 tokio-util = "0.7.8"
+tokio-uring = "0.4.0"
 
