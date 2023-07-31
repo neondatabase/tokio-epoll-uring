@@ -626,29 +626,4 @@ fn open_file_direct_io(
         }
         options.open(path).unwrap()
     }
-
-    // https://github.com/axboe/fio/issues/48
-    // summarized in https://github.com/ronomon/direct-io/issues/1#issuecomment-360331547
-    // => macOS does not support O_DIRECT, but we can use fcntl to set F_NOCACHE
-    // If the file pages are in the page cache, this has no effect though.
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let file = std::fs::OpenOptions::new()
-            .read(read)
-            .write(write)
-            .create(write)
-            .open(path)
-            .unwrap();
-        match args.direct_io {
-            WorkKind::DirectIo => {
-                let fd = file.as_raw_fd();
-                let res = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
-                assert_eq!(res, 0);
-            }
-            WorkKind::CachedIo => {}
-        }
-        file
-    }
 }
