@@ -6,7 +6,8 @@ use tokio_uring::buf::IoBufMut;
 
 use crate::{
     ops::{read::ReadOp, OpFut},
-    system::submission::PlugError, Ops,
+    system::submission::PlugError,
+    Ops,
 };
 
 use super::{ShutdownRequest, SubmitSide};

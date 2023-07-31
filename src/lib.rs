@@ -17,9 +17,9 @@
 //! the resources while the operation is in flight.
 //! More background: withoutboats' [notes on io_uring](https://without.boats/blog/io-uring/).
 //!
-//! ## Example
+//! ## Example 1: Explicitly Launched System
 //!
-//! ```
+//! ```rust
 //! #[tokio::main]
 //! async fn main() {
 //!   use tokio_epoll_uring::prelude::*;
@@ -39,7 +39,34 @@
 //! }
 //! ```
 //!
-//! Check out more examples in the `./examples` directory.
+//! ## Example 2: Thread-Local System
+//!
+//! On a multi-core system, you'll want a separate [`System`] per executor thread to minimize the need for coordination during submission.
+//! The [`with_thread_local_system`] provides an out-of-the-box solution to lazily launch a [`System`] for the current executor thread.
+//!
+//! ```rust
+//! #[tokio::main]
+//! async fn main() {
+//!     let mut tasks = Vec::new();
+//!     for i in (0..100) {
+//!         tasks.push(tokio::spawn(mytask(i)));
+//!     }
+//!     for jh in tasks {
+//!         jh.await;
+//!     }
+//! }
+//!
+//! async fn mytask(i: usize) {
+//!     let file = std::fs::File::open("/dev/zero").unwrap();
+//!     let fd: std::os::fd::OwnedFd = file.into();
+//!     let buf = vec![1; 1024];
+//!     let ((_, _), res) = tokio_epoll_uring::with_thread_local_system(|system| {
+//!         use tokio_epoll_uring::Ops;
+//!         system.read(fd, 0, buf)
+//!     }).await;
+//!     println!("task {i} result: {res:?}");
+//! }
+//! ```
 //!
 //! # Motivation, Design, Benchmarks
 //!
