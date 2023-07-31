@@ -1,12 +1,12 @@
-use std::{
-    fmt::Display,
-    sync::{Arc, Mutex, Weak},
-};
+use std::{fmt::Display, ops::ControlFlow, sync::Arc};
 
 use futures::FutureExt;
 use tokio::sync::oneshot;
 
-pub trait OpTrait: Sized + Send + 'static {
+/// An io_uring operation and the resources it operates on.
+///
+/// For each io_uring operation, there is a struct that implements this trait.
+pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
     type Resources;
     type Success;
     type Error;
@@ -18,21 +18,25 @@ pub trait OpTrait: Sized + Send + 'static {
 use crate::system::{
     completion::ProcessCompletionsCause,
     slots::{self, InflightHandle, InflightHandleError, SlotHandle, TryGetSlotResult},
-    submission::{SubmitError, SubmitSideInner, SubmitSideOpen},
+    submission::{SubmitError, SubmitSideOpen},
 };
+
+use super::SubmitSideWeak;
+
+/// Generic [`Future`](std::future::Future) that represents an [`Op`], created by a method on [`crate::Ops`].
 pub struct OpFut<O>
 where
-    O: OpTrait + Send + 'static,
+    O: Op + Send + 'static,
 {
     state: OpFutState<O>,
 }
 pub(crate) enum OpFutState<O>
 where
-    O: OpTrait + Send + 'static,
+    O: Op + Send + 'static,
 {
     Undefined,
     WaitForSlot {
-        submit_side_weak: Weak<Mutex<SubmitSideInner>>,
+        submit_side_weak: SubmitSideWeak,
         waiter: oneshot::Receiver<SlotHandle>,
         make_op: O,
     },
@@ -57,7 +61,7 @@ pub(crate) fn finish_submit<O>(
     submit_side_open: &mut SubmitSideOpen,
 ) -> Result<InflightHandle<O>, (O, OpError)>
 where
-    O: OpTrait + Send + 'static + Unpin,
+    O: Op + Send + 'static + Unpin,
 {
     let (sqe, inflight_op_fut) = match unsafe_slot.use_for_op(op) {
         Ok((sqe, inflight_op_handle)) => (sqe, inflight_op_handle),
@@ -116,7 +120,7 @@ where
 
 impl<O> OpFut<O>
 where
-    O: OpTrait + Send + Unpin + 'static,
+    O: Op + Send + Unpin + 'static,
 {
     fn new_err(make_op: O, err: OpError) -> Self {
         OpFut {
@@ -124,54 +128,61 @@ where
         }
     }
 
-    pub(crate) fn new(make_op: O, submit_side_open: &mut SubmitSideOpen) -> Self {
-        match submit_side_open.slots.try_get_slot() {
-            TryGetSlotResult::Draining => {
-                return Self::new_err(make_op, OpError::SystemShuttingDown);
-            }
-            TryGetSlotResult::GotSlot(unsafe_slot) => {
-                let fut = match finish_submit(make_op, unsafe_slot, submit_side_open) {
-                    Ok(fut) => fut,
-                    Err((make_op, err)) => {
-                        return Self::new_err(make_op, err);
-                    }
-                };
-                return OpFut {
-                    state: OpFutState::Submitted(fut),
-                };
-            }
-            TryGetSlotResult::NoSlots(waiter) => {
-                // All slots are taken and we're waiting in line.
-                // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
-                // This is in the hope that we'll wake ourselves up.
+    pub(crate) fn new(make_op: O, submit_side: SubmitSideWeak) -> Self {
+        submit_side.with_submit_side_open(|submit_side_open| {
+            match submit_side_open {
+                None => OpFut::new_err(make_op, OpError::SystemShuttingDown),
+                Some(submit_side_open) => {
+                    match submit_side_open.slots.try_get_slot() {
+                        TryGetSlotResult::Draining => {
+                            return Self::new_err(make_op, OpError::SystemShuttingDown);
+                        }
+                        TryGetSlotResult::GotSlot(unsafe_slot) => {
+                            let fut = match finish_submit(make_op, unsafe_slot, submit_side_open) {
+                                Ok(fut) => fut,
+                                Err((make_op, err)) => {
+                                    return Self::new_err(make_op, err);
+                                }
+                            };
+                            return OpFut {
+                                state: OpFutState::Submitted(fut),
+                            };
+                        }
+                        TryGetSlotResult::NoSlots(waiter) => {
+                            // All slots are taken and we're waiting in line.
+                            // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
+                            // This is in the hope that we'll wake ourselves up.
 
-                lazy_static::lazy_static! {
-                    static ref PROCESS_URING_ON_QUEUE_FULL: bool =
-                        std::env::var("PROCESS_URING_ON_QUEUE_FULL")
-                            .map(|v| v == "1")
-                            .unwrap_or_else(|e| match e {
-                                std::env::VarError::NotPresent => false,
-                                std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
-                            });
-                }
-                if *PROCESS_URING_ON_QUEUE_FULL {
-                    // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
-                    submit_side_open.submitter.submit().unwrap();
-                    submit_side_open
-                        .completion_side
-                        .lock()
-                        .unwrap()
-                        .process_completions(ProcessCompletionsCause::Regular);
-                }
-                return OpFut {
-                    state: OpFutState::WaitForSlot {
-                        submit_side_weak: Weak::clone(&submit_side_open.myself),
-                        waiter,
-                        make_op,
-                    },
-                };
+                            lazy_static::lazy_static! {
+                                static ref PROCESS_URING_ON_QUEUE_FULL: bool =
+                                    std::env::var("PROCESS_URING_ON_QUEUE_FULL")
+                                        .map(|v| v == "1")
+                                        .unwrap_or_else(|e| match e {
+                                            std::env::VarError::NotPresent => false,
+                                            std::env::VarError::NotUnicode(_) => panic!("PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
+                                        });
+                            }
+                            if *PROCESS_URING_ON_QUEUE_FULL {
+                                // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
+                                submit_side_open.submitter.submit().unwrap();
+                                submit_side_open
+                                    .completion_side
+                                    .lock()
+                                    .unwrap()
+                                    .process_completions(ProcessCompletionsCause::Regular);
+                            }
+                            return OpFut {
+                                state: OpFutState::WaitForSlot {
+                                    submit_side_weak: submit_side_open.myself.clone(),
+                                    waiter,
+                                    make_op,
+                                },
+                            };
+                        }
+                    }
+                },
             }
-        }
+        })
     }
 }
 
@@ -198,7 +209,7 @@ impl<T: Display> Display for Error<T> {
 
 impl<O> std::future::Future for OpFut<O>
 where
-    O: OpTrait + Send + 'static + Unpin,
+    O: Op + Send + 'static + Unpin,
 {
     type Output = (O::Resources, Result<O::Success, Error<O::Error>>);
 
@@ -232,36 +243,38 @@ where
                         return std::task::Poll::Pending;
                     }
                     std::task::Poll::Ready(Ok(unsafe_slot)) => {
-                        let submit_side = match submit_side_weak.upgrade() {
-                            Some(submit_side) => submit_side,
-                            None => {
-                                myself.state = OpFutState::ReadyPolled;
-                                unsafe_slot.try_return();
-                                myself.state = OpFutState::ReadyPolled;
-                                return std::task::Poll::Ready((
-                                    op.on_failed_submission(),
-                                    Err(Error::System(OpError::SystemIsShutDown)),
-                                ));
-                            }
-                        };
-                        let mut inner_guard = submit_side.lock().unwrap();
-                        let submit_side_open = match &mut *inner_guard {
-                            SubmitSideInner::Open(open) => open,
-                            SubmitSideInner::Plugged => todo!(),
-                            SubmitSideInner::Undefined => unreachable!(),
-                        };
-                        match finish_submit(op, unsafe_slot, submit_side_open) {
-                            Ok(fut) => {
-                                myself.state = OpFutState::Submitted(fut);
-                                continue;
-                            }
-                            Err((op, err)) => {
-                                myself.state = OpFutState::ReadyPolled;
-                                return std::task::Poll::Ready((
-                                    op.on_failed_submission(),
-                                    Err(Error::System(err)),
-                                ));
-                            }
+                        let res =
+                            submit_side_weak.with_submit_side_open(|maybe_submit_side_open| {
+                                match maybe_submit_side_open {
+                                    Some(submit_side_open) => {
+                                        match finish_submit(op, unsafe_slot, submit_side_open) {
+                                            Ok(fut) => {
+                                                myself.state = OpFutState::Submitted(fut);
+                                                return ControlFlow::Continue(());
+                                            }
+                                            Err((op, err)) => {
+                                                myself.state = OpFutState::ReadyPolled;
+                                                return ControlFlow::Break(std::task::Poll::Ready(
+                                                    (
+                                                        op.on_failed_submission(),
+                                                        Err(Error::System(err)),
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        myself.state = OpFutState::ReadyPolled;
+                                        return ControlFlow::Break(std::task::Poll::Ready((
+                                            op.on_failed_submission(),
+                                            Err(Error::System(OpError::SystemIsShutDown)),
+                                        )));
+                                    }
+                                }
+                            });
+                        match res {
+                            ControlFlow::Continue(()) => continue,
+                            ControlFlow::Break(ret) => return ret,
                         }
                     }
                     std::task::Poll::Ready(Err(_sender_dropped)) => {

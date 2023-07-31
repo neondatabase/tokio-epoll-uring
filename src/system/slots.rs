@@ -25,7 +25,7 @@ use std::{
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
-use super::{submission::op_fut::OpTrait, RING_SIZE};
+use super::{submission::op_fut::Op, RING_SIZE};
 
 pub(crate) trait SlotsCoOwner {}
 
@@ -282,35 +282,47 @@ impl SlotsInner {
     }
 }
 
+impl Slots<CoOwnerSubmitSide> {
+    pub(super) fn set_draining(&self) {
+        let mut inner_guard = self.inner.lock().unwrap();
+        let cur = std::mem::replace(&mut *inner_guard, SlotsInner::Undefined);
+        match cur {
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(open) => {
+                let SlotsInnerOpen {
+                    id,
+                    storage,
+                    unused_indices,
+                    waiters: _, // cancels all waiters
+                    myself: _,
+                } = *open;
+                *inner_guard = SlotsInner::Draining(Box::new(SlotsInnerDraining {
+                    id,
+                    storage,
+                    unused_indices,
+                }));
+            }
+            SlotsInner::Draining(_draining) => {
+                panic!("implementation error: must only call set_draining once")
+            }
+        }
+    }
+}
+
 impl Slots<CoOwnerCompletionSide> {
-    pub(super) fn set_draining_and_get_pending_slot_count(&self) -> usize {
+    pub(super) fn pending_slot_count(&self) -> usize {
         let ring_size = usize::try_from(RING_SIZE).unwrap();
         let mut inner_guard = self.inner.lock().unwrap();
-        // max 2 iters
-        loop {
-            let cur = std::mem::replace(&mut *inner_guard, SlotsInner::Undefined);
-            match cur {
-                SlotsInner::Undefined => unreachable!(),
-                SlotsInner::Open(open) => {
-                    let SlotsInnerOpen {
-                        id,
-                        storage,
-                        unused_indices,
-                        waiters: _, // cancels all waiters
-                        myself: _,
-                    } = *open;
-                    *inner_guard = SlotsInner::Draining(Box::new(SlotsInnerDraining {
-                        id,
-                        storage,
-                        unused_indices,
-                    }));
-                    continue;
-                }
-                SlotsInner::Draining(draining) => {
-                    let pending_count = ring_size - draining.slots_owned_by_user_space().count();
-                    *inner_guard = SlotsInner::Draining(draining);
-                    return pending_count;
-                }
+        let cur = std::mem::replace(&mut *inner_guard, SlotsInner::Undefined);
+        match cur {
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(_open) => {
+                panic!("implementation error: must only call this method after set_draining")
+            }
+            SlotsInner::Draining(draining) => {
+                let pending_count = ring_size - draining.slots_owned_by_user_space().count();
+                *inner_guard = SlotsInner::Draining(draining);
+                return pending_count;
             }
         }
     }
@@ -384,7 +396,7 @@ impl SlotHandle {
         mut op: O,
     ) -> Result<(io_uring::squeue::Entry, InflightHandle<O>), (O, UseError)>
     where
-        O: OpTrait + Send + 'static,
+        O: Op + Send + 'static,
     {
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
@@ -416,14 +428,6 @@ impl SlotHandle {
             },
         ))
     }
-
-    pub(crate) fn try_return(self) {
-        // can only fail if SlotsInner got dropped, which means system is shut down
-        // which means the handle was stale already
-        let _ = self
-            .slots_weak
-            .try_upgrade_mut(|inner| inner.return_slot(self.idx));
-    }
 }
 
 impl SlotsInnerDraining {
@@ -443,7 +447,7 @@ impl SlotsInnerDraining {
     }
 }
 
-pub(crate) struct InflightHandle<O: OpTrait + Send + 'static> {
+pub(crate) struct InflightHandle<O: Op + Send + 'static> {
     // TODO: misnomer
     resources_owned_by_kernel: Option<O>, // beocmes None in `drop()`, Some otherwise
     state: InflightHandleState,
@@ -457,12 +461,12 @@ enum InflightHandleState {
     Dropped,
 }
 
-pub(crate) enum InflightHandleError<O: OpTrait> {
+pub(crate) enum InflightHandleError<O: Op> {
     SlotsDropped,
     Completion(O::Error),
 }
 
-impl<O: OpTrait + Send + Unpin> std::future::Future for InflightHandle<O> {
+impl<O: Op + Send + Unpin> std::future::Future for InflightHandle<O> {
     type Output = (O::Resources, Result<O::Success, InflightHandleError<O>>);
 
     fn poll(
@@ -615,7 +619,7 @@ impl SlotHandle {
 // stay alive until we get the operation's cqe. Otherwise we risk memory corruption by hands of the kernel.
 impl<O> Drop for InflightHandle<O>
 where
-    O: OpTrait + Send + 'static,
+    O: Op + Send + 'static,
 {
     fn drop(&mut self) {
         let cur = std::mem::replace(&mut self.state, InflightHandleState::Dropped);

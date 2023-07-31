@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use crate::system::submission::op_fut::OpTrait;
+use crate::system::submission::op_fut::Op;
 
 pub struct ReadOp<B>
 where
@@ -11,7 +11,9 @@ where
     pub(crate) buf: B,
 }
 
-impl<B> OpTrait for ReadOp<B>
+impl<B> crate::sealed::Sealed for ReadOp<B> where B: tokio_uring::buf::IoBufMut + Send {}
+
+impl<B> Op for ReadOp<B>
 where
     B: tokio_uring::buf::IoBufMut + Send,
 {

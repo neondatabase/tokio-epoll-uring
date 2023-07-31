@@ -6,7 +6,7 @@ use tokio_uring::buf::IoBufMut;
 
 use crate::{
     ops::read::ReadOp,
-    system::submission::{op_fut::OpFut, CoOwnedSubmitSide, PlugError, SubmitSideCoOwnerHandle},
+    system::submission::{op_fut::OpFut, SubmitSide},
     Ops,
 };
 
@@ -20,7 +20,7 @@ use super::ShutdownRequest;
 /// Alternatively, `drop` will also request shutdown, but not wait for completion of shutdown.
 ///
 /// This handle is [`Send`] but not [`Clone`].
-/// If you need to share it between threads, use [`SharedSystemHandle`](crate::SharedSystemHandle).
+/// While it's possible to wrap it in an `Arc<Mutex<_>>`, you probably want to look into [`crate::with_thread_local_system`] instead.
 pub struct SystemHandle {
     inner: Option<SystemHandleInner>,
 }
@@ -28,7 +28,7 @@ pub struct SystemHandle {
 struct SystemHandleInner {
     #[allow(dead_code)]
     pub(super) id: usize,
-    pub(crate) submit_side: CoOwnedSubmitSide<SubmitSideCoOwnerHandle>,
+    pub(crate) submit_side: SubmitSide,
     pub(super) shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
 }
 
@@ -43,7 +43,7 @@ impl Drop for SystemHandle {
 impl SystemHandle {
     pub(crate) fn new(
         id: usize,
-        submit_side: CoOwnedSubmitSide<SubmitSideCoOwnerHandle>,
+        submit_side: SubmitSide,
         shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
     ) -> Self {
         SystemHandle {
@@ -62,7 +62,6 @@ impl SystemHandle {
     ///
     /// After the call to this function returns, it is guaranteed that all subsequent attempts
     /// to start new operations will fail with a custom [`std::io::Error`].
-    /// I.e., subsequent `crate::read().await` will fail with an error.
     ///
     /// Operations started before we initiated shutdown that have not been submitted
     /// to the kernel yet will fail in the same way.
@@ -112,31 +111,21 @@ impl std::future::Future for WaitShutdownFut {
 
 impl SystemHandleInner {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send + Unpin {
-        Box::pin(async move { todo!() })
-        // let SystemHandleInner {
-        //     id: _,
-        //     submit_side,
-        //     shutdown_tx,
-        // } = self;
-        // let mut submit_side_guard = submit_side.0.inner.lock().unwrap();
-        // let open_state = match submit_side_guard.plug() {
-        //     Ok(open_state) => open_state,
-        //     Err(PlugError::AlreadyPlugged) => panic!(
-        //         "implementation error: its solely the SystemHandle's job to plug the submit side"
-        //     ),
-        // };
-        // drop(submit_side_guard);
-        // drop(submit_side);
-        // let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        // let req = ShutdownRequest {
-        //     open_state,
-        //     done_tx,
-        // };
-        // shutdown_tx
-        //     .send(req)
-        //     .ok()
-        //     .expect("implementation error: poller task must not die before SystemHandle");
-        // WaitShutdownFut { done_rx }
+        let SystemHandleInner {
+            id: _,
+            submit_side,
+            shutdown_tx,
+        } = self;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let req = ShutdownRequest {
+            done_tx,
+            open_state: submit_side.plug(),
+        };
+        shutdown_tx
+            .send(req)
+            .ok()
+            .expect("implementation error: poller task must not die before SystemHandle");
+        WaitShutdownFut { done_rx }
     }
 }
 
@@ -144,13 +133,11 @@ impl Ops for crate::SystemHandle {
     fn nop(&self) -> OpFut<crate::ops::nop::Nop> {
         let op = crate::ops::nop::Nop {};
         let inner = self.inner.as_ref().unwrap();
-        todo!()
-        // let submit_side_open = inner.submit_side.lock().unwrap();
-        // OpFut::new(op, inner.submit_side)
+        OpFut::new(op, inner.submit_side.weak())
     }
     fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
         let op = ReadOp { file, offset, buf };
-        todo!()
-        // OpFut::new(op, self.state.guaranteed_live().submit_side.clone())
+        let inner = self.inner.as_ref().unwrap();
+        OpFut::new(op, inner.submit_side.weak())
     }
 }

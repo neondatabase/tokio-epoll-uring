@@ -6,7 +6,7 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{Ops, SharedSystemHandle, System};
+use crate::{system::test_util::shared_system_handle::SharedSystemHandle, Ops, System};
 
 // TODO: turn into a does-not-compile test
 // #[tokio::test]

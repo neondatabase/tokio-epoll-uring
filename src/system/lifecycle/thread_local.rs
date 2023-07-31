@@ -9,12 +9,12 @@ use std::{
 use futures::FutureExt;
 
 use crate::{
-    system::submission::op_fut::{OpFut, OpTrait},
+    system::submission::op_fut::{Op, OpFut},
     System, SystemHandle,
 };
 
 /// Submit [`crate::Ops`] to a lazily launched [`System`]
-/// that is thread-local to the current tokio executor thread.
+/// that is thread-local to the current executor thread.
 ///
 /// ```
 /// async {
@@ -32,7 +32,7 @@ use crate::{
 ///
 pub fn with_thread_local_system<F, O>(make_op: F) -> ThreadLocalOpFut<F, O>
 where
-    O: OpTrait + Unpin + Send,
+    O: Op + Unpin + Send,
     F: Send + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
 {
     ThreadLocalOpFut {
@@ -42,7 +42,7 @@ where
 
 pub struct ThreadLocalOpFut<F, O>
 where
-    O: OpTrait + Unpin + Send,
+    O: Op + Unpin + Send,
     F: Send + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
 {
     state: ThreadLocalOpFutState<F, O>,
@@ -50,7 +50,7 @@ where
 
 enum ThreadLocalOpFutState<F, O>
 where
-    O: OpTrait + Unpin + Send,
+    O: Op + Unpin + Send,
     F: Send + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
 {
     Undefined,
@@ -67,7 +67,7 @@ where
 
 impl<F, O> std::future::Future for ThreadLocalOpFut<F, O>
 where
-    O: OpTrait + Unpin + Send,
+    O: Op + Unpin + Send,
     F: Unpin + Send + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
 {
     type Output = (
@@ -146,7 +146,7 @@ thread_local! {
 
 enum TryThreadLocalSubmitResult<F, O>
 where
-    O: OpTrait + Unpin + Send,
+    O: Op + Unpin + Send,
     F: Unpin + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
 {
     Submitted(OpFut<O>),
@@ -155,7 +155,7 @@ where
 
 fn try_with_thread_local_submit_side<O, F>(f: F) -> TryThreadLocalSubmitResult<F, O>
 where
-    O: OpTrait + Unpin + Send,
+    O: Op + Unpin + Send,
     F: Unpin + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
 {
     THREAD_LOCAL.with(move |local_state_arc| {
@@ -211,7 +211,11 @@ where
                     }),
                 )
             }
-            ThreadLocalState::Launched(system) => TryThreadLocalSubmitResult::Submitted(f(&system)),
+            ThreadLocalState::Launched(system) => {
+                let res = f(&system);
+                *local_state = ThreadLocalState::Launched(system);
+                TryThreadLocalSubmitResult::Submitted(res)
+            }
         }
     })
 }

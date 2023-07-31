@@ -1,8 +1,10 @@
-use crate::system::submission::op_fut::OpTrait;
+use crate::system::submission::op_fut::Op;
 
 pub struct Nop {}
 
-impl OpTrait for Nop {
+impl crate::sealed::Sealed for Nop {}
+
+impl Op for Nop {
     type Resources = ();
     type Success = ();
     type Error = std::io::Error;

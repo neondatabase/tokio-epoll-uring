@@ -331,16 +331,13 @@ async fn poller_impl(
     }
 
     // 1. Prevent new ops from being submitted and wait for all inflight ops to finish.
-    // We already plugged the sumit side in SystemHandle::drop / SystemHandle::shutdown;
-    // But what actually matters is to transition Ops into Draining state.
-    // TODO: remove the SubmitSide plugged state, it's redundant to Ops::Draining.
+    // `SystemHandleInner::shutdown` already plugged the sumit side & transitioned Ops to `Draining` state.
+    // So, all that's left is to wait for pending count to reach 0.
     loop {
         {
             let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
-            let pending_count = completion_side_guard
-                .slots
-                .set_draining_and_get_pending_slot_count();
+            let pending_count = completion_side_guard.slots.pending_slot_count();
             debug!(pending_count, "waiting for pending operations to complete");
             if pending_count == 0 {
                 break;
@@ -496,8 +493,9 @@ mod tests {
         system::{
             completion::{PollerState, PollerTesting},
             lifecycle::System,
+            test_util::shared_system_handle::SharedSystemHandle,
         },
-        Ops, SharedSystemHandle,
+        Ops,
     };
 
     #[test]

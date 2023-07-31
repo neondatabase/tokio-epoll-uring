@@ -1,9 +1,6 @@
 pub(crate) mod op_fut;
 
-use std::{
-    marker::PhantomData,
-    sync::{Arc, Mutex, Weak},
-};
+use std::sync::{Arc, Mutex, Weak};
 
 use io_uring::{SubmissionQueue, Submitter};
 
@@ -20,18 +17,13 @@ pub(crate) struct SubmitSideNewArgs {
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
-pub(crate) trait SubmitSideCoOwner {}
-
-pub(crate) struct SubmitSideCoOwnerHandle;
-impl SubmitSideCoOwner for SubmitSideCoOwnerHandle {}
-
-pub(crate) struct CoOwnedSubmitSide<C: SubmitSideCoOwner> {
-    _marker: PhantomData<C>,
+pub(crate) struct SubmitSide {
+    // This is the only long-lived strong reference to the `SubmitSideInner`.
     inner: Arc<Mutex<SubmitSideInner>>,
 }
 
-impl<C: SubmitSideCoOwner> CoOwnedSubmitSide<C> {
-    pub(crate) fn new(args: SubmitSideNewArgs) -> CoOwnedSubmitSide<C> {
+impl SubmitSide {
+    pub(crate) fn new(args: SubmitSideNewArgs) -> SubmitSide {
         let SubmitSideNewArgs {
             id,
             submitter,
@@ -39,8 +31,7 @@ impl<C: SubmitSideCoOwner> CoOwnedSubmitSide<C> {
             slots: ops,
             completion_side,
         } = args;
-        CoOwnedSubmitSide {
-            _marker: PhantomData,
+        SubmitSide {
             inner: Arc::new_cyclic(|myself| {
                 Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
                     id,
@@ -48,7 +39,7 @@ impl<C: SubmitSideCoOwner> CoOwnedSubmitSide<C> {
                     sq,
                     slots: ops,
                     completion_side: Arc::clone(&completion_side),
-                    myself: Weak::clone(&myself),
+                    myself: SubmitSideWeak(Weak::clone(&myself)),
                 }))
             }),
         }
@@ -75,20 +66,66 @@ impl SubmitSideOpen {
 
 pub struct SubmitSideWeak(Weak<Mutex<SubmitSideInner>>);
 
+impl SubmitSideWeak {
+    pub(crate) fn clone(&self) -> Self {
+        SubmitSideWeak(Weak::clone(&self.0))
+    }
+    pub(crate) fn with_submit_side_open<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(Option<&mut SubmitSideOpen>) -> R,
+    {
+        let submit_side = match self.0.upgrade() {
+            Some(submit_side) => submit_side,
+            None => return f(None),
+        };
+        SubmitSide { inner: submit_side }.with_submit_side_open(f)
+    }
+}
+
+impl SubmitSide {
+    pub(crate) fn with_submit_side_open<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(Option<&mut SubmitSideOpen>) -> R,
+    {
+        let mut inner_guard = self.inner.lock().unwrap();
+        let submit_side_open = match &mut *inner_guard {
+            SubmitSideInner::Open(open) => open,
+            SubmitSideInner::Plugged => return f(None),
+        };
+        f(Some(submit_side_open))
+    }
+}
+
 pub(crate) enum SubmitSideInner {
     Open(SubmitSideOpen),
     Plugged,
-    Undefined,
 }
 
 pub(crate) struct SubmitSideOpen {
     #[allow(dead_code)]
     id: usize,
-    pub(crate) submitter: Submitter<'static>,
+    submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
-    pub(crate) slots: Slots<CoOwnerSubmitSide>,
-    pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
-    myself: Weak<Mutex<SubmitSideInner>>,
+    slots: Slots<CoOwnerSubmitSide>,
+    completion_side: Arc<Mutex<CompletionSide>>,
+    myself: SubmitSideWeak,
+}
+
+impl SubmitSide {
+    pub(crate) fn weak(&self) -> SubmitSideWeak {
+        SubmitSideWeak(Arc::downgrade(&self.inner))
+    }
+    pub(crate) fn plug(self) -> SubmitSideOpen {
+        let mut inner = self.inner.lock().unwrap();
+        let cur = std::mem::replace(&mut *inner, SubmitSideInner::Plugged);
+        match cur {
+            SubmitSideInner::Open(open) => {
+                open.slots.set_draining();
+                open
+            }
+            SubmitSideInner::Plugged => unreachable!(),
+        }
+    }
 }
 
 impl SubmitSideOpen {
@@ -100,23 +137,6 @@ impl SubmitSideOpen {
 
 unsafe impl Send for SubmitSideOpen {}
 unsafe impl Sync for SubmitSideOpen {}
-
-pub enum PlugError {
-    AlreadyPlugged,
-}
-impl SubmitSideInner {
-    pub(crate) fn plug(&mut self) -> Result<SubmitSideOpen, PlugError> {
-        let cur = std::mem::replace(self, SubmitSideInner::Undefined);
-        match cur {
-            SubmitSideInner::Undefined => panic!("implementation error"),
-            SubmitSideInner::Open(open) => {
-                *self = SubmitSideInner::Plugged;
-                Ok(open)
-            }
-            SubmitSideInner::Plugged => Err(PlugError::AlreadyPlugged),
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SubmitError {

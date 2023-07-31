@@ -70,29 +70,21 @@
 //!
 //! See [`crate::doc`].
 
-pub mod doc;
-
-/// The io_uring operations supported by this crate.
-/// Use directly on any of the "Implementors" (see below)
-/// or inside the closure passed to [`with_thread_local_system`].
-pub trait Ops {
-    fn nop(&self) -> OpFut<ops::nop::Nop>;
-    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>>;
+pub(crate) mod sealed {
+    pub trait Sealed {}
 }
 
+pub mod doc;
+
 pub mod ops;
+pub use ops::Ops;
 
 mod system;
-use std::os::fd::OwnedFd;
 
-use ops::read::ReadOp;
 pub use system::lifecycle::handle::SystemHandle;
 pub use system::lifecycle::thread_local::with_thread_local_system;
 pub use system::lifecycle::System;
 
 pub(crate) mod util;
 
-mod shared_system_handle;
-pub use shared_system_handle::SharedSystemHandle;
-use system::submission::op_fut::OpFut;
-use tokio_uring::buf::IoBufMut;
+// pub mod shared_system_handle;

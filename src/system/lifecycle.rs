@@ -16,7 +16,7 @@ use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::SystemHandle,
     slots::{CoOwnerPoller, Slots},
-    submission::{CoOwnedSubmitSide, SubmitSideCoOwnerHandle, SubmitSideNewArgs},
+    submission::{SubmitSide, SubmitSideNewArgs},
 };
 
 /// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
@@ -52,7 +52,7 @@ enum LaunchState {
                     >,
             >,
         >,
-        submit_side: CoOwnedSubmitSide<SubmitSideCoOwnerHandle>,
+        submit_side: SubmitSide,
     },
     Launched,
     Undefined,
@@ -113,7 +113,7 @@ impl std::future::Future for Launch {
                     let completion_side =
                         Arc::new(Mutex::new(CompletionSide::new(id, cq, ops_completion_side)));
 
-                    let submit_side = CoOwnedSubmitSide::new(SubmitSideNewArgs {
+                    let submit_side = SubmitSide::new(SubmitSideNewArgs {
                         id,
                         submitter,
                         sq,
