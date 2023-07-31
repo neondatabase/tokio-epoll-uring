@@ -2,4 +2,5 @@
 
 members = [
     "tokio-epoll-uring",
+    "benchmark",
 ]
