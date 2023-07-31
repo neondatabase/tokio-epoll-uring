@@ -4,10 +4,7 @@ use futures::Future;
 
 use crate::{
     ops::read::ReadOp,
-    system::{
-        lifecycle::handle::SystemHandleState,
-        submission::{op_fut::OpFut, SubmitSide},
-    },
+    system::submission::{op_fut::OpFut, SubmitSideOpen},
     Ops, System, SystemHandle,
 };
 
@@ -20,23 +17,24 @@ use crate::{
 pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
 
 impl SharedSystemHandle {
-    fn with_submit_side<F: FnOnce(SubmitSide) -> R, R>(&self, f: F) -> R {
+    fn with_submit_side<F: FnOnce(&mut SubmitSideOpen) -> R, R>(&self, f: F) -> R {
         f({
             let guard = self.0.read().unwrap();
             let guard = guard
                 .as_ref()
                 .expect("SharedSystemHandle is shut down, cannot submit new operations");
-            match &guard.state {
-                SystemHandleState::KeepSystemAlive(inner) => inner.submit_side.clone(),
-                SystemHandleState::ExplicitShutdownRequestOngoing
-                | SystemHandleState::ExplicitShutdownRequestDone
-                | SystemHandleState::ImplicitShutdownRequestThroughDropOngoing
-                | SystemHandleState::ImplicitShutdownRequestThroughDropDone => {
-                    unreachable!(
-                        "the .take() in fn shutdown plus the RwLock prevent us from reaching here"
-                    )
-                }
-            }
+            todo!()
+            // match &guard.state {
+            //     SystemHandleState::KeepSystemAlive(inner) => inner.submit_side,
+            //     SystemHandleState::ExplicitShutdownRequestOngoing
+            //     | SystemHandleState::ExplicitShutdownRequestDone
+            //     | SystemHandleState::ImplicitShutdownRequestThroughDropOngoing
+            //     | SystemHandleState::ImplicitShutdownRequestThroughDropDone => {
+            //         unreachable!(
+            //             "the .take() in fn shutdown plus the RwLock prevent us from reaching here"
+            //         )
+            //     }
+            // }
         })
     }
 }

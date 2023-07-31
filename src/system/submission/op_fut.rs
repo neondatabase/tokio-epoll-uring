@@ -18,7 +18,7 @@ pub trait OpTrait: Sized + Send + 'static {
 use crate::system::{
     completion::ProcessCompletionsCause,
     slots::{self, InflightHandle, InflightHandleError, SlotHandle, TryGetSlotResult},
-    submission::{SubmitError, SubmitSide, SubmitSideInner, SubmitSideOpen},
+    submission::{SubmitError, SubmitSideInner, SubmitSideOpen},
 };
 pub struct OpFut<O>
 where
@@ -123,13 +123,8 @@ where
             state: OpFutState::Err { make_op, err },
         }
     }
-    pub fn new(make_op: O, submit_side: SubmitSide) -> Self {
-        let mut submit_side_guard = submit_side.0.lock().unwrap();
-        let submit_side_open = match &mut *submit_side_guard {
-            SubmitSideInner::Undefined => unreachable!(),
-            SubmitSideInner::Open(open) => open,
-            SubmitSideInner::Plugged => return Self::new_err(make_op, OpError::SystemShuttingDown),
-        };
+
+    pub(crate) fn new(make_op: O, submit_side_open: &mut SubmitSideOpen) -> Self {
         match submit_side_open.slots.try_get_slot() {
             TryGetSlotResult::Draining => {
                 return Self::new_err(make_op, OpError::SystemShuttingDown);
@@ -170,7 +165,7 @@ where
                 }
                 return OpFut {
                     state: OpFutState::WaitForSlot {
-                        submit_side_weak: Arc::downgrade(&submit_side.0),
+                        submit_side_weak: Weak::clone(&submit_side_open.myself),
                         waiter,
                         make_op,
                     },

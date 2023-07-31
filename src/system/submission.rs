@@ -1,6 +1,9 @@
 pub(crate) mod op_fut;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    marker::PhantomData,
+    sync::{Arc, Mutex, Weak},
+};
 
 use io_uring::{SubmissionQueue, Submitter};
 
@@ -17,8 +20,18 @@ pub(crate) struct SubmitSideNewArgs {
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
-impl SubmitSide {
-    pub(crate) fn new(args: SubmitSideNewArgs) -> SubmitSide {
+pub(crate) trait SubmitSideCoOwner {}
+
+pub(crate) struct SubmitSideCoOwnerHandle;
+impl SubmitSideCoOwner for SubmitSideCoOwnerHandle {}
+
+pub(crate) struct CoOwnedSubmitSide<C: SubmitSideCoOwner> {
+    _marker: PhantomData<C>,
+    inner: Arc<Mutex<SubmitSideInner>>,
+}
+
+impl<C: SubmitSideCoOwner> CoOwnedSubmitSide<C> {
+    pub(crate) fn new(args: SubmitSideNewArgs) -> CoOwnedSubmitSide<C> {
         let SubmitSideNewArgs {
             id,
             submitter,
@@ -26,15 +39,19 @@ impl SubmitSide {
             slots: ops,
             completion_side,
         } = args;
-        SubmitSide(Arc::new(Mutex::new(SubmitSideInner::Open(
-            SubmitSideOpen {
-                id,
-                submitter,
-                sq,
-                slots: ops,
-                completion_side: Arc::clone(&completion_side),
-            },
-        ))))
+        CoOwnedSubmitSide {
+            _marker: PhantomData,
+            inner: Arc::new_cyclic(|myself| {
+                Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
+                    id,
+                    submitter,
+                    sq,
+                    slots: ops,
+                    completion_side: Arc::clone(&completion_side),
+                    myself: Weak::clone(&myself),
+                }))
+            }),
+        }
     }
 }
 
@@ -56,8 +73,7 @@ impl SubmitSideOpen {
     }
 }
 
-#[derive(Clone)]
-pub struct SubmitSide(pub(crate) Arc<Mutex<SubmitSideInner>>);
+pub struct SubmitSideWeak(Weak<Mutex<SubmitSideInner>>);
 
 pub(crate) enum SubmitSideInner {
     Open(SubmitSideOpen),
@@ -72,6 +88,7 @@ pub(crate) struct SubmitSideOpen {
     sq: SubmissionQueue<'static>,
     pub(crate) slots: Slots<CoOwnerSubmitSide>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
+    myself: Weak<Mutex<SubmitSideInner>>,
 }
 
 impl SubmitSideOpen {

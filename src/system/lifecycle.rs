@@ -14,9 +14,9 @@ use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
-    lifecycle::handle::{SystemHandle, SystemHandleLive, SystemHandleState},
+    lifecycle::handle::SystemHandle,
     slots::{CoOwnerPoller, Slots},
-    submission::{SubmitSide, SubmitSideNewArgs},
+    submission::{CoOwnedSubmitSide, SubmitSideCoOwnerHandle, SubmitSideNewArgs},
 };
 
 /// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
@@ -52,7 +52,7 @@ enum LaunchState {
                     >,
             >,
         >,
-        submit_side: SubmitSide,
+        submit_side: CoOwnedSubmitSide<SubmitSideCoOwnerHandle>,
     },
     Launched,
     Undefined,
@@ -113,7 +113,7 @@ impl std::future::Future for Launch {
                     let completion_side =
                         Arc::new(Mutex::new(CompletionSide::new(id, cq, ops_completion_side)));
 
-                    let submit_side = SubmitSide::new(SubmitSideNewArgs {
+                    let submit_side = CoOwnedSubmitSide::new(SubmitSideNewArgs {
                         id,
                         submitter,
                         sq,
@@ -144,13 +144,7 @@ impl std::future::Future for Launch {
                 } => match poller_ready_fut.poll_unpin(cx) {
                     std::task::Poll::Ready(poller_shutdown_tx) => {
                         myself.state = LaunchState::Launched;
-                        let system_handle = SystemHandle {
-                            state: SystemHandleState::KeepSystemAlive(SystemHandleLive {
-                                id,
-                                submit_side,
-                                shutdown_tx: poller_shutdown_tx,
-                            }),
-                        };
+                        let system_handle = SystemHandle::new(id, submit_side, poller_shutdown_tx);
                         return std::task::Poll::Ready(system_handle);
                     }
                     std::task::Poll::Pending => {

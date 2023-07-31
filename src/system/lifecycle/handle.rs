@@ -1,8 +1,16 @@
 //! Owned handle to an explicitly [`System::launch`]ed system.
 
-use crate::system::submission::PlugError;
+use std::os::fd::OwnedFd;
 
-use super::{ShutdownRequest, SubmitSide};
+use tokio_uring::buf::IoBufMut;
+
+use crate::{
+    ops::read::ReadOp,
+    system::submission::{op_fut::OpFut, CoOwnedSubmitSide, PlugError, SubmitSideCoOwnerHandle},
+    Ops,
+};
+
+use super::ShutdownRequest;
 
 /// Owned handle to the [`System`](crate::System) created by [`System::launch`](crate::System::launch).
 ///
@@ -14,49 +22,39 @@ use super::{ShutdownRequest, SubmitSide};
 /// This handle is [`Send`] but not [`Clone`].
 /// If you need to share it between threads, use [`SharedSystemHandle`](crate::SharedSystemHandle).
 pub struct SystemHandle {
-    pub(crate) state: SystemHandleState,
+    inner: Option<SystemHandleInner>,
 }
 
-pub(crate) enum SystemHandleState {
-    KeepSystemAlive(SystemHandleLive),
-    ExplicitShutdownRequestOngoing,
-    ExplicitShutdownRequestDone,
-    ImplicitShutdownRequestThroughDropOngoing,
-    ImplicitShutdownRequestThroughDropDone,
-}
-pub(crate) struct SystemHandleLive {
+struct SystemHandleInner {
     #[allow(dead_code)]
     pub(super) id: usize,
-    pub(crate) submit_side: SubmitSide,
+    pub(crate) submit_side: CoOwnedSubmitSide<SubmitSideCoOwnerHandle>,
     pub(super) shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
 }
 
 impl Drop for SystemHandle {
     fn drop(&mut self) {
-        let cur = std::mem::replace(
-            &mut self.state,
-            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing,
-        );
-        match cur {
-            SystemHandleState::ExplicitShutdownRequestOngoing => {
-                panic!("implementation error, likely panic during explicit shutdown")
-            }
-            SystemHandleState::ExplicitShutdownRequestDone => (), // nothing to do
-            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing => {
-                unreachable!("only this function sets that state, and it gets called exactly once")
-            }
-            SystemHandleState::ImplicitShutdownRequestThroughDropDone => {
-                unreachable!("only this function sets that state, and it gets called exactly once")
-            }
-            SystemHandleState::KeepSystemAlive(live) => {
-                let _ = live.shutdown(); // we don't care about the result
-                self.state = SystemHandleState::ImplicitShutdownRequestThroughDropDone;
-            }
+        if let Some(inner) = self.inner.take() {
+            let _ = inner.shutdown(); // we don't care about the result
         }
     }
 }
 
 impl SystemHandle {
+    pub(crate) fn new(
+        id: usize,
+        submit_side: CoOwnedSubmitSide<SubmitSideCoOwnerHandle>,
+        shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
+    ) -> Self {
+        SystemHandle {
+            inner: Some(SystemHandleInner {
+                id,
+                submit_side,
+                shutdown_tx,
+            }),
+        }
+    }
+
     /// Initiate system shtudown and return a future to await completion of shutdown.
     ///
     /// It is not necessary to poll the returned future to initiate shutdown; it is
@@ -81,41 +79,11 @@ impl SystemHandle {
     ///
     /// So, it is safe to drop the tokio runtime on which the poller task runs.
     pub fn initiate_shutdown(mut self) -> impl std::future::Future<Output = ()> + Send + Unpin {
-        let cur = std::mem::replace(
-            &mut self.state,
-            SystemHandleState::ExplicitShutdownRequestOngoing,
-        );
-        match cur {
-            SystemHandleState::ExplicitShutdownRequestOngoing => {
-                unreachable!("this function consumes self")
-            }
-            SystemHandleState::ExplicitShutdownRequestDone => {
-                unreachable!("this function consumes self")
-            }
-            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing => {
-                unreachable!("this function consumes self")
-            }
-            SystemHandleState::ImplicitShutdownRequestThroughDropDone => {
-                unreachable!("this function consumes self")
-            }
-            SystemHandleState::KeepSystemAlive(live) => {
-                let ret = live.shutdown();
-                self.state = SystemHandleState::ExplicitShutdownRequestDone;
-                ret
-            }
-        }
-    }
-}
-
-impl SystemHandleState {
-    pub(crate) fn guaranteed_live(&self) -> &SystemHandleLive {
-        match self {
-            SystemHandleState::ExplicitShutdownRequestOngoing => unreachable!("caller guarantees that system handle is live, but it is in state ExplicitShutdownRequestOngoing"),
-            SystemHandleState::ExplicitShutdownRequestDone => unreachable!("caller guarantees that system handle is live, but it is in state ExplicitShutdownRequestDone"),
-            SystemHandleState::ImplicitShutdownRequestThroughDropOngoing => unreachable!("caller guarantees that system handle is live, but it is in state ImplicitShutdownRequestThroughDrop"),
-            SystemHandleState::ImplicitShutdownRequestThroughDropDone => unreachable!("caller guarantees that system handle is live, but it is in state ImplicitShutdownRequestThroughDropDone"),
-            SystemHandleState::KeepSystemAlive(live) => live,
-        }
+        let inner = self
+            .inner
+            .take()
+            .expect("we only consume here and during Drop");
+        inner.shutdown()
     }
 }
 
@@ -142,31 +110,47 @@ impl std::future::Future for WaitShutdownFut {
     }
 }
 
-impl SystemHandleLive {
+impl SystemHandleInner {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send + Unpin {
-        let SystemHandleLive {
-            id: _,
-            submit_side,
-            shutdown_tx,
-        } = self;
-        let mut submit_side_guard = submit_side.0.lock().unwrap();
-        let open_state = match submit_side_guard.plug() {
-            Ok(open_state) => open_state,
-            Err(PlugError::AlreadyPlugged) => panic!(
-                "implementation error: its solely the SystemHandle's job to plug the submit side"
-            ),
-        };
-        drop(submit_side_guard);
-        drop(submit_side);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let req = ShutdownRequest {
-            open_state,
-            done_tx,
-        };
-        shutdown_tx
-            .send(req)
-            .ok()
-            .expect("implementation error: poller task must not die before SystemHandle");
-        WaitShutdownFut { done_rx }
+        Box::pin(async move { todo!() })
+        // let SystemHandleInner {
+        //     id: _,
+        //     submit_side,
+        //     shutdown_tx,
+        // } = self;
+        // let mut submit_side_guard = submit_side.0.inner.lock().unwrap();
+        // let open_state = match submit_side_guard.plug() {
+        //     Ok(open_state) => open_state,
+        //     Err(PlugError::AlreadyPlugged) => panic!(
+        //         "implementation error: its solely the SystemHandle's job to plug the submit side"
+        //     ),
+        // };
+        // drop(submit_side_guard);
+        // drop(submit_side);
+        // let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        // let req = ShutdownRequest {
+        //     open_state,
+        //     done_tx,
+        // };
+        // shutdown_tx
+        //     .send(req)
+        //     .ok()
+        //     .expect("implementation error: poller task must not die before SystemHandle");
+        // WaitShutdownFut { done_rx }
+    }
+}
+
+impl Ops for crate::SystemHandle {
+    fn nop(&self) -> OpFut<crate::ops::nop::Nop> {
+        let op = crate::ops::nop::Nop {};
+        let inner = self.inner.as_ref().unwrap();
+        todo!()
+        // let submit_side_open = inner.submit_side.lock().unwrap();
+        // OpFut::new(op, inner.submit_side)
+    }
+    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
+        let op = ReadOp { file, offset, buf };
+        todo!()
+        // OpFut::new(op, self.state.guaranteed_live().submit_side.clone())
     }
 }
