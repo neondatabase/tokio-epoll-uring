@@ -20,6 +20,7 @@ use engines::{
     tokio_on_executor_thread::EngineTokioOnExecutorThread,
     tokio_spawn_blocking::EngineTokioSpawnBlocking, tokio_uring::EngineTokioUring,
 };
+use hdrhistogram::Counter;
 use itertools::Itertools;
 use rand::RngCore;
 use serde_with::serde_as;
@@ -155,11 +156,11 @@ struct StatsState {
 
 impl StatsState {
     fn make_latency_histogram() -> hdrhistogram::Histogram<u64> {
-        hdrhistogram::Histogram::new_with_bounds(1, 10_000_000, 3).unwrap()
+        hdrhistogram::Histogram::new_with_bounds(1, 1_000_000_000, 3).unwrap()
     }
     fn record_iop_latency(&self, client_num: usize, latency: Duration) {
         let mut h = self.latencies_histo[client_num].lock().unwrap();
-        h.record(u64::try_from(latency.as_micros()).unwrap())
+        h.record(u64::try_from(latency.as_nanos()).unwrap())
             .unwrap();
     }
 }
@@ -253,7 +254,7 @@ fn main() {
             }
             const LATENCY_PERCENTILES: [f64; 7] = [50.0, 90.0, 99.0, 99.9, 99.99, 99.999, 99.9999];
             fn latency_percentiles_serialize<S>(
-                values: &[u64; LATENCY_PERCENTILES.len()],
+                values: &[f64; LATENCY_PERCENTILES.len()],
                 serializer: S,
             ) -> Result<S::Ok, S::Error>
             where
@@ -275,18 +276,18 @@ fn main() {
                 elapsed_us: std::time::Duration,
                 throughput_iops: f64,
                 throughput_bw_mibps: f64,
-                latency_min_us: u64,
+                latency_min_us: f64,
                 latency_mean_us: f64,
-                latency_max_us: u64,
+                latency_max_us: f64,
                 #[serde(serialize_with = "latency_percentiles_serialize")]
-                latency_percentiles: [u64; LATENCY_PERCENTILES.len()],
+                latency_percentiles: [f64; LATENCY_PERCENTILES.len()],
             }
 
             impl std::fmt::Display for AggregatedStatsSummary {
                 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     write!(
                         f,
-                        "t{:.2} TP: iops={:.0} bw={:.2} LAT(us): min={} mean={:.0} max={} {}",
+                        "t{:.2} TP: iops={:.0} bw={:.2} LAT(us): min={:.0} mean={:.0} max={:.0} {}",
                         self.elapsed_us.as_secs_f64(),
                         self.throughput_iops,
                         self.throughput_bw_mibps,
@@ -296,7 +297,7 @@ fn main() {
                         self.latency_percentiles
                             .iter()
                             .zip(LATENCY_PERCENTILES.iter())
-                            .map(|(v, p)| format!("p{p}={v}"))
+                            .map(|(v, p)| format!("p{p}={v:.0}"))
                             .join(" "),
                     )
                 }
@@ -325,13 +326,13 @@ fn main() {
                         throughput_bw_mibps: (self.op_count as f64) * ((self.op_size) as f64)
                             / ((1 << 20) as f64)
                             / elapsed_secs,
-                        latency_min_us: histo.min(),
-                        latency_mean_us: histo.mean(),
-                        latency_max_us: histo.max(),
+                        latency_min_us: histo.min().as_f64() / 1000.0,
+                        latency_mean_us: histo.mean() / 1000.0,
+                        latency_max_us: histo.max().as_f64() / 1000.0,
                         latency_percentiles: {
-                            let mut values = [0; LATENCY_PERCENTILES.len()];
+                            let mut values = [0.0; LATENCY_PERCENTILES.len()];
                             for (i, value_ref) in values.iter_mut().enumerate() {
-                                *value_ref = histo.value_at_percentile(LATENCY_PERCENTILES[i]);
+                                *value_ref = histo.value_at_percentile(LATENCY_PERCENTILES[i]).as_f64() / 1000.0;
                             }
                             values
                         },
