@@ -30,6 +30,8 @@ mod engines;
 
 #[derive(serde::Serialize, clap::Parser, Clone)]
 struct Args {
+    #[clap(long)]
+    disable_stats: bool,
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
     block_size_shift: NonZeroU64,
@@ -166,6 +168,7 @@ enum EngineKind {
 }
 
 struct StatsState {
+    disabled: bool,
     reads_in_last_second: Vec<crossbeam_utils::CachePadded<AtomicU64>>,
     latencies_histo: Vec<crossbeam_utils::CachePadded<Mutex<hdrhistogram::Histogram<u64>>>>,
 }
@@ -175,6 +178,9 @@ impl StatsState {
         hdrhistogram::Histogram::new_with_bounds(1, 1_000_000_000, 3).unwrap()
     }
     fn record_iop_latency(&self, client_num: usize, latency: Duration) {
+        if self.disabled {
+            return;
+        }
         let mut h = self.latencies_histo[client_num].lock().unwrap();
         h.record(u64::try_from(latency.as_nanos()).unwrap())
             .unwrap();
@@ -218,6 +224,7 @@ fn main() {
     let engine = setup_engine(&args.work_kind.engine());
 
     let stats_state = Arc::new(StatsState {
+        disabled: args.disable_stats,
         reads_in_last_second: (0..works.len())
             .into_iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
@@ -386,6 +393,10 @@ fn main() {
                     .unwrap();
 
                 rt.block_on(clients_and_monitor_ready.wait());
+                if args.disable_stats {
+                    stop_monitor_rx.blocking_recv().unwrap();
+                    return;
+                }
                 let monitor_start_time = std::time::Instant::now();
 
                 let mut ticker = rt.block_on(async move { tokio::time::interval(MONITOR_PERIOD) });
