@@ -152,7 +152,6 @@ enum EngineKind {
 struct StatsState {
     reads_in_last_second: Vec<crossbeam_utils::CachePadded<AtomicU64>>,
     latencies_histo: Vec<crossbeam_utils::CachePadded<Mutex<hdrhistogram::Histogram<u64>>>>,
-    total_latencies_ns: Vec<crossbeam_utils::CachePadded<AtomicU64>>,
 }
 
 impl StatsState {
@@ -163,10 +162,6 @@ impl StatsState {
         let mut h = self.latencies_histo[client_num].lock().unwrap();
         h.record(u64::try_from(latency.as_nanos()).unwrap())
             .unwrap();
-        self.total_latencies_ns[client_num].fetch_add(
-            u64::try_from(latency.as_nanos()).unwrap(),
-            Ordering::Relaxed,
-        );
     }
 }
 
@@ -210,10 +205,6 @@ fn main() {
         latencies_histo: (0..works.len())
             .into_iter()
             .map(|_| CachePadded::new(Mutex::new(StatsState::make_latency_histogram())))
-            .collect(),
-        total_latencies_ns: (0..works.len())
-            .into_iter()
-            .map(|_| CachePadded::new(AtomicU64::new(0)))
             .collect(),
     });
 
@@ -260,7 +251,6 @@ fn main() {
                 op_count: u64,
                 op_size: u64,
                 latencies_histo: hdrhistogram::Histogram<u64>,
-                latencies_total: u64,
             }
             const LATENCY_PERCENTILES: [f64; 7] = [50.0, 90.0, 99.0, 99.9, 99.99, 99.999, 99.9999];
             fn latency_percentiles_serialize<S>(
@@ -288,7 +278,6 @@ fn main() {
                 throughput_bw_mibps: f64,
                 latency_min_us: f64,
                 latency_mean_us: f64,
-                latency_mean_from_totals_us: f64,
                 latency_max_us: f64,
                 #[serde(serialize_with = "latency_percentiles_serialize")]
                 latency_percentiles: [f64; LATENCY_PERCENTILES.len()],
@@ -298,13 +287,12 @@ fn main() {
                 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     write!(
                         f,
-                        "t{:.2} TP: iops={:.0} bw={:.2} LAT(us): min={:.0} mean={:.0} mean_from_totals={:.0} max={:.0} {}",
+                        "t{:.2} TP: iops={:.0} bw={:.2} LAT(us): min={:.0} mean={:.0} max={:.0} {}",
                         self.elapsed_us.as_secs_f64(),
                         self.throughput_iops,
                         self.throughput_bw_mibps,
                         self.latency_min_us,
                         self.latency_mean_us,
-                        self.latency_mean_from_totals_us,
                         self.latency_max_us,
                         self.latency_percentiles
                             .iter()
@@ -321,14 +309,12 @@ fn main() {
                         op_count: 0,
                         op_size,
                         latencies_histo: StatsState::make_latency_histogram(),
-                        latencies_total: 0,
                     }
                 }
                 fn reset(&mut self, start: std::time::Instant) {
                     self.start = start;
                     self.op_count = 0;
                     self.latencies_histo.clear();
-                    self.latencies_total = 0;
                 }
                 fn summary_since_start(&self) -> AggregatedStatsSummary {
                     let elapsed = self.start.elapsed();
@@ -342,14 +328,11 @@ fn main() {
                             / elapsed_secs,
                         latency_min_us: histo.min().as_f64() / 1000.0,
                         latency_mean_us: histo.mean() / 1000.0,
-                        latency_mean_from_totals_us: (self.latencies_total.as_f64() / self.op_count.as_f64()) / 1000.0,
                         latency_max_us: histo.max().as_f64() / 1000.0,
                         latency_percentiles: {
                             let mut values = [0.0; LATENCY_PERCENTILES.len()];
                             for (i, value_ref) in values.iter_mut().enumerate() {
-                                *value_ref =
-                                    histo.value_at_percentile(LATENCY_PERCENTILES[i]).as_f64()
-                                        / 1000.0;
+                                *value_ref = histo.value_at_percentile(LATENCY_PERCENTILES[i]).as_f64() / 1000.0;
                             }
                             values
                         },
@@ -406,11 +389,6 @@ fn main() {
                         total.latencies_histo += &*h;
                         this_round.latencies_histo += &*h;
                         h.clear();
-                    }
-                    for t in &stats_state.total_latencies_ns {
-                        let t = t.swap(0, Ordering::Relaxed);
-                        total.latencies_total += t;
-                        this_round.latencies_total += t;
                     }
 
                     let this_round_summary = this_round.summary_since_start();
