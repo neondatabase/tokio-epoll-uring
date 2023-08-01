@@ -18,26 +18,22 @@ run() {
 				EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL=1 \
 				EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL=0 \
 				"${common_args[@]}" "tokio-epoll-uring"
-			local filename="$engine"
 		;;
 		tokio-epoll-uring--force-yield)
 			env EPOLL_URING_PROCESS_URING_ON_SUBMIT=1 \
 				EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL=1 \
-				EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL=0 \
+				EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL=1 \
 				"${common_args[@]}" "tokio-epoll-uring"
-			local filename="$engine"
 		;;
 		tokio-spawn-blocking*)
 			env "${common_args[@]}" "tokio-spawn-blocking" "${engine#tokio-spawn-blocking--}"
-			local filename="$engine"
 		;;
 		*)
 			env "${common_args[@]}" "$engine"
-			local filename="$engine"
 			;;
 	esac
 	if [ "${SAVE_RESULT:-0}" = "1" ]; then
-		mv benchmark.output.json "${NCLIENTS}--${filename}.output.json"
+		mv benchmark.output.json "${NCLIENTS}--${engine}.output.json"
 	fi
 }
 
@@ -95,7 +91,6 @@ for engine in "${compare_engines[@]}"; do
 	SAVE_RESULT=1 RUNTIME="100m-total-ios" run "$engine"
 done
 unset NCLIENTS
-exit
 
 NCLIENTS=1200
 create_files
