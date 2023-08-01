@@ -15,7 +15,7 @@ use std::{
 };
 use tracing::info;
 
-use crate::{Args, ClientWork, ClientWorkKind, Engine, StatsState};
+use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
 
 pub(crate) struct EngineTokioSpawnBlocking {
     rt: tokio::runtime::Runtime,
@@ -40,7 +40,7 @@ impl Engine for EngineTokioSpawnBlocking {
         clients_ready: Arc<tokio::sync::Barrier>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
-    ) {
+    ) -> EngineRunResult {
         let rt = &self.rt;
         rt.block_on(async {
             let mut handles = Vec::new();
@@ -53,14 +53,19 @@ impl Engine for EngineTokioSpawnBlocking {
                     let args = Arc::clone(&args);
                     async move {
                         clients_ready.wait().await;
-                        Self::client(i, Arc::clone(&args), work, &stop, stats_state).await
+                        let start = std::time::Instant::now();
+                        Self::client(i, Arc::clone(&args), work, &stop, stats_state).await;
+                        start.elapsed()
                     }
                 }));
             }
+            let mut client_run_times = Vec::new();
             for handle in handles {
-                handle.await.unwrap();
+                let run_time = handle.await.unwrap();
+                client_run_times.push(run_time);
             }
-        });
+            EngineRunResult { client_run_times }
+        })
     }
 }
 

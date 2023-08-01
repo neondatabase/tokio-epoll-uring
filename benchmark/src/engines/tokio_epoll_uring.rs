@@ -15,7 +15,7 @@ use std::{
 use tokio_epoll_uring::Ops;
 use tracing::{debug, info};
 
-use crate::{Args, ClientWork, ClientWorkKind, Engine, StatsState};
+use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
 
 pub(crate) struct EngineTokioEpollUring {
     rt: tokio::runtime::Runtime,
@@ -40,7 +40,7 @@ impl Engine for EngineTokioEpollUring {
         clients_ready: Arc<tokio::sync::Barrier>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
-    ) {
+    ) -> EngineRunResult {
         let EngineTokioEpollUring { rt } = *self;
         let rt = Arc::new(rt);
 
@@ -54,7 +54,9 @@ impl Engine for EngineTokioEpollUring {
                     let args = Arc::clone(&args);
                     async move {
                         clients_ready.wait().await;
-                        Self::client(i, &args, work, &stop, stats_state).await
+                        let start = std::time::Instant::now();
+                        Self::client(i, &args, work, &stop, stats_state).await;
+                        start.elapsed()
                     }
                 }));
             }
@@ -96,16 +98,19 @@ impl Engine for EngineTokioEpollUring {
                     }
                 }
             });
+            let mut client_run_times = Vec::new();
             for (i, handle) in handles.into_iter().enumerate() {
                 info!("awaiting client {i}");
-                handle.await.unwrap();
+                let runtime = handle.await.unwrap();
                 stopped_handles[i].store(true, Ordering::Relaxed);
+                client_run_times.push(runtime);
             }
             stop_stopped_task_status_task.store(true, Ordering::Relaxed);
             info!("awaiting stopped_task_status_task");
             stopped_task_status_task.await.unwrap();
             info!("stopped_task_status_task stopped");
-        });
+            EngineRunResult { client_run_times }
+        })
     }
 }
 

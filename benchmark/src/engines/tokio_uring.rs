@@ -10,7 +10,7 @@ use std::{
 };
 use tracing::info;
 
-use crate::{Args, ClientWork, ClientWorkKind, Engine, StatsState};
+use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
 pub(crate) struct EngineTokioUring {}
 
 impl EngineTokioUring {
@@ -27,7 +27,7 @@ impl Engine for EngineTokioUring {
         clients_ready: Arc<tokio::sync::Barrier>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
-    ) {
+    ) -> EngineRunResult {
         tokio_uring::start(async move {
             let mut handles = Vec::new();
             assert_eq!(works.len(), args.num_clients.get() as usize);
@@ -42,6 +42,7 @@ impl Engine for EngineTokioUring {
                     let args = Arc::clone(&args);
                     async move {
                         clients_ready.wait().await;
+                        let start = std::time::Instant::now();
                         Self::client(
                             i,
                             Arc::clone(&args),
@@ -50,14 +51,18 @@ impl Engine for EngineTokioUring {
                             stats_state,
                             all_client_tasks_spawned,
                         )
-                        .await
+                        .await;
+                        start.elapsed()
                     }
                 }));
             }
+            let mut client_run_times = Vec::new();
             for handle in handles {
-                handle.await.unwrap();
+                let run_time = handle.await.unwrap();
+                client_run_times.push(run_time);
             }
-        });
+            EngineRunResult { client_run_times }
+        })
     }
 }
 

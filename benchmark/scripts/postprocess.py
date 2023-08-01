@@ -15,6 +15,7 @@ with open("all_data.json", "w") as f:
     json.dump(all_data, f, indent=4)
 
 desired_totals = [
+    (["elapsed_us"], "runtime (us)"),
     (["throughput_iops"], "IOPS"),
     (["throughput_bw_mibps"], "MiB/s"),
     (["latency_min_us"], "min (us)"),
@@ -47,5 +48,5 @@ for nclients, data in by_nclients.items():
         writer = csv.writer(f)
         writer.writerow(["client"] + [data["name"] for data in data])
         for i in range(0, nclients):
-            writer.writerow([i] + [data["output"]["sorted_per_task_total_reads"][i] for data in data])
+            writer.writerow([i] + [data["output"]["sorted_per_task_runtimes_secs"][i] for data in data])
 

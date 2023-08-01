@@ -88,7 +88,7 @@ echo 3 > /proc/sys/vm/drop_caches
 ensure_workload_in_page_cache
 for engine in "${compare_engines[@]}"; do
 	date # for debugging
-	SAVE_RESULT=1 RUNTIME="100m-total-ios" run "$engine"
+	SAVE_RESULT=1 RUNTIME="500k-ios-per-client" run "$engine"
 done
 unset NCLIENTS
 
@@ -98,7 +98,7 @@ echo 3 > /proc/sys/vm/drop_caches
 TARGET_MIN_MIBS=$((58*1024)) ensure_page_cache_size_at_least
 for engine in "${compare_engines[@]}"; do
 	date # for debugging
-	SAVE_RESULT=1 RUNTIME="10m-total-ios" run "$engine"
+	SAVE_RESULT=1 RUNTIME="12k-ios-per-client" run "$engine"
 done
 unset NCLIENTS
 

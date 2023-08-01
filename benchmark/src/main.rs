@@ -24,7 +24,6 @@ use hdrhistogram::Counter;
 use itertools::Itertools;
 use rand::RngCore;
 use serde_with::serde_as;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 mod engines;
@@ -45,6 +44,7 @@ enum RunDuration {
     UntilCtrlC,
     FixedDuration(Duration),
     FixedTotalIoCount(u64),
+    FixedPerClientIoCount(u64),
 }
 
 impl FromStr for RunDuration {
@@ -53,8 +53,8 @@ impl FromStr for RunDuration {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "until-ctrl-c" => Ok(RunDuration::UntilCtrlC),
-            x if x.ends_with("total-ios") => {
-                let stripped = &s[..s.len() - "total-ios".len()];
+            x if x.ends_with("ios-total") => {
+                let stripped = &s[..s.len() - "ios-total".len()];
                 let (stripped, multiplier) = if stripped.ends_with("k-") {
                     (&stripped[..stripped.len() - 2], 1000)
                 } else if stripped.ends_with("m-") {
@@ -66,6 +66,22 @@ impl FromStr for RunDuration {
                 };
                 match stripped.parse::<NonZeroU64>() {
                     Ok(n) => Ok(RunDuration::FixedTotalIoCount(n.get() * multiplier)),
+                    Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
+                }
+            }
+            x if x.ends_with("ios-per-client") => {
+                let stripped = &s[..s.len() - "ios-per-client".len()];
+                let (stripped, multiplier) = if stripped.ends_with("k-") {
+                    (&stripped[..stripped.len() - 2], 1000)
+                } else if stripped.ends_with("m-") {
+                    (&stripped[..stripped.len() - 2], 1000 * 1000)
+                } else if stripped.ends_with("g-") {
+                    (&stripped[..stripped.len() - 2], 1000 * 1000 * 1000)
+                } else {
+                    (stripped, 1)
+                };
+                match stripped.parse::<NonZeroU64>() {
+                    Ok(n) => Ok(RunDuration::FixedPerClientIoCount(n.get() * multiplier)),
                     Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
                 }
             }
@@ -173,7 +189,11 @@ trait Engine {
         clients_ready: Arc<tokio::sync::Barrier>,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<StatsState>,
-    );
+    ) -> EngineRunResult;
+}
+
+struct EngineRunResult {
+    client_run_times: Vec<Duration>,
 }
 
 const MONITOR_PERIOD: Duration = Duration::from_secs(1);
@@ -191,7 +211,7 @@ fn main() {
     let args: Arc<Args> = Arc::new(Args::parse());
 
     let stop_engine = Arc::new(AtomicBool::new(false));
-    let stop_monitor = CancellationToken::new();
+    let (stop_monitor_tx, mut stop_monitor_rx) = tokio::sync::oneshot::channel::<EngineRunResult>();
 
     let works = setup_client_works(&args);
 
@@ -219,6 +239,9 @@ fn main() {
             });
         }
         RunDuration::FixedTotalIoCount(_) => {
+            // done earlier in setup_client_works
+        }
+        RunDuration::FixedPerClientIoCount(_) => {
             // done earlier in setup_client_works
         }
     }
@@ -332,7 +355,9 @@ fn main() {
                         latency_percentiles: {
                             let mut values = [0.0; LATENCY_PERCENTILES.len()];
                             for (i, value_ref) in values.iter_mut().enumerate() {
-                                *value_ref = histo.value_at_percentile(LATENCY_PERCENTILES[i]).as_f64() / 1000.0;
+                                *value_ref =
+                                    histo.value_at_percentile(LATENCY_PERCENTILES[i]).as_f64()
+                                        / 1000.0;
                             }
                             values
                         },
@@ -344,10 +369,10 @@ fn main() {
             struct BenchmarkOutput {
                 args: Args,
                 sorted_per_task_total_reads: Vec<u64>,
+                sorted_per_task_runtimes_secs: Vec<f64>,
                 totals: Vec<AggregatedStatsSummary>,
             }
 
-            let stop_monitor = stop_monitor.clone();
             move || {
                 let mut per_task_total_reads = HashMap::new();
                 let op_size = 1 << args.block_size_shift.get();
@@ -364,15 +389,15 @@ fn main() {
 
                 let mut ticker = rt.block_on(async move { tokio::time::interval(MONITOR_PERIOD) });
 
-                let mut exit = false;
-                while !exit {
+                let mut exit: Option<EngineRunResult> = None;
+                while exit.is_none() {
                     this_round.reset(std::time::Instant::now());
                     rt.block_on(async {
                         let ticker = &mut ticker;
                         tokio::select! {
                             _ = ticker.tick() => {}
-                            _ = stop_monitor.cancelled() => {
-                                exit = true;
+                            msg = &mut stop_monitor_rx => {
+                                exit = Some(msg.unwrap());
                             }
                         };
                     });
@@ -399,6 +424,7 @@ fn main() {
 
                     total_summaries.push(total_summary);
                 }
+                let exit = exit.unwrap();
 
                 info!("monitor shutting down");
 
@@ -409,9 +435,16 @@ fn main() {
                 //  ssh neon-devvm-mbp ssh testinstance sudo cat /mnt/per_task_total_reads.json | jq '.[]' | pbcopy
                 let sorted_per_task_total_reads =
                     per_task_total_reads.values().cloned().sorted().collect();
+                let sorted_per_task_runtimes_secs = exit
+                    .client_run_times
+                    .into_iter()
+                    .sorted()
+                    .map(|d| d.as_secs_f64())
+                    .collect();
                 let output = BenchmarkOutput {
                     args: args.as_ref().clone(),
                     sorted_per_task_total_reads,
+                    sorted_per_task_runtimes_secs,
                     totals: total_summaries,
                 };
                 let outpath = std::path::PathBuf::from("benchmark.output.json");
@@ -424,14 +457,17 @@ fn main() {
         })
         .unwrap();
 
-    engine.run(
+    let res = engine.run(
         args.clone(),
         works,
         clients_and_monitor_ready,
         stop_engine,
         stats_state,
     );
-    stop_monitor.cancel();
+    stop_monitor_tx
+        .send(res)
+        .ok()
+        .expect("monitor must not exit by itself");
     monitor.join().unwrap();
 }
 
@@ -449,7 +485,7 @@ impl OpsLeft {
             None => (),
             Some(ops_left) => {
                 let ops_left = ops_left.fetch_sub(1, Ordering::Relaxed);
-                if ops_left < 0 {
+                if ops_left <= 0 {
                     return ControlFlow::Break(());
                 }
             }
@@ -471,13 +507,25 @@ enum ClientWorkKind {
 }
 
 fn setup_client_works(args: &Args) -> Vec<ClientWork> {
-    let ops_left = OpsLeft(match args.run_duration {
-        RunDuration::UntilCtrlC => None,
-        RunDuration::FixedDuration(_) => None,
-        RunDuration::FixedTotalIoCount(total_io_count) => Some(Arc::new(AtomicI64::new(
-            i64::try_from(total_io_count).unwrap(),
-        ))),
-    });
+    let mut fixed_total_io_count_ops_left = None;
+    let mut get_ops_left_for_client = || {
+        match args.run_duration {
+            RunDuration::UntilCtrlC => OpsLeft(None),
+            RunDuration::FixedDuration(_) => OpsLeft(None),
+            RunDuration::FixedTotalIoCount(total_io_count) => {
+                let shared = fixed_total_io_count_ops_left.get_or_insert_with(|| {
+                    Arc::new(AtomicI64::new(i64::try_from(total_io_count).unwrap()))
+                });
+                OpsLeft(Some(Arc::clone(shared)))
+            }
+            RunDuration::FixedPerClientIoCount(per_client) => {
+                // create a separate OpsLeft per client
+                OpsLeft(Some(Arc::new(AtomicI64::new(
+                    i64::try_from(per_client).unwrap(),
+                ))))
+            }
+        }
+    };
     match &args.work_kind {
         WorkKind::DiskAccess {
             disk_access_kind,
@@ -496,8 +544,9 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
                     OpenFileMode::Read,
                     &data_file_path(args, i),
                 );
+
                 client_files.push(ClientWork {
-                    ops_left: ops_left.clone(),
+                    ops_left: get_ops_left_for_client(),
                     kind: ClientWorkKind::DiskAccess {
                         file,
                         validate: match validate {
@@ -512,7 +561,7 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
         WorkKind::TimerFd { expiration_mode } => (0..args.num_clients.get())
             .map(|_| match expiration_mode {
                 TimerFdExperiationModeKind::Oneshot { micros, engine: _ } => ClientWork {
-                    ops_left: ops_left.clone(),
+                    ops_left: get_ops_left_for_client(),
                     kind: ClientWorkKind::TimerFdSetStateAndRead {
                         timerfd: {
                             timerfd::TimerFd::new_custom(timerfd::ClockId::Monotonic, false, true)
@@ -525,7 +574,7 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
             .collect(),
         WorkKind::NoWork { engine: _ } => (0..args.num_clients.get())
             .map(|_| ClientWork {
-                ops_left: ops_left.clone(),
+                ops_left: get_ops_left_for_client(),
                 kind: ClientWorkKind::NoWork {},
             })
             .collect(),

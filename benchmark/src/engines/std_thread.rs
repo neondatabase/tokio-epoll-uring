@@ -1,3 +1,4 @@
+use rand::Rng;
 use std::{
     alloc::Layout,
     ops::ControlFlow,
@@ -7,10 +8,9 @@ use std::{
         Arc,
     },
 };
-use rand::Rng;
 use tracing::info;
 
-use crate::{Args, ClientWork, ClientWorkKind, Engine, StatsState};
+use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
 
 pub(crate) struct EngineStd {}
 impl Engine for EngineStd {
@@ -21,15 +21,16 @@ impl Engine for EngineStd {
         clients_ready: Arc<tokio::sync::Barrier>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
-    ) {
+    ) -> EngineRunResult {
         let myself = Arc::new(*self);
         std::thread::scope(|scope| {
             assert_eq!(works.len(), args.num_clients.get() as usize);
+            let mut jhs = Vec::with_capacity(args.num_clients.get() as usize);
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let myself = Arc::clone(&myself);
-                scope.spawn({
+                jhs.push(scope.spawn({
                     let args = Arc::clone(&args);
                     let clients_ready = Arc::clone(&clients_ready);
                     move || {
@@ -38,11 +39,15 @@ impl Engine for EngineStd {
                             .build()
                             .unwrap()
                             .block_on(clients_ready.wait());
-                        myself.client(i, Arc::clone(&args), work, &stop, stats_state)
+                        let start = std::time::Instant::now();
+                        myself.client(i, Arc::clone(&args), work, &stop, stats_state);
+                        start.elapsed()
                     }
-                });
+                }));
             }
-        });
+            let client_run_times = jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
+            EngineRunResult { client_run_times }
+        })
     }
 }
 impl EngineStd {
