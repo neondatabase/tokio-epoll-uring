@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -193,7 +193,7 @@ trait Engine {
 }
 
 struct EngineRunResult {
-    client_run_times: Vec<Duration>,
+    client_finish_times: Vec<Instant>,
 }
 
 const MONITOR_PERIOD: Duration = Duration::from_secs(1);
@@ -386,6 +386,7 @@ fn main() {
                     .unwrap();
 
                 rt.block_on(clients_and_monitor_ready.wait());
+                let monitor_start_time = std::time::Instant::now();
 
                 let mut ticker = rt.block_on(async move { tokio::time::interval(MONITOR_PERIOD) });
 
@@ -436,9 +437,10 @@ fn main() {
                 let sorted_per_task_total_reads =
                     per_task_total_reads.values().cloned().sorted().collect();
                 let sorted_per_task_runtimes_secs = exit
-                    .client_run_times
+                    .client_finish_times
                     .into_iter()
                     .sorted()
+                    .map(|finish_time| finish_time.checked_duration_since(monitor_start_time).expect("this can happen if the tasks finish before monitor thread gets scheduled to capture `monitor_start_time`. but, that's super rare"))
                     .map(|d| d.as_secs_f64())
                     .collect();
                 let output = BenchmarkOutput {

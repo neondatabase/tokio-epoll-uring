@@ -54,9 +54,8 @@ impl Engine for EngineTokioEpollUring {
                     let args = Arc::clone(&args);
                     async move {
                         clients_ready.wait().await;
-                        let start = std::time::Instant::now();
                         Self::client(i, &args, work, &stop, stats_state).await;
-                        start.elapsed()
+                        std::time::Instant::now()
                     }
                 }));
             }
@@ -98,18 +97,20 @@ impl Engine for EngineTokioEpollUring {
                     }
                 }
             });
-            let mut client_run_times = Vec::new();
+            let mut client_finish_times = Vec::new();
             for (i, handle) in handles.into_iter().enumerate() {
                 info!("awaiting client {i}");
                 let runtime = handle.await.unwrap();
                 stopped_handles[i].store(true, Ordering::Relaxed);
-                client_run_times.push(runtime);
+                client_finish_times.push(runtime);
             }
             stop_stopped_task_status_task.store(true, Ordering::Relaxed);
             info!("awaiting stopped_task_status_task");
             stopped_task_status_task.await.unwrap();
             info!("stopped_task_status_task stopped");
-            EngineRunResult { client_run_times }
+            EngineRunResult {
+                client_finish_times,
+            }
         })
     }
 }

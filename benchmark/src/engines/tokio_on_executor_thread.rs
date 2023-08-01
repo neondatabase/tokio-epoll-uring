@@ -49,7 +49,6 @@ impl Engine for EngineTokioOnExecutorThread {
                     let args = Arc::clone(&args);
                     async move {
                         clients_ready.wait().await;
-                        let start = std::time::Instant::now();
                         Self::client(
                             i,
                             Arc::clone(&args),
@@ -59,16 +58,18 @@ impl Engine for EngineTokioOnExecutorThread {
                             all_client_tasks_spawned,
                         )
                         .await;
-                        start.elapsed()
+                        std::time::Instant::now()
                     }
                 }));
             }
-            let mut client_run_times = Vec::new();
+            let mut client_finish_times = Vec::new();
             for handle in handles {
                 let run_time = handle.await.unwrap();
-                client_run_times.push(run_time);
+                client_finish_times.push(run_time);
             }
-            EngineRunResult { client_run_times }
+            EngineRunResult {
+                client_finish_times,
+            }
         })
     }
 }

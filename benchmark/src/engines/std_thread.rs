@@ -39,14 +39,15 @@ impl Engine for EngineStd {
                             .build()
                             .unwrap()
                             .block_on(clients_ready.wait());
-                        let start = std::time::Instant::now();
                         myself.client(i, Arc::clone(&args), work, &stop, stats_state);
-                        start.elapsed()
+                        std::time::Instant::now()
                     }
                 }));
             }
             let client_run_times = jhs.into_iter().map(|jh| jh.join().unwrap()).collect();
-            EngineRunResult { client_run_times }
+            EngineRunResult {
+                client_finish_times: client_run_times,
+            }
         })
     }
 }
