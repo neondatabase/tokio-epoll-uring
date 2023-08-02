@@ -15,14 +15,14 @@ run() {
 	)
 	case "$engine" in
 		tokio-epoll-uring--no-force-yield)
-			env EPOLL_URING_PROCESS_URING_ON_SUBMIT=1 \
-				EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL=1 \
+			env EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT=1 \
+				EPOLL_URING_PROCESS_COMPLETIONS_ON_QUEUE_FULL=1 \
 				EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL=0 \
 				"${common_args[@]}" "tokio-epoll-uring"
 		;;
 		tokio-epoll-uring--force-yield)
-			env EPOLL_URING_PROCESS_URING_ON_SUBMIT=1 \
-				EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL=1 \
+			env EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT=1 \
+				EPOLL_URING_PROCESS_COMPLETIONS_ON_QUEUE_FULL=1 \
 				EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL=1 \
 				"${common_args[@]}" "tokio-epoll-uring"
 		;;

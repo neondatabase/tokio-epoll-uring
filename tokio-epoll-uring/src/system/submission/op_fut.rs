@@ -62,7 +62,17 @@ where
         }
     };
 
-    const PROCESS_COMPLETIONS_ON_SUBMIT: bool = false;
+    static PROCESS_COMPLETIONS_ON_SUBMIT: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| {
+            std::env::var("EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT")
+                .map(|v| v == "1")
+                .unwrap_or_else(|e| match e {
+                    std::env::VarError::NotPresent => true, // default-on
+                    std::env::VarError::NotUnicode(_) => {
+                        panic!("EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT must be a unicode string")
+                    }
+                })
+        });
 
     let inflight = submit_side.with_submit_side_open(|submit_side| {
 
@@ -90,7 +100,7 @@ where
         #[allow(unused_assignments)]
         let mut cq_owned = None;
 
-        let cq_guard = if PROCESS_COMPLETIONS_ON_SUBMIT {
+        let cq_guard = if *PROCESS_COMPLETIONS_ON_SUBMIT {
             let cq = Arc::clone(&submit_side.completion_side);
             cq_owned = Some(cq);
             Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
