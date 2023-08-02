@@ -26,7 +26,7 @@ impl Engine for EngineStd {
         std::thread::scope(|scope| {
             assert_eq!(works.len(), args.num_clients.get() as usize);
             let mut jhs = Vec::with_capacity(args.num_clients.get() as usize);
-            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
+            for (i, work) in (0..args.num_clients.get()).zip(works) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let myself = Arc::clone(&myself);

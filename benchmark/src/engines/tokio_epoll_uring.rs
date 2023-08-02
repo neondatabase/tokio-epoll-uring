@@ -46,7 +46,7 @@ impl Engine for EngineTokioEpollUring {
 
         rt.block_on(async move {
             let mut handles = Vec::new();
-            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
+            for (i, work) in (0..args.num_clients.get()).zip(works) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let clients_ready = Arc::clone(&clients_ready);

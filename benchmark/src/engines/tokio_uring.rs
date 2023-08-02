@@ -33,7 +33,7 @@ impl Engine for EngineTokioUring {
             assert_eq!(works.len(), args.num_clients.get() as usize);
             let all_client_tasks_spawned =
                 Arc::new(tokio::sync::Barrier::new(args.num_clients.get() as usize));
-            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
+            for (i, work) in (0..args.num_clients.get()).zip(works) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let all_client_tasks_spawned = Arc::clone(&all_client_tasks_spawned);
