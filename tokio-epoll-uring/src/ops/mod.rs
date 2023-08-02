@@ -27,7 +27,7 @@ type BoxedOpFuture<O: Op> = Pin<
 /// The io_uring operations supported by this crate.
 ///
 /// Use directly on any of the "Implementors" (see below)
-/// or inside the closure passed to [`crate::with_thread_local_system`].
+/// or inside the closure passed to [`crate::thread_local_system`].
 // FIXME: why does this exist?
 pub trait Ops {
     /// See <https://man.archlinux.org/man/extra/liburing/io_uring_prep_nop.3.en>.

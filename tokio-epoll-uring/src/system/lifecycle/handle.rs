@@ -20,7 +20,7 @@ use super::ShutdownRequest;
 /// Alternatively, `drop` will also request shutdown, but not wait for completion of shutdown.
 ///
 /// This handle is [`Send`] but not [`Clone`].
-/// While it's possible to wrap it in an `Arc<Mutex<_>>`, you probably want to look into [`crate::with_thread_local_system`] instead.
+/// While it's possible to wrap it in an `Arc<Mutex<_>>`, you probably want to look into [`crate::thread_local_system`] instead.
 pub struct SystemHandle {
     inner: Option<SystemHandleInner>,
 }
