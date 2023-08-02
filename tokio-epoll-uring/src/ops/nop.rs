@@ -13,9 +13,7 @@ impl Op for Nop {
         io_uring::opcode::Nop::new().build()
     }
 
-    fn on_failed_submission(self) -> Self::Resources {
-        ()
-    }
+    fn on_failed_submission(self) -> Self::Resources {}
 
     fn on_op_completion(self, res: i32) -> (Self::Resources, Result<Self::Success, Self::Error>) {
         // https://man.archlinux.org/man/io_uring_prep_read.3.en

@@ -71,12 +71,12 @@ impl Engine for EngineTokioEpollUring {
                 let stop_clients = Arc::clone(&stop);
                 let stop_stopped_task_status_task = Arc::clone(&stop_stopped_task_status_task);
                 async move {
-                    'outer: while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
+                    while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
                         // don't print until `stop` is set
-                        while !stop_clients.load(Ordering::Relaxed) {
+                        if !stop_clients.load(Ordering::Relaxed) {
                             tokio::time::sleep(Duration::from_millis(1000)).await;
                             debug!("waiting for clients to stop");
-                            continue 'outer;
+                            continue;
                         }
                         // log list of not-stopped clients every second
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -88,7 +88,7 @@ impl Engine for EngineTokioEpollUring {
                         let not_stopped = stopped_handles
                             .iter()
                             .enumerate()
-                            .filter(|(_, state)| state.load(Ordering::Relaxed) == false)
+                            .filter(|(_, stopped)| !stopped.load(Ordering::Relaxed))
                             .map(|(i, _)| i)
                             .collect::<Vec<usize>>();
                         let total = stopped_handles.len();

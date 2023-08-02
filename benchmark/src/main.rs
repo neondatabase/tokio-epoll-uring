@@ -53,39 +53,30 @@ impl FromStr for RunDuration {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parse_iops_spec = |input: &str| {
+            let kilo = input.strip_suffix('k').map(|x| (x, 1));
+            let mega = input.strip_suffix('m').map(|x| (x, 2));
+            let giga = input.strip_suffix('g').map(|x| (x, 3));
+            let (stripped, exponent) = kilo
+                .or(mega)
+                .or(giga)
+                .ok_or_else(|| format!("invalid io count: {s:?}"))?;
+            match stripped.parse::<NonZeroU64>() {
+                Ok(n) => Ok(n.get() * 1000u64.pow(exponent)),
+                Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
+            }
+        };
         match s {
             "until-ctrl-c" => Ok(RunDuration::UntilCtrlC),
-            x if x.ends_with("ios-total") => {
-                let stripped = &s[..s.len() - "ios-total".len()];
-                let (stripped, multiplier) = if stripped.ends_with("k-") {
-                    (&stripped[..stripped.len() - 2], 1000)
-                } else if stripped.ends_with("m-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000)
-                } else if stripped.ends_with("g-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000 * 1000)
-                } else {
-                    (stripped, 1)
-                };
-                match stripped.parse::<NonZeroU64>() {
-                    Ok(n) => Ok(RunDuration::FixedTotalIoCount(n.get() * multiplier)),
-                    Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
-                }
+            x if x.ends_with("-ios-total") => {
+                let stripped = &s[..s.len() - "-ios-total".len()];
+                let parsed = parse_iops_spec(stripped)?;
+                Ok(RunDuration::FixedTotalIoCount(parsed))
             }
-            x if x.ends_with("ios-per-client") => {
-                let stripped = &s[..s.len() - "ios-per-client".len()];
-                let (stripped, multiplier) = if stripped.ends_with("k-") {
-                    (&stripped[..stripped.len() - 2], 1000)
-                } else if stripped.ends_with("m-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000)
-                } else if stripped.ends_with("g-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000 * 1000)
-                } else {
-                    (stripped, 1)
-                };
-                match stripped.parse::<NonZeroU64>() {
-                    Ok(n) => Ok(RunDuration::FixedPerClientIoCount(n.get() * multiplier)),
-                    Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
-                }
+            x if x.ends_with("-ios-per-client") => {
+                let stripped = &s[..s.len() - "-ios-per-client".len()];
+                let parsed = parse_iops_spec(stripped)?;
+                Ok(RunDuration::FixedPerClientIoCount(parsed))
             }
             x => match humantime::parse_duration(x) {
                 Ok(d) => Ok(RunDuration::FixedDuration(d)),
@@ -221,16 +212,14 @@ fn main() {
 
     let works = setup_client_works(&args);
 
-    let engine = setup_engine(&args.work_kind.engine());
+    let engine = setup_engine(args.work_kind.engine());
 
     let stats_state = Arc::new(StatsState {
         disabled: args.disable_stats,
         reads_in_last_second: (0..works.len())
-            .into_iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
             .collect(),
         latencies_histo: (0..works.len())
-            .into_iter()
             .map(|_| CachePadded::new(Mutex::new(StatsState::make_latency_histogram())))
             .collect(),
     });
@@ -544,7 +533,7 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
             disk_access_kind,
             validate,
         } => {
-            setup_files(&args, disk_access_kind);
+            setup_files(args, disk_access_kind);
             // assert invariant and open files
             let mut client_files = Vec::new();
             for i in 0..args.num_clients.get() {
@@ -609,7 +598,7 @@ fn alloc_self_aligned_buffer(size: usize) -> *mut u8 {
 
 fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
     let data_dir = data_dir(args);
-    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(data_dir).unwrap();
     std::thread::scope(|scope| {
         for i in 0..args.num_clients.get() {
             let file_path = data_file_path(args, i);
@@ -645,7 +634,7 @@ fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
                 let chunk = unsafe { std::slice::from_raw_parts_mut(chunk, 1 << 20) };
                 for _ in 0..append_megs {
                     rand::thread_rng().fill_bytes(chunk);
-                    file.write_all(&chunk).unwrap();
+                    file.write_all(chunk).unwrap();
                 }
             });
         }
