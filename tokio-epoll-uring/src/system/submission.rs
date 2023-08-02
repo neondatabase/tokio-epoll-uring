@@ -33,16 +33,13 @@ impl SubmitSide {
             completion_side,
         } = args;
         SubmitSide {
-            inner: Arc::new_cyclic(|myself| {
-                Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
-                    id,
-                    submitter,
-                    sq,
-                    slots: ops,
-                    completion_side: Arc::clone(&completion_side),
-                    myself: SubmitSideWeak(Weak::clone(myself)),
-                }))
-            }),
+            inner: Arc::new(Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
+                id,
+                submitter,
+                sq,
+                slots: ops,
+                completion_side: Arc::clone(&completion_side),
+            }))),
         }
     }
 }
@@ -68,9 +65,6 @@ impl SubmitSideOpen {
 pub struct SubmitSideWeak(Weak<Mutex<SubmitSideInner>>);
 
 impl SubmitSideWeak {
-    pub(crate) fn clone(&self) -> Self {
-        SubmitSideWeak(Weak::clone(&self.0))
-    }
     pub(crate) fn with_submit_side_open<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<&mut SubmitSideOpen>) -> R,
@@ -126,7 +120,6 @@ pub(crate) struct SubmitSideOpen {
     sq: SubmissionQueue<'static>,
     slots: Slots<CoOwnerSubmitSide>,
     completion_side: Arc<Mutex<CompletionSide>>,
-    myself: SubmitSideWeak,
 }
 
 impl SubmitSide {
