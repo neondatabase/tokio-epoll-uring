@@ -27,9 +27,9 @@ async fn main() {
             let read = res.unwrap();
             assert_eq!(read, 2048, "not expecting short read");
             assert_eq!(&buf[0..512], &[23u8; 512]);
-            assert_eq!(&buf[512..512 + 1024], &[42u8; 1024]);
-            assert_eq!(&buf[512 + 1024..512 + 1024 + 512], &[67u8; 512]);
-        }));
+            assert_eq!(&buf[512..][..1024], &[42u8; 1024]);
+            assert_eq!(&buf[512 + 1024..][..512], &[67u8; 512]);
+        });
     }
 
     for jh in jhs {
