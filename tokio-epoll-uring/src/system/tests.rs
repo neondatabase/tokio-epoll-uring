@@ -47,7 +47,7 @@ async fn op_state_pending_but_future_dropped() {
             tokio::select! {
                 _ = &mut read_fut => { unreachable!("we don't write to the pipe") }
                 _ = stop_polling_read_fut.cancelled() => {
-                    read_fut.await
+                    read_fut
                 }
             }
         }
