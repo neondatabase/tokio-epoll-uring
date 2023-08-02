@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use crate::{system::submission::op_fut::Op, System, SystemHandle};
+use crate::{
+    system::submission::op_fut::{Error as OpError, Op},
+    System, SystemHandle,
+};
 
 thread_local! {
     static THREAD_LOCAL: std::sync::Arc<tokio::sync::OnceCell<SystemHandle>> = Arc::new(tokio::sync::OnceCell::const_new());
@@ -25,10 +28,13 @@ thread_local! {
 /// };
 /// ```
 ///
-pub async fn with_thread_local_system<F, O>(make_op: F) -> <OpFut<O> as std::future::Future>::Output
+pub async fn with_thread_local_system<F, Fut, O>(
+    make_op: F,
+) -> (O::Resources, Result<O::Success, OpError<O::Error>>)
 where
     O: Op + Unpin + Send,
-    F: Send + 'static + FnOnce(&'_ SystemHandle) -> OpFut<O>,
+    F: Send + 'static + FnOnce(&'_ SystemHandle) -> Fut,
+    Fut: std::future::Future<Output = (O::Resources, Result<O::Success, OpError<O::Error>>)>,
 {
     let arc = THREAD_LOCAL.with(|arc| arc.clone());
 
