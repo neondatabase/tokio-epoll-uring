@@ -114,9 +114,7 @@ impl EngineTokioSpawnBlocking {
             struct SendPtr(*mut u8);
             unsafe impl Send for SendPtr {} // the thread spawned in the loop below doesn't outlive this function (we're polled t completion)
             unsafe impl Sync for SendPtr {} // the loop below ensures only one thread accesses it at a time
-            let buf = SendPtr(buf_ptr);
-            // extra scope so that it doesn't outlive any await points, it's not Send, only the SendPtr wrapper is
-            buf
+            SendPtr(buf_ptr)
         };
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {

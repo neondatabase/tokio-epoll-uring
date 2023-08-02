@@ -39,7 +39,7 @@ impl SubmitSide {
                     sq,
                     slots: ops,
                     completion_side: Arc::clone(&completion_side),
-                    myself: SubmitSideWeak(Weak::clone(&myself)),
+                    myself: SubmitSideWeak(Weak::clone(myself)),
                 }))
             }),
         }
