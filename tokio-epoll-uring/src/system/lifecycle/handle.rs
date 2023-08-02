@@ -1,13 +1,13 @@
 //! Owned handle to an explicitly [`System::launch`]ed system.
 
-use std::os::fd::OwnedFd;
-
+use futures::FutureExt;
+use std::task::ready;
+use std::{os::fd::OwnedFd, pin::Pin};
 use tokio_uring::buf::IoBufMut;
 
 use crate::{
     ops::read::ReadOp,
-    system::submission::{op_fut::OpFut, SubmitSide},
-    Ops,
+    system::submission::{op_fut::execute_op, SubmitSide},
 };
 
 use super::ShutdownRequest;
@@ -100,13 +100,9 @@ impl std::future::Future for WaitShutdownFut {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let done_rx = &mut self.done_rx;
-        let done_rx = std::pin::Pin::new(done_rx);
-        match done_rx.poll(cx) {
-            std::task::Poll::Ready(res) => match res {
-                Ok(()) => std::task::Poll::Ready(()),
-                Err(_) => panic!("implementation error: poller must not die before SystemHandle"),
-            },
-            std::task::Poll::Pending => std::task::Poll::Pending,
+        match ready!(done_rx.poll_unpin(cx)) {
+            Ok(()) => std::task::Poll::Ready(()),
+            Err(_) => panic!("implementation error: poller must not die before SystemHandle"),
         }
     }
 }
@@ -131,15 +127,71 @@ impl SystemHandleInner {
     }
 }
 
-impl Ops for crate::SystemHandle {
-    fn nop(&self) -> OpFut<crate::ops::nop::Nop> {
+impl crate::SystemHandle {
+    pub fn nop(
+        &self,
+    ) -> impl std::future::Future<
+        Output = (
+            (),
+            Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+        ),
+    > {
         let op = crate::ops::nop::Nop {};
         let inner = self.inner.as_ref().unwrap();
-        OpFut::new(op, inner.submit_side.weak())
+        execute_op(op, inner.submit_side.weak())
     }
-    fn read<B: IoBufMut + Send>(&self, file: OwnedFd, offset: u64, buf: B) -> OpFut<ReadOp<B>> {
+    pub fn read<B: IoBufMut + Send>(
+        &self,
+        file: OwnedFd,
+        offset: u64,
+        buf: B,
+    ) -> impl std::future::Future<
+        Output = (
+            (OwnedFd, B),
+            Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
+        ),
+    > {
         let op = ReadOp { file, offset, buf };
         let inner = self.inner.as_ref().unwrap();
-        OpFut::new(op, inner.submit_side.weak())
+        execute_op(op, inner.submit_side.weak())
+    }
+}
+
+impl crate::Ops for crate::SystemHandle {
+    fn nop(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = (
+                        (),
+                        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+                    ),
+                >
+                + 'static
+                + Send,
+        >,
+    > {
+        self.nop().boxed()
+    }
+
+    fn read<B: IoBufMut + Send>(
+        &self,
+        file: OwnedFd,
+        offset: u64,
+        buf: B,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = (
+                        (OwnedFd, B),
+                        Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
+                    ),
+                >
+                + 'static
+                + Send,
+        >,
+    > {
+        self.read(file, offset, buf).boxed()
     }
 }

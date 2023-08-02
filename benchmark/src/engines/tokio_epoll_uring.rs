@@ -12,7 +12,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio_epoll_uring::Ops;
 use tracing::{debug, info};
 
 use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
@@ -195,11 +194,11 @@ impl EngineTokioEpollUring {
                     // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
                     //  affine to a completion queue somehow... The design space is big.)
 
+                    let handle = tokio_epoll_uring::thread_local_system().await;
+
                     let ((file, owned_buf), res) =
-                        tokio_epoll_uring::with_thread_local_system(move |system| {
-                            system.read(file, offset_in_file, owned_buf)
-                        })
-                        .await;
+                        handle.read(file, offset_in_file, owned_buf).await;
+
                     let count = res.unwrap();
                     assert_eq!(count, owned_buf.len());
                     assert_eq!(count, block_size);

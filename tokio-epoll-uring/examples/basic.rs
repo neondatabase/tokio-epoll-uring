@@ -1,7 +1,5 @@
 use std::os::fd::OwnedFd;
 
-use tokio_epoll_uring::Ops;
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
