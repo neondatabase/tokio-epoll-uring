@@ -3,7 +3,7 @@
 //! # Usage
 //!
 //! 1. Launch a [`System`] to get a [`SystemHandle`].
-//! 2. On the handle, call the [`Ops`] method that corresponds to the desired io_uring operation.
+//! 2. On the handle, call method that corresponds to the desired io_uring operation.
 //!    The method/returned future will *own* resources such as buffers and file descriptors
 //!    until the operation completes.
 //! 4. Await the future returned by the invocation.
@@ -20,11 +20,8 @@
 //! ```rust
 //! #[tokio::main]
 //! async fn main() {
-//!   use tokio_epoll_uring::Ops;
-//!   use tokio_epoll_uring::System;
-//!
 //!   // Launch the uring system.
-//!   let system = System::launch().await;
+//!   let system = tokio_epoll_uring::System::launch().await;
 //!
 //!   let file = std::fs::File::open("/dev/zero").unwrap();
 //!   let fd: std::os::fd::OwnedFd = file.into();
@@ -75,7 +72,6 @@ pub(crate) mod sealed {
 pub mod doc;
 
 pub mod ops;
-pub use ops::Ops;
 
 mod system;
 

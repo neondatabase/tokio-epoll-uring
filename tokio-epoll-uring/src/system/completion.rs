@@ -490,13 +490,10 @@ mod tests {
 
     use tracing::info;
 
-    use crate::{
-        system::{
-            completion::{PollerState, PollerTesting},
-            lifecycle::System,
-            test_util::shared_system_handle::SharedSystemHandle,
-        },
-        Ops,
+    use crate::system::{
+        completion::{PollerState, PollerTesting},
+        lifecycle::System,
+        test_util::shared_system_handle::SharedSystemHandle,
     };
 
     #[test]
