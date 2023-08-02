@@ -221,16 +221,14 @@ fn main() {
 
     let works = setup_client_works(&args);
 
-    let engine = setup_engine(&args.work_kind.engine());
+    let engine = setup_engine(args.work_kind.engine());
 
     let stats_state = Arc::new(StatsState {
         disabled: args.disable_stats,
         reads_in_last_second: (0..works.len())
-            .into_iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
             .collect(),
         latencies_histo: (0..works.len())
-            .into_iter()
             .map(|_| CachePadded::new(Mutex::new(StatsState::make_latency_histogram())))
             .collect(),
     });
@@ -544,7 +542,7 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
             disk_access_kind,
             validate,
         } => {
-            setup_files(&args, disk_access_kind);
+            setup_files(args, disk_access_kind);
             // assert invariant and open files
             let mut client_files = Vec::new();
             for i in 0..args.num_clients.get() {
@@ -609,7 +607,7 @@ fn alloc_self_aligned_buffer(size: usize) -> *mut u8 {
 
 fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
     let data_dir = data_dir(args);
-    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(data_dir).unwrap();
     std::thread::scope(|scope| {
         for i in 0..args.num_clients.get() {
             let file_path = data_file_path(args, i);
@@ -645,7 +643,7 @@ fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
                 let chunk = unsafe { std::slice::from_raw_parts_mut(chunk, 1 << 20) };
                 for _ in 0..append_megs {
                     rand::thread_rng().fill_bytes(chunk);
-                    file.write_all(&chunk).unwrap();
+                    file.write_all(chunk).unwrap();
                 }
             });
         }

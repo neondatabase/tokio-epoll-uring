@@ -14,7 +14,7 @@ impl Op for Nop {
     }
 
     fn on_failed_submission(self) -> Self::Resources {
-        ()
+        
     }
 
     fn on_op_completion(self, res: i32) -> (Self::Resources, Result<Self::Success, Self::Error>) {

@@ -108,7 +108,7 @@ impl std::future::Future for Launch {
                     let (ops_submit_side, ops_completion_side, ops_poller) = super::slots::new(id);
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
-                    let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
+                    let (submitter, sq, cq) = unsafe { (*uring).split() };
 
                     let completion_side =
                         Arc::new(Mutex::new(CompletionSide::new(id, cq, ops_completion_side)));

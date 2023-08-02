@@ -98,7 +98,7 @@ impl Poller {
             .await
             // TODO make launch fallible and propagate this error
             .expect("poller task must not die during startup");
-        return shutdown_tx;
+        shutdown_tx
     }
 }
 
@@ -356,7 +356,7 @@ async fn poller_impl(
     // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
     // (See comment on `yield_now().await` above why cancellation is safe earlier.)
     // Use a closure to enforce it.
-    (move || {
+    {
         let mut poller_guard = poller.lock().unwrap();
         let cur = std::mem::replace(
             &mut poller_guard.state,
@@ -400,7 +400,7 @@ async fn poller_impl(
         };
         poller.lock().unwrap().state = PollerState::ShutDown;
         tracing::info!("poller finished shutdown");
-    })()
+    }
 }
 
 async fn poller_impl_impl(
@@ -596,7 +596,7 @@ mod tests {
         });
 
         let ((_, _), res) = second_rt.block_on(read_fut);
-        let err = res.err().expect("when poller signals shutdown_done, it has dropped the Ops Arc; read_fut only holds a Weak to it and will fail to upgrade");
+        let err = res.expect_err("when poller signals shutdown_done, it has dropped the Ops Arc; read_fut only holds a Weak to it and will fail to upgrade");
         assert_eq!(
             format!("{:#}", err),
             "tokio-epoll-uring: system is shut down"

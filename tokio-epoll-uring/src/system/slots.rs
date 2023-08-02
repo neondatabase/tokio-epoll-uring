@@ -137,7 +137,7 @@ impl SlotsWeak {
         match Weak::upgrade(&self.inner_weak) {
             Some(inner_strong) => {
                 let mut inner_guard = inner_strong.lock().unwrap();
-                Ok(f(&mut *inner_guard))
+                Ok(f(&mut inner_guard))
             }
             None => Err(()),
         }
@@ -270,7 +270,7 @@ impl SlotsInner {
                 *slot = Slot::Ready {
                     result: cqe.result(),
                 };
-                self.return_slot(idx as usize);
+                self.return_slot(idx);
             }
             Slot::Ready { .. } => {
                 unreachable!(
@@ -322,7 +322,7 @@ impl Slots<CoOwnerCompletionSide> {
             SlotsInner::Draining(draining) => {
                 let pending_count = ring_size - draining.slots_owned_by_user_space().count();
                 *inner_guard = SlotsInner::Draining(draining);
-                return pending_count;
+                pending_count
             }
         }
     }
@@ -545,19 +545,19 @@ impl<O: Op + Send + Unpin> std::future::Future for InflightHandle<O> {
                 }
                 self.state = InflightHandleState::DoneAndPolled;
                 let (resources, res) = rsrc.on_op_completion(res);
-                return std::task::Poll::Ready((
+                std::task::Poll::Ready((
                     resources,
                     res.map_err(InflightHandleError::Completion),
-                ));
+                ))
             }
             InflightHandleState::DoneButYieldingToExecutorForFairness { result } => {
                 self.state = InflightHandleState::DoneAndPolled;
                 let rsrc = self.resources_owned_by_kernel.take().unwrap();
                 let (resources, res) = rsrc.on_op_completion(result);
-                return std::task::Poll::Ready((
+                std::task::Poll::Ready((
                     resources,
                     res.map_err(InflightHandleError::Completion),
-                ));
+                ))
             }
         }
     }
@@ -592,7 +592,7 @@ impl SlotHandle {
                     *slot_mut = Slot::Pending {
                         waker: Some(cx.waker().clone()),
                     };
-                    return InflightSlotPollResult::Pending(self);
+                    InflightSlotPollResult::Pending(self)
                 }
                 Slot::PendingButFutureDropped { .. } => {
                     unreachable!("if it's dropped, it's not pollable")
@@ -601,13 +601,13 @@ impl SlotHandle {
                     trace!("op is ready, returning resources to user");
                     *slot_mut = Slot::Ready { result: res };
                     inner.return_slot(self.idx);
-                    return InflightSlotPollResult::Ready(res);
+                    InflightSlotPollResult::Ready(res)
                 }
             }
         });
         match res {
             Err(()) => {
-                return InflightSlotPollResult::ShutDown;
+                InflightSlotPollResult::ShutDown
             }
             Ok(res) => res,
         }
@@ -687,7 +687,6 @@ where
                             let resources_owned_by_kernel = self.resources_owned_by_kernel.take();
                             drop(resources_owned_by_kernel);
                         }
-                        return;
                     }
                 }
             }

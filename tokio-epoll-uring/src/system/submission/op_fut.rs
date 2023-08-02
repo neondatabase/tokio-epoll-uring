@@ -135,7 +135,7 @@ where
                 Some(submit_side_open) => {
                     match submit_side_open.slots.try_get_slot() {
                         TryGetSlotResult::Draining => {
-                            return Self::new_err(make_op, OpError::SystemShuttingDown);
+                            Self::new_err(make_op, OpError::SystemShuttingDown)
                         }
                         TryGetSlotResult::GotSlot(unsafe_slot) => {
                             let fut = match finish_submit(make_op, unsafe_slot, submit_side_open) {
@@ -144,9 +144,9 @@ where
                                     return Self::new_err(make_op, err);
                                 }
                             };
-                            return OpFut {
+                            OpFut {
                                 state: OpFutState::Submitted(fut),
-                            };
+                            }
                         }
                         TryGetSlotResult::NoSlots(waiter) => {
                             // All slots are taken and we're waiting in line.
@@ -171,13 +171,13 @@ where
                                     .unwrap()
                                     .process_completions(ProcessCompletionsCause::Regular);
                             }
-                            return OpFut {
+                            OpFut {
                                 state: OpFutState::WaitForSlot {
                                     submit_side_weak: submit_side_open.myself.clone(),
                                     waiter,
                                     make_op,
                                 },
-                            };
+                            }
                         }
                     }
                 },
@@ -250,25 +250,25 @@ where
                                         match finish_submit(op, unsafe_slot, submit_side_open) {
                                             Ok(fut) => {
                                                 myself.state = OpFutState::Submitted(fut);
-                                                return ControlFlow::Continue(());
+                                                ControlFlow::Continue(())
                                             }
                                             Err((op, err)) => {
                                                 myself.state = OpFutState::ReadyPolled;
-                                                return ControlFlow::Break(std::task::Poll::Ready(
+                                                ControlFlow::Break(std::task::Poll::Ready(
                                                     (
                                                         op.on_failed_submission(),
                                                         Err(Error::System(err)),
                                                     ),
-                                                ));
+                                                ))
                                             }
                                         }
                                     }
                                     None => {
                                         myself.state = OpFutState::ReadyPolled;
-                                        return ControlFlow::Break(std::task::Poll::Ready((
+                                        ControlFlow::Break(std::task::Poll::Ready((
                                             op.on_failed_submission(),
                                             Err(Error::System(OpError::SystemIsShutDown)),
-                                        )));
+                                        )))
                                     }
                                 }
                             });

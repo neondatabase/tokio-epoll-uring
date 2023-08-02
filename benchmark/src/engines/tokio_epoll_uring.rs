@@ -88,7 +88,7 @@ impl Engine for EngineTokioEpollUring {
                         let not_stopped = stopped_handles
                             .iter()
                             .enumerate()
-                            .filter(|(_, state)| state.load(Ordering::Relaxed) == false)
+                            .filter(|(_, state)| !state.load(Ordering::Relaxed))
                             .map(|(i, _)| i)
                             .collect::<Vec<usize>>();
                         let total = stopped_handles.len();
