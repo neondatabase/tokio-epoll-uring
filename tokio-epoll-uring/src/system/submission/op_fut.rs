@@ -250,25 +250,23 @@ where
                                         match finish_submit(op, unsafe_slot, submit_side_open) {
                                             Ok(fut) => {
                                                 myself.state = OpFutState::Submitted(fut);
-                                                return ControlFlow::Continue(());
+                                                ControlFlow::Continue(())
                                             }
                                             Err((op, err)) => {
                                                 myself.state = OpFutState::ReadyPolled;
-                                                return ControlFlow::Break(std::task::Poll::Ready(
-                                                    (
-                                                        op.on_failed_submission(),
-                                                        Err(Error::System(err)),
-                                                    ),
-                                                ));
+                                                ControlFlow::Break(std::task::Poll::Ready((
+                                                    op.on_failed_submission(),
+                                                    Err(Error::System(err)),
+                                                )))
                                             }
                                         }
                                     }
                                     None => {
                                         myself.state = OpFutState::ReadyPolled;
-                                        return ControlFlow::Break(std::task::Poll::Ready((
+                                        ControlFlow::Break(std::task::Poll::Ready((
                                             op.on_failed_submission(),
                                             Err(Error::System(OpError::SystemIsShutDown)),
-                                        )));
+                                        )))
                                     }
                                 }
                             });

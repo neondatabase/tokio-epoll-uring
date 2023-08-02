@@ -35,7 +35,9 @@ struct SystemHandleInner {
 impl Drop for SystemHandle {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            let _ = inner.shutdown(); // we don't care about the result
+            let wait_shutdown_done = inner.shutdown();
+            // we don't care about the result
+            drop(wait_shutdown_done);
         }
     }
 }

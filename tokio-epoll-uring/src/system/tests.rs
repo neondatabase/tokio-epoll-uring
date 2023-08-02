@@ -43,6 +43,7 @@ async fn op_state_pending_but_future_dropped() {
     let stop_polling_read_fut = CancellationToken::new();
     let jh = tokio::spawn({
         let stop_polling_read_fut = stop_polling_read_fut.clone();
+        #[allow(clippy::async_yields_async)]
         async move {
             tokio::select! {
                 _ = &mut read_fut => { unreachable!("we don't write to the pipe") }

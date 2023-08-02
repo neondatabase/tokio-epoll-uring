@@ -108,7 +108,7 @@ impl std::future::Future for Launch {
                     let (ops_submit_side, ops_completion_side, ops_poller) = super::slots::new(id);
                     let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
                     let uring_fd = unsafe { (*uring).as_raw_fd() };
-                    let (submitter, sq, cq) = unsafe { (&mut *uring).split() };
+                    let (submitter, sq, cq) = unsafe { (*uring).split() };
 
                     let completion_side =
                         Arc::new(Mutex::new(CompletionSide::new(id, cq, ops_completion_side)));
@@ -213,11 +213,17 @@ pub(crate) fn poller_impl_finish_shutdown(
         // drop our Arc.
         ops.shutdown_assertions();
     }
-    // final assertions done, do the unsplitting
-    drop(cq);
-    drop(sq);
-    drop(submitter);
-    let uring = unsafe { Box::from_raw(split_uring) };
+    // final assertions done, do the unsplitting.
+    // There's no special meaning to these `drop`s here, it's just nice to see
+    // and drop them all in one place, right before get back the IoUring struct
+    // that they referenced.
+    #[allow(clippy::drop_non_drop)]
+    {
+        drop(cq);
+        drop(sq);
+        drop(submitter);
+    }
+    let uring: Box<io_uring::IoUring> = unsafe { Box::from_raw(split_uring) };
 
     // Drop the IoUring struct, cleaning up the underlying kernel resources.
     drop(uring);
