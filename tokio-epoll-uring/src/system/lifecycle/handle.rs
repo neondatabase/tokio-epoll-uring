@@ -1,4 +1,4 @@
-//! Owned handle to an explicitly [`System::launch`]ed system.
+//! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
 use futures::FutureExt;
 use std::task::ready;

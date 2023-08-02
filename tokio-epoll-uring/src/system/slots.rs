@@ -6,12 +6,12 @@
 //!
 //! # Usage
 //!
-//! The consumer of this module is [`crate::ops::OpFut::new`].
+//! The consumer of this module is [`crate::system::submission::op_fut::execute_op`].
 //! The role that this module plays in the op submission process:
 //!
 //! 1. Consumer gets a handle to a slot using [`Slots::try_get_slot`].
 //! 2. Consumer uses the slot, getting back an [`InflightHandle`].
-//! 3. Consumer submits the io_uring op to the [`SubmissionSide`].
+//! 3. Consumer submits the io_uring op to the [`SubmitSide`](crate::system::submission::SubmitSide).
 //! 4. Consumer `await`s the the [`InflightHandle`].
 //!
 //! The [`InflightHandle`] future that enforces correct
