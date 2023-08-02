@@ -62,8 +62,6 @@ where
         }
     };
 
-    const PROCESS_COMPLETIONS_ON_SUBMIT: bool = false;
-
     let inflight = submit_side.with_submit_side_open(|submit_side| {
 
         let submit_side = match submit_side {
@@ -90,7 +88,7 @@ where
         #[allow(unused_assignments)]
         let mut cq_owned = None;
 
-        let cq_guard = if PROCESS_COMPLETIONS_ON_SUBMIT {
+        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
             let cq = Arc::clone(&submit_side.completion_side);
             cq_owned = Some(cq);
             Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())

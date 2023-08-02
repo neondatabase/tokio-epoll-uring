@@ -196,6 +196,8 @@ struct EngineRunResult {
 const MONITOR_PERIOD: Duration = Duration::from_secs(1);
 
 fn main() {
+    tokio_epoll_uring::env_tunables::assert_no_unknown_env_vars();
+
     tracing_subscriber::fmt()
         .with_file(true)
         .with_line_number(true)

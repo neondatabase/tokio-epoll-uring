@@ -86,4 +86,53 @@ pub use system::submission::op_fut::Error as SystemError;
 
 pub(crate) mod util;
 
-// pub mod shared_system_handle;
+#[doc(hidden)]
+pub mod env_tunables {
+    pub(crate) static YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| {
+            std::env::var("EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL")
+            .map(|v| v == "1")
+            .unwrap_or_else(|e| match e {
+                std::env::VarError::NotPresent => true, // default-on
+                std::env::VarError::NotUnicode(_) => panic!("EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL must be a unicode string"),
+            })
+        });
+    pub(crate) static PROCESS_COMPLETIONS_ON_QUEUE_FULL: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| {
+            std::env::var("EPOLL_URING_PROCESS_COMPLETIONS_ON_QUEUE_FULL")
+                .map(|v| v == "1")
+                .unwrap_or_else(|e| match e {
+                    std::env::VarError::NotPresent => true, // default-on
+                    std::env::VarError::NotUnicode(_) => panic!(
+                        "EPOLL_URING_PROCESS_COMPLETIONS_ON_QUEUE_FULL must be a unicode string"
+                    ),
+                })
+        });
+    pub(crate) static PROCESS_COMPLETIONS_ON_SUBMIT: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| {
+            std::env::var("EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT")
+                .map(|v| v == "1")
+                .unwrap_or_else(|e| match e {
+                    std::env::VarError::NotPresent => true, // default-on
+                    std::env::VarError::NotUnicode(_) => {
+                        panic!("EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT must be a unicode string")
+                    }
+                })
+        });
+    pub fn assert_no_unknown_env_vars() {
+        std::env::vars()
+            .filter_map(|(v, _)| {
+                if v.starts_with("EPOLL_URING_") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .for_each(|v| match v.as_str() {
+                "EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL"
+                | "EPOLL_URING_PROCESS_COMPLETIONS_ON_QUEUE_FULL"
+                | "EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT" => {}
+                x => panic!("env var starts with EPOLL_URING but is not an env_tunable: {x:?}"),
+            });
+    }
+}
