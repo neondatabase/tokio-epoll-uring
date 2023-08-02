@@ -520,7 +520,7 @@ impl<O: Op + Send + Unpin> std::future::Future for InflightHandle<O> {
                         std::env::var("EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL")
                             .map(|v| v == "1")
                             .unwrap_or_else(|e| match e {
-                                std::env::VarError::NotPresent => false,
+                                std::env::VarError::NotPresent => true, // default-on
                                 std::env::VarError::NotUnicode(_) => panic!("EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL must be a unicode string"),
                             });
                 }

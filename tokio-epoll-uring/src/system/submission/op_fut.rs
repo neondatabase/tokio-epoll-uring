@@ -75,7 +75,7 @@ where
             std::env::var("EPOLL_URING_PROCESS_URING_ON_SUBMIT")
                 .map(|v| v == "1")
                 .unwrap_or_else(|e| match e {
-                    std::env::VarError::NotPresent => false,
+                    std::env::VarError::NotPresent => true, // default-on
                     std::env::VarError::NotUnicode(_) => panic!("EPOLL_URING_PROCESS_URING_ON_SUBMIT must be a unicode string"),
                 });
     }
@@ -158,7 +158,7 @@ where
                                     std::env::var("EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL")
                                         .map(|v| v == "1")
                                         .unwrap_or_else(|e| match e {
-                                            std::env::VarError::NotPresent => false,
+                                            std::env::VarError::NotPresent => true, // default-on
                                             std::env::VarError::NotUnicode(_) => panic!("EPOLL_URING_PROCESS_URING_ON_QUEUE_FULL must be a unicode string"),
                                         });
                             }
