@@ -21,9 +21,6 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         toolchain: [stable, beta]
-        exclude:
-          - os: macOS-latest
-            toolchain: beta
 
     runs-on: ${{ matrix.os }}
 
