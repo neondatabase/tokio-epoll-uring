@@ -77,7 +77,6 @@ pub(crate) mod sealed {
 pub mod doc;
 
 pub mod ops;
-pub use ops::Ops;
 
 mod system;
 

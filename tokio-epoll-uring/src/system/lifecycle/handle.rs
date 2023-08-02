@@ -1,8 +1,7 @@
 //! Owned handle to an explicitly [`System::launch`]ed system.
 
 use futures::FutureExt;
-use std::task::ready;
-use std::{os::fd::OwnedFd, pin::Pin};
+use std::{os::fd::OwnedFd, task::ready};
 use tokio_uring::buf::IoBufMut;
 
 use crate::{
@@ -154,44 +153,5 @@ impl crate::SystemHandle {
         let op = ReadOp { file, offset, buf };
         let inner = self.inner.as_ref().unwrap();
         execute_op(op, inner.submit_side.weak())
-    }
-}
-
-impl crate::Ops for crate::SystemHandle {
-    fn nop(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = (
-                        (),
-                        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
-                    ),
-                >
-                + 'static
-                + Send,
-        >,
-    > {
-        self.nop().boxed()
-    }
-
-    fn read<B: IoBufMut + Send>(
-        &self,
-        file: OwnedFd,
-        offset: u64,
-        buf: B,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = (
-                        (OwnedFd, B),
-                        Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
-                    ),
-                >
-                + 'static
-                + Send,
-        >,
-    > {
-        self.read(file, offset, buf).boxed()
     }
 }

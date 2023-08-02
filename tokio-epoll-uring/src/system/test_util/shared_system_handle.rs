@@ -1,9 +1,9 @@
 use std::sync::{Arc, RwLock};
 
-use futures::{Future, FutureExt};
+use futures::Future;
 
 use crate::SystemError;
-use crate::{Ops, System, SystemHandle};
+use crate::{System, SystemHandle};
 
 /// [`Clone`]-able wrapper around [`SystemHandle`] for sharing between threads / tokio tasks.
 ///
@@ -12,45 +12,6 @@ use crate::{Ops, System, SystemHandle};
 /// If they fail, we currently panic.
 #[derive(Clone)]
 pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
-
-impl Ops for SharedSystemHandle {
-    fn nop(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = (
-                        (),
-                        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
-                    ),
-                >
-                + 'static
-                + Send,
-        >,
-    > {
-        self.nop().boxed()
-    }
-
-    fn read<B: tokio_uring::buf::IoBufMut + Send>(
-        &self,
-        file: std::os::fd::OwnedFd,
-        offset: u64,
-        buf: B,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = (
-                        (std::os::fd::OwnedFd, B),
-                        Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
-                    ),
-                >
-                + 'static
-                + Send,
-        >,
-    > {
-        self.read(file, offset, buf).boxed()
-    }
-}
 
 #[cfg(test)]
 use crate::system::completion::PollerTesting;
@@ -81,16 +42,7 @@ impl SharedSystemHandle {
             .initiate_shutdown()
     }
 
-    fn nop(
-        &self,
-    ) -> impl std::future::Future<Output = ((), Result<(), SystemError<std::io::Error>>)> {
-        let guard = self.0.read().unwrap();
-        let guard = guard
-            .as_ref()
-            .expect("SharedSystemHandle is shut down, cannot submit new operations");
-        guard.nop()
-    }
-    fn read<B: tokio_uring::buf::IoBufMut + Send>(
+    pub fn read<B: tokio_uring::buf::IoBufMut + Send>(
         &self,
         file: std::os::fd::OwnedFd,
         offset: u64,
