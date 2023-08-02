@@ -14,6 +14,7 @@ pub mod read;
 ///
 /// Use directly on any of the "Implementors" (see below)
 /// or inside the closure passed to [`crate::with_thread_local_system`].
+// FIXME: why does this exist?
 pub trait Ops {
     /// See <https://man.archlinux.org/man/extra/liburing/io_uring_prep_nop.3.en>.
     fn nop(
