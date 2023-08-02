@@ -1,7 +1,8 @@
 //! Owned handle to an explicitly [`System::launch`]ed system.
 
+use futures::FutureExt;
 use std::os::fd::OwnedFd;
-
+use std::task::ready;
 use tokio_uring::buf::IoBufMut;
 
 use crate::{
@@ -100,13 +101,9 @@ impl std::future::Future for WaitShutdownFut {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let done_rx = &mut self.done_rx;
-        let done_rx = std::pin::Pin::new(done_rx);
-        match done_rx.poll(cx) {
-            std::task::Poll::Ready(res) => match res {
-                Ok(()) => std::task::Poll::Ready(()),
-                Err(_) => panic!("implementation error: poller must not die before SystemHandle"),
-            },
-            std::task::Poll::Pending => std::task::Poll::Pending,
+        match ready!(done_rx.poll_unpin(cx)) {
+            Ok(()) => std::task::Poll::Ready(()),
+            Err(_) => panic!("implementation error: poller must not die before SystemHandle"),
         }
     }
 }
