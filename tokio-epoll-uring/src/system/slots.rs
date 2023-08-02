@@ -1,5 +1,16 @@
 //! Structure to keep track of in-flight operations.
 //!
+//! [`Slots`] serves the following purposes:
+//!
+//! - Have a place to which we can transfer ownership of the resources (FD, buffer)
+//!   if the future gets dropped while op is still in flight.
+//! - Heep track of what ops are in flight so during system shutdown we know when we're done.
+//! - Limit queue depth & provide means for a task to wait until it's the task's turn.
+//!   The queue depth limit is currently hard-coded to [`crate::system::RING_SIZE`].
+//!   The wait-until-it's-our-turn is implemented by the `tokio::sync::oneshot` returned by
+//!   [`Slots::try_get_slot`].
+//!
+//!
 //! There is one [`Slots`] instance per [`crate::System`].
 //!
 //! An in-flight io_uring operation occupies a slot in a [`Slots`] instance.
@@ -34,6 +45,7 @@ pub(super) mod co_owner {
     pub const NUM_CO_OWNERS: usize = 3;
 }
 
+/// See module-level comment [`crate::system::slots`].
 pub(crate) struct Slots<const O: usize> {
     #[allow(dead_code)]
     id: usize,
