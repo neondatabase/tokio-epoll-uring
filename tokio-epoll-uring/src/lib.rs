@@ -40,7 +40,7 @@
 //! ## Example 2: Thread-Local System
 //!
 //! On a multi-core system, you'll want a separate [`System`] per executor thread to minimize the need for coordination during submission.
-//! The [`with_thread_local_system`] provides an out-of-the-box solution to lazily launch a [`System`] for the current executor thread.
+//! The [`thread_local_system`] provides an out-of-the-box solution to lazily launch a [`System`] for the current executor thread.
 //!
 //! ```rust
 //! #[tokio::main]
