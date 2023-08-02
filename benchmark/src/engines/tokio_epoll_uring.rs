@@ -12,7 +12,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio_epoll_uring::Ops;
 use tracing::{debug, info};
 
 use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
