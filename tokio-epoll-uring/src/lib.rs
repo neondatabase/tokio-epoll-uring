@@ -20,11 +20,8 @@
 //! ```rust
 //! #[tokio::main]
 //! async fn main() {
-//!   use tokio_epoll_uring::Ops;
-//!   use tokio_epoll_uring::System;
-//!
 //!   // Launch the uring system.
-//!   let system = System::launch().await;
+//!   let system = tokio_epoll_uring::System::launch().await;
 //!
 //!   let file = std::fs::File::open("/dev/zero").unwrap();
 //!   let fd: std::os::fd::OwnedFd = file.into();
