@@ -58,10 +58,8 @@
 //!     let file = std::fs::File::open("/dev/zero").unwrap();
 //!     let fd: std::os::fd::OwnedFd = file.into();
 //!     let buf = vec![1; 1024];
-//!     let ((_, _), res) = tokio_epoll_uring::with_thread_local_system(|system| {
-//!         use tokio_epoll_uring::Ops;
-//!         system.read(fd, 0, buf)
-//!     }).await;
+//!     let system = tokio_epoll_uring::thread_local_system().await;
+//!     let ((_, _), res) = system.read(fd, 0, buf).await;
 //!     println!("task {i} result: {res:?}");
 //! }
 //! ```
