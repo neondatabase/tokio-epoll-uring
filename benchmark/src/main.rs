@@ -73,7 +73,7 @@ impl FromStr for RunDuration {
             "until-ctrl-c" => Ok(RunDuration::UntilCtrlC),
             x if x.ends_with("ios-total") => {
                 let stripped = &s[..s.len() - "ios-total".len()];
-                parse_multiplied(s)
+                parse_multiplied(stripped)
             }
             x if x.ends_with("ios-per-client") => {
                 let stripped = &s[..s.len() - "ios-per-client".len()];
