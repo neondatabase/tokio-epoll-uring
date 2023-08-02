@@ -23,8 +23,6 @@ use super::SubmitSideWeak;
 pub enum OpError {
     #[error("shutting down")]
     SystemShuttingDown,
-    #[error("system is shut down")]
-    SystemIsShutDown,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -72,7 +70,7 @@ where
             Some(submit_side) => submit_side,
             None => return Err((
                     op.on_failed_submission(),
-                    Err(Error::System(OpError::SystemIsShutDown)),
+                    Err(Error::System(OpError::SystemShuttingDown)),
                 )),
         };
 
@@ -83,7 +81,7 @@ where
             Err((op, slots::UseError::SlotsDropped)) => {
                 return Err((
                     op.on_failed_submission(),
-                    Err(Error::System(OpError::SystemIsShutDown)),
+                    Err(Error::System(OpError::SystemShuttingDown)),
                 ));
             }
         };

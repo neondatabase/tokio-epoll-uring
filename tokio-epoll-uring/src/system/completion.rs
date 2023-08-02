@@ -598,9 +598,14 @@ mod tests {
 
         let ((_, _), res) = second_rt.block_on(read_fut);
         let err = res.expect_err("when poller signals shutdown_done, it has dropped the Ops Arc; read_fut only holds a Weak to it and will fail to upgrade");
-        assert_eq!(
-            format!("{:#}", err),
-            "tokio-epoll-uring: system is shut down"
+        assert!(
+            matches!(
+                err,
+                crate::SystemError::System(
+                    crate::system::submission::op_fut::OpError::SystemShuttingDown
+                )
+            ),
+            "{err:?}"
         );
     }
 
