@@ -73,7 +73,7 @@ impl Engine for EngineTokioEpollUring {
                 async move {
                     'outer: while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
                         // don't print until `stop` is set
-                        while !stop_clients.load(Ordering::Relaxed) {
+                        if !stop_clients.load(Ordering::Relaxed) {
                             tokio::time::sleep(Duration::from_millis(1000)).await;
                             debug!("waiting for clients to stop");
                             continue 'outer;
