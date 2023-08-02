@@ -3,10 +3,11 @@ pub(crate) mod op_fut;
 use std::sync::{Arc, Mutex, Weak};
 
 use io_uring::{SubmissionQueue, Submitter};
+use tokio_util::either::Either;
 
 use super::{
     completion::CompletionSide,
-    slots::{CoOwnerSubmitSide, Slots},
+    slots::{CoOwnerSubmitSide, SlotHandle, Slots, TryGetSlotResult},
 };
 
 pub(crate) struct SubmitSideNewArgs {
@@ -32,16 +33,13 @@ impl SubmitSide {
             completion_side,
         } = args;
         SubmitSide {
-            inner: Arc::new_cyclic(|myself| {
-                Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
-                    id,
-                    submitter,
-                    sq,
-                    slots: ops,
-                    completion_side: Arc::clone(&completion_side),
-                    myself: SubmitSideWeak(Weak::clone(myself)),
-                }))
-            }),
+            inner: Arc::new(Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
+                id,
+                submitter,
+                sq,
+                slots: ops,
+                completion_side: Arc::clone(&completion_side),
+            }))),
         }
     }
 }
@@ -67,9 +65,6 @@ impl SubmitSideOpen {
 pub struct SubmitSideWeak(Weak<Mutex<SubmitSideInner>>);
 
 impl SubmitSideWeak {
-    pub(crate) fn clone(&self) -> Self {
-        SubmitSideWeak(Weak::clone(&self.0))
-    }
     pub(crate) fn with_submit_side_open<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<&mut SubmitSideOpen>) -> R,
@@ -79,6 +74,23 @@ impl SubmitSideWeak {
             None => return f(None),
         };
         SubmitSide { inner: submit_side }.with_submit_side_open(f)
+    }
+
+    pub(crate) async fn get_slot(&self) -> Option<SlotHandle> {
+        let maybe_fut = self.with_submit_side_open(|submit_side_open| match submit_side_open {
+            None => None,
+            Some(open) => match open.slots.try_get_slot() {
+                TryGetSlotResult::Draining => None,
+                TryGetSlotResult::GotSlot(slot) => Some(Either::Left(async move { Ok(slot) })),
+                TryGetSlotResult::NoSlots(later) => Some(Either::Right(later)),
+            },
+        });
+
+        if let Some(maybe_fut) = maybe_fut {
+            maybe_fut.await.ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -108,7 +120,6 @@ pub(crate) struct SubmitSideOpen {
     sq: SubmissionQueue<'static>,
     slots: Slots<CoOwnerSubmitSide>,
     completion_side: Arc<Mutex<CompletionSide>>,
-    myself: SubmitSideWeak,
 }
 
 impl SubmitSide {

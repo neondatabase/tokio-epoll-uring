@@ -1,8 +1,9 @@
 use std::sync::{Arc, RwLock};
 
-use futures::Future;
+use futures::{Future, FutureExt};
 
-use crate::{system::submission::op_fut::OpFut, Ops, System, SystemHandle};
+use crate::SystemError;
+use crate::{Ops, System, SystemHandle};
 
 /// [`Clone`]-able wrapper around [`SystemHandle`] for sharing between threads / tokio tasks.
 ///
@@ -13,24 +14,41 @@ use crate::{system::submission::op_fut::OpFut, Ops, System, SystemHandle};
 pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
 
 impl Ops for SharedSystemHandle {
-    fn nop(&self) -> OpFut<crate::ops::nop::Nop> {
-        let guard = self.0.read().unwrap();
-        let guard = guard
-            .as_ref()
-            .expect("SharedSystemHandle is shut down, cannot submit new operations");
-        guard.nop()
+    fn nop(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = (
+                        (),
+                        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+                    ),
+                >
+                + 'static
+                + Send,
+        >,
+    > {
+        self.nop().boxed()
     }
+
     fn read<B: tokio_uring::buf::IoBufMut + Send>(
         &self,
         file: std::os::fd::OwnedFd,
         offset: u64,
         buf: B,
-    ) -> OpFut<crate::ops::read::ReadOp<B>> {
-        let guard = self.0.read().unwrap();
-        let guard = guard
-            .as_ref()
-            .expect("SharedSystemHandle is shut down, cannot submit new operations");
-        guard.read(file, offset, buf)
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = (
+                        (std::os::fd::OwnedFd, B),
+                        Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
+                    ),
+                >
+                + 'static
+                + Send,
+        >,
+    > {
+        self.read(file, offset, buf).boxed()
     }
 }
 
@@ -61,5 +79,32 @@ impl SharedSystemHandle {
             .take()
             .expect("SharedSystemHandle already shut down")
             .initiate_shutdown()
+    }
+
+    fn nop(
+        &self,
+    ) -> impl std::future::Future<Output = ((), Result<(), SystemError<std::io::Error>>)> {
+        let guard = self.0.read().unwrap();
+        let guard = guard
+            .as_ref()
+            .expect("SharedSystemHandle is shut down, cannot submit new operations");
+        guard.nop()
+    }
+    fn read<B: tokio_uring::buf::IoBufMut + Send>(
+        &self,
+        file: std::os::fd::OwnedFd,
+        offset: u64,
+        buf: B,
+    ) -> impl std::future::Future<
+        Output = (
+            (std::os::fd::OwnedFd, B),
+            Result<usize, SystemError<std::io::Error>>,
+        ),
+    > {
+        let guard = self.0.read().unwrap();
+        let guard = guard
+            .as_ref()
+            .expect("SharedSystemHandle is shut down, cannot submit new operations");
+        guard.read(file, offset, buf)
     }
 }

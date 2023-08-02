@@ -61,6 +61,7 @@ struct SlotsInnerOpen {
     id: usize,
     storage: [Option<Slot>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
+    // FIXME: this is a basic channel right? could be a tokio::sync::mpsc::channel(1) instead
     waiters: VecDeque<tokio::sync::oneshot::Sender<SlotHandle>>,
     myself: SlotsWeak,
 }
@@ -73,6 +74,7 @@ struct SlotsInnerDraining {
 }
 
 pub(crate) struct SlotHandle {
+    // FIXME: why is this weak?
     slots_weak: SlotsWeak,
     idx: usize,
 }
@@ -101,7 +103,10 @@ pub(super) fn new(
     let inner = Arc::new_cyclic(|inner_weak| {
         Mutex::new(SlotsInner::Open(Box::new(SlotsInnerOpen {
             id,
-            storage: array_macro::array![_ => None; RING_SIZE as usize],
+            storage: {
+                const NONE: Option<Slot> = None;
+                [NONE; RING_SIZE as usize]
+            },
             unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
             waiters: VecDeque::new(),
             myself: SlotsWeak {
