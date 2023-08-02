@@ -8,7 +8,6 @@ use tokio_uring::buf::IoBufMut;
 use crate::{
     ops::read::ReadOp,
     system::submission::{op_fut::execute_op, SubmitSide},
-    Ops,
 };
 
 use super::ShutdownRequest;
@@ -129,7 +128,7 @@ impl SystemHandleInner {
 }
 
 impl crate::SystemHandle {
-    fn nop(
+    pub fn nop(
         &self,
     ) -> impl std::future::Future<
         Output = (
@@ -141,7 +140,7 @@ impl crate::SystemHandle {
         let inner = self.inner.as_ref().unwrap();
         execute_op(op, inner.submit_side.weak())
     }
-    fn read<B: IoBufMut + Send>(
+    pub fn read<B: IoBufMut + Send>(
         &self,
         file: OwnedFd,
         offset: u64,
@@ -158,7 +157,7 @@ impl crate::SystemHandle {
     }
 }
 
-impl Ops for crate::SystemHandle {
+impl crate::Ops for crate::SystemHandle {
     fn nop(
         &self,
     ) -> Pin<
