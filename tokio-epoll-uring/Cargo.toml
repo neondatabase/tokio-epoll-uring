@@ -1,0 +1,28 @@
+[package]
+name = "tokio-epoll-uring"
+description = "High-performance use of Linux’s io_uring from vanilla tokio."
+version = "0.1.0"
+edition = "2021"
+authors = [ "Christian Schwarz <me@cschwarz.com>" ]
+repository = "https://github.com/neondatabase/tokio-epoll-uring"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+array-macro = "2.1.5"
+futures = "0.3.28"
+io-uring = "0.6.0"
+lazy_static = "1.4.0"
+scopeguard = "1.1.0"
+thiserror = "1.0.44"
+tokio = { version = "1.29.1", features = ["io-std", "full"] }
+tokio-uring = "0.4.0"
+tokio-util = "0.7.8"
+tracing = "0.1.37"
+
+[dev-dependencies]
+tokio = { version = "1.29.1", features = ["full"] }
+tempfile = "3.6.0"
+tracing-subscriber = "*"
+nix = "0.26.2"
+os_pipe = "1.1.4"
+assert-panic = "1.0.1"
