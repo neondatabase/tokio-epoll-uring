@@ -1,0 +1,52 @@
+name: Build and Test
+
+on:
+  push:
+    branches:
+      - main
+      - release
+  pull_request:
+
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
+env:
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        toolchain: [stable, beta]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@master
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.toolchain }}
+        components: rustfmt, clippy
+
+    - name: Run clippy
+      run: cargo clippy --workspace
+
+    - name: Run cargo check
+      run: cargo check --workspace
+
+    - name: Run the tests
+      run: cargo test --workspace
+
+    - name: Check documentation generation
+      run: cargo doc --workspace --no-deps --document-private-items
+      env:
+        RUSTDOCFLAGS: "-Dwarnings -Arustdoc::private_intra_doc_links"
+
+    - name: Check formatting
+      if: ${{ !cancelled() }}
+      run: cargo fmt --all -- --check

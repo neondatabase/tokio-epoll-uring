@@ -7,14 +7,14 @@ use tokio_util::either::Either;
 
 use super::{
     completion::CompletionSide,
-    slots::{CoOwnerSubmitSide, SlotHandle, Slots, TryGetSlotResult},
+    slots::{self, SlotHandle, Slots, TryGetSlotResult},
 };
 
 pub(crate) struct SubmitSideNewArgs {
     pub(crate) id: usize,
     pub(crate) submitter: Submitter<'static>,
     pub(crate) sq: SubmissionQueue<'static>,
-    pub(crate) slots: Slots<CoOwnerSubmitSide>,
+    pub(crate) slots: Slots<{ slots::co_owner::SUBMIT_SIDE }>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
@@ -118,7 +118,7 @@ pub(crate) struct SubmitSideOpen {
     id: usize,
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
-    slots: Slots<CoOwnerSubmitSide>,
+    slots: Slots<{ slots::co_owner::SUBMIT_SIDE }>,
     completion_side: Arc<Mutex<CompletionSide>>,
 }
 

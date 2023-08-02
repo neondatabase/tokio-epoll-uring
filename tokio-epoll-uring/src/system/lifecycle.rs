@@ -15,7 +15,7 @@ use crate::system::{submission::SubmitSideOpen, RING_SIZE};
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::SystemHandle,
-    slots::{CoOwnerPoller, Slots},
+    slots::{self, Slots},
     submission::{SubmitSide, SubmitSideNewArgs},
 };
 
@@ -170,7 +170,7 @@ pub(crate) struct ShutdownRequest {
 
 pub(crate) fn poller_impl_finish_shutdown(
     system: System,
-    ops: Slots<CoOwnerPoller>,
+    ops: Slots<{ slots::co_owner::POLLER }>,
     completion_side: Arc<Mutex<CompletionSide>>,
     req: ShutdownRequest,
 ) {

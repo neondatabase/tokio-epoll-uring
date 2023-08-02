@@ -6,12 +6,12 @@
 //!
 //! # Usage
 //!
-//! The consumer of this module is [`crate::ops::OpFut::new`].
+//! The consumer of this module is [`crate::system::submission::op_fut::execute_op`].
 //! The role that this module plays in the op submission process:
 //!
 //! 1. Consumer gets a handle to a slot using [`Slots::try_get_slot`].
 //! 2. Consumer uses the slot, getting back an [`InflightHandle`].
-//! 3. Consumer submits the io_uring op to the [`SubmissionSide`].
+//! 3. Consumer submits the io_uring op to the [`SubmitSide`](crate::system::submission::SubmitSide).
 //! 4. Consumer `await`s the the [`InflightHandle`].
 //!
 //! The [`InflightHandle`] future that enforces correct
@@ -27,18 +27,14 @@ use tracing::{debug, trace};
 
 use super::{submission::op_fut::Op, RING_SIZE};
 
-pub(crate) trait SlotsCoOwner {}
+pub(super) mod co_owner {
+    pub const SUBMIT_SIDE: usize = 0;
+    pub const COMPLETION_SIDE: usize = 1;
+    pub const POLLER: usize = 2;
+    pub const NUM_CO_OWNERS: usize = 3;
+}
 
-pub(crate) struct CoOwnerSubmitSide;
-impl SlotsCoOwner for CoOwnerSubmitSide {}
-pub(crate) struct CoOwnerCompletionSide;
-impl SlotsCoOwner for CoOwnerCompletionSide {}
-
-pub(crate) struct CoOwnerPoller;
-impl SlotsCoOwner for CoOwnerPoller {}
-
-pub(crate) struct Slots<O: SlotsCoOwner> {
-    _marker: std::marker::PhantomData<O>,
+pub(crate) struct Slots<const O: usize> {
     #[allow(dead_code)]
     id: usize,
     inner: Arc<Mutex<SlotsInner>>,
@@ -64,6 +60,7 @@ struct SlotsInnerOpen {
     // FIXME: this is a basic channel right? could be a tokio::sync::mpsc::channel(1) instead
     waiters: VecDeque<tokio::sync::oneshot::Sender<SlotHandle>>,
     myself: SlotsWeak,
+    co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
 }
 
 struct SlotsInnerDraining {
@@ -71,6 +68,7 @@ struct SlotsInnerDraining {
     id: usize,
     storage: [Option<Slot>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
+    co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
 }
 
 pub(crate) struct SlotHandle {
@@ -96,9 +94,9 @@ enum Slot {
 pub(super) fn new(
     id: usize,
 ) -> (
-    Slots<CoOwnerSubmitSide>,
-    Slots<CoOwnerCompletionSide>,
-    Slots<CoOwnerPoller>,
+    Slots<{ co_owner::SUBMIT_SIDE }>,
+    Slots<{ co_owner::COMPLETION_SIDE }>,
+    Slots<{ co_owner::POLLER }>,
 ) {
     let inner = Arc::new_cyclic(|inner_weak| {
         Mutex::new(SlotsInner::Open(Box::new(SlotsInnerOpen {
@@ -113,25 +111,46 @@ pub(super) fn new(
                 id,
                 inner_weak: inner_weak.clone(),
             },
+            co_owner_live: [false; co_owner::NUM_CO_OWNERS],
         })))
     });
+    fn make_co_owner<const O: usize>(inner: &Arc<Mutex<SlotsInner>>) -> Slots<O> {
+        let mut guard = inner.lock().unwrap();
+        let SlotsInner::Open(open) = &mut *guard else {
+            panic!("we just created it like this above");
+        };
+        let SlotsInnerOpen {
+            id, co_owner_live, ..
+        } = &mut **open;
+        co_owner_live[O] = true;
+        Slots {
+            id: *id,
+            inner: Arc::clone(inner),
+        }
+    }
     (
-        Slots {
-            _marker: std::marker::PhantomData,
-            id,
-            inner: Arc::clone(&inner),
-        },
-        Slots {
-            _marker: std::marker::PhantomData,
-            id,
-            inner: Arc::clone(&inner),
-        },
-        Slots {
-            _marker: std::marker::PhantomData,
-            id,
-            inner: Arc::clone(&inner),
-        },
+        make_co_owner::<{ co_owner::SUBMIT_SIDE }>(&inner),
+        make_co_owner::<{ co_owner::COMPLETION_SIDE }>(&inner),
+        make_co_owner::<{ co_owner::POLLER }>(&inner),
     )
+}
+
+impl<const O: usize> Drop for Slots<O> {
+    fn drop(&mut self) {
+        let lock_res = self.inner.lock();
+        match lock_res {
+            Ok(mut guard) => match &mut *guard {
+                SlotsInner::Undefined => (),
+                SlotsInner::Open(open) => open.co_owner_live[O] = false,
+                SlotsInner::Draining(draining) => draining.co_owner_live[O] = false,
+            },
+            Err(mut poison) => match &mut **poison.get_mut() {
+                SlotsInner::Open(open) => open.co_owner_live[O] = false,
+                SlotsInner::Draining(draining) => draining.co_owner_live[O] = false,
+                SlotsInner::Undefined => (),
+            },
+        }
+    }
 }
 
 impl SlotsWeak {
@@ -197,7 +216,7 @@ impl SlotsInner {
     }
 }
 
-impl<O: SlotsCoOwner> Slots<O> {
+impl<const O: usize> Slots<O> {
     pub(super) fn poller_timeout_debug_dump(&self) {
         let inner = self.inner.lock().unwrap();
         // TODO: only do this if some env var is set?
@@ -232,7 +251,7 @@ impl<O: SlotsCoOwner> Slots<O> {
     }
 }
 
-impl Slots<CoOwnerCompletionSide> {
+impl Slots<{ co_owner::COMPLETION_SIDE }> {
     pub(super) fn process_completions(
         &mut self,
         cqes: impl Iterator<Item = io_uring::cqueue::Entry>,
@@ -287,7 +306,7 @@ impl SlotsInner {
     }
 }
 
-impl Slots<CoOwnerSubmitSide> {
+impl Slots<{ co_owner::SUBMIT_SIDE }> {
     pub(super) fn set_draining(&self) {
         let mut inner_guard = self.inner.lock().unwrap();
         let cur = std::mem::replace(&mut *inner_guard, SlotsInner::Undefined);
@@ -300,11 +319,13 @@ impl Slots<CoOwnerSubmitSide> {
                     unused_indices,
                     waiters: _, // cancels all waiters
                     myself: _,
+                    co_owner_live,
                 } = *open;
                 *inner_guard = SlotsInner::Draining(Box::new(SlotsInnerDraining {
                     id,
                     storage,
                     unused_indices,
+                    co_owner_live,
                 }));
             }
             SlotsInner::Draining(_draining) => {
@@ -314,7 +335,7 @@ impl Slots<CoOwnerSubmitSide> {
     }
 }
 
-impl Slots<CoOwnerCompletionSide> {
+impl Slots<{ co_owner::COMPLETION_SIDE }> {
     pub(super) fn pending_slot_count(&self) -> usize {
         let ring_size = usize::try_from(RING_SIZE).unwrap();
         let mut inner_guard = self.inner.lock().unwrap();
@@ -333,8 +354,8 @@ impl Slots<CoOwnerCompletionSide> {
     }
 }
 
-impl<O: SlotsCoOwner> Slots<O> {
-    pub(super) fn shutdown_assertions(&self) {
+impl<const O: usize> Slots<O> {
+    pub(super) fn shutdown_assertions(self) {
         let ops_inner_guard = self.inner.lock().unwrap();
         let inner = match &*ops_inner_guard {
             SlotsInner::Undefined => unreachable!(),
@@ -353,6 +374,11 @@ impl<O: SlotsCoOwner> Slots<O> {
             RING_SIZE.try_into().unwrap()
         );
         assert!(unused_indices.is_subset(&slots_owned_by_user_space));
+
+        // assert the calling owner is the only remaining owner
+        let mut expected_co_owner_live = [false; co_owner::NUM_CO_OWNERS];
+        expected_co_owner_live[O] = true;
+        assert_eq!(inner.co_owner_live, expected_co_owner_live);
     }
 }
 
@@ -362,7 +388,7 @@ pub(crate) enum TryGetSlotResult {
     Draining,
 }
 
-impl Slots<CoOwnerSubmitSide> {
+impl Slots<{ co_owner::SUBMIT_SIDE }> {
     pub(crate) fn try_get_slot(&self) -> TryGetSlotResult {
         let mut inner_guard = self.inner.lock().unwrap();
         let open = match &mut *inner_guard {

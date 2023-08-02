@@ -11,14 +11,14 @@ use crate::util::oneshot_nonconsuming;
 
 use super::{
     lifecycle::{ShutdownRequest, System},
-    slots::{CoOwnerCompletionSide, CoOwnerPoller, Slots},
+    slots::{self, Slots},
 };
 
 pub(crate) struct CompletionSide {
     #[allow(dead_code)]
     id: usize,
     cq: CompletionQueue<'static>,
-    slots: Slots<CoOwnerCompletionSide>,
+    slots: Slots<{ slots::co_owner::COMPLETION_SIDE }>,
 }
 
 unsafe impl Send for CompletionSide {}
@@ -32,7 +32,7 @@ impl CompletionSide {
     pub(crate) fn new(
         id: usize,
         cq: CompletionQueue<'static>,
-        ops: Slots<CoOwnerCompletionSide>,
+        ops: Slots<{ slots::co_owner::COMPLETION_SIDE }>,
     ) -> Self {
         Self { id, cq, slots: ops }
     }
@@ -61,7 +61,7 @@ pub(crate) struct PollerNewArgs {
     pub uring_fd: std::os::fd::RawFd,
     pub completion_side: Arc<Mutex<CompletionSide>>,
     pub system: System,
-    pub(crate) slots: Slots<CoOwnerPoller>,
+    pub(crate) slots: Slots<{ slots::co_owner::POLLER }>,
     pub testing: Option<PollerTesting>,
 }
 
@@ -130,7 +130,7 @@ struct PollerStateInner {
     uring_fd: std::os::fd::RawFd,
     completion_side: Arc<Mutex<CompletionSide>>,
     system: System,
-    pub slots: Slots<CoOwnerPoller>,
+    pub slots: Slots<{ slots::co_owner::POLLER }>,
     shutdown_rx: oneshot_nonconsuming::Receiver<ShutdownRequest>,
 }
 
@@ -525,7 +525,7 @@ mod tests {
 
         let (system, read_fut) = rt.block_on(async move {
             let system = SharedSystemHandle::launch_with_testing(testing).await;
-            let mut read_fut = Box::pin(system.read(reader, 0, vec![1]));
+            let mut read_fut = Box::pin(system.read(reader, 0, vec![0]));
             tokio::select! {
                 _ = &mut read_fut => { panic!("we haven't written to the pipe yet") },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
@@ -577,12 +577,12 @@ mod tests {
                 // TODO don't rely on timing
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => { }
                 _ = &mut shutdown_done_fut => {
-                    panic!("shutdown should not complete until submit_fut is done");
+                    panic!("shutdown should not complete until read_fut is done");
                 }
             }
 
             // now unblock the read
-            writer.write_all(&[1]).unwrap();
+            writer.write_all(&[23]).unwrap();
 
             tokio::select! {
                 // TODO don't rely on timing
@@ -594,7 +594,7 @@ mod tests {
         });
 
         let ((_, _), res) = second_rt.block_on(read_fut);
-        let err = res.expect_err("when poller signals shutdown_done, it has dropped the Ops Arc; read_fut only holds a Weak to it and will fail to upgrade");
+        let err = res.expect_err("when poller signals shutdown_done, it has dropped the Slots Arc; read_fut only holds a Weak to it and will fail to upgrade");
         assert!(
             matches!(
                 err,
