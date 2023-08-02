@@ -75,11 +75,11 @@ impl<T: Send> SendOnce<T> {
 
 /// The result of [`Receiver::recv`].
 pub enum RecvResult<T> {
-    /// If there is and explicit [`Sender::send`] call, the first receiver wins the sent value.
+    /// If there is and explicit [`SendOnce::send`] call, the first receiver wins the sent value.
     FirstRecv(T),
-    /// If there is and explicit [`Sender::send`] call, not-first receivers get this result.
+    /// If there is and explicit [`SendOnce::send`] call, not-first receivers get this result.
     NotFirstRecv,
-    /// If the [`Sender`] is dropped, all receivers get this result.
+    /// If the [`SendOnce`] is dropped, all receivers get this result.
     SenderDropped,
 }
 
