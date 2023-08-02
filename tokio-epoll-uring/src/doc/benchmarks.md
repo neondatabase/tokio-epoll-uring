@@ -1,44 +1,33 @@
- # Benchmarks
+# Benchmarks
 
- ## Fully-Page-Cache-Hit 8k Random Reads
+We use the `benchmark` crate that's maintained in the same repository as this crate.
+It's a micro-benchmark that evaluates different IO engines' performance in 8k random reads issued by a configurable number of tasks.
+The evaluation is done on an `i4i.2xlarge` EC2 instance.
 
- On an `i4i.2xlarge` EC2 instance, we get 2.5 million 8k random read IOPS per second from the page cache.
- These are 8-vCPU machines. Hence we have 8 executor threads.
- The benchmark used 400 concurrent tokio tasks, each `read().await`ing 8k bytes at random offsets in per-task files.
- The total working set is ca. 40 GiB, and we made sure it was completely inside the page cache during the benchmark
- (no read IOs to the disk during the benchmark).
+Highlights:
 
- We have some env-var tunables to maximize fairness.
- Enabling them yields 1.8 million 8k random reads per second at nearly 100% fairness.
- Fairness is measured by the spread of total achieved IOPS per task over the benchmark run.
- A lower spread means better fairness.
+ * With 400 tasks, each operating on a 100MiB file, the workload fits completely into the page cache.
+   We achieve 1.8 million 8k random read IOPS with a high degree of fairness.
+   When willing to sacrifice fairness, a different configuration achieves 2.45 million 8k random read IOPS.
+   Even the "1.8mio" are 5x of what `tokio::fs`/`tokio::spawn_blocking` achieve.
+   It is 4x what a single `tokio_uring` runtime can achieve, because our design takes advantage of multiple cores
+   through multiple tokio worker threads, whereas `tokio_uring` is limited to a executor thread / CPU core.
 
- The bottleneck in any of the above configurations is CPU time.
- We reach 100% CPU utilization with far less than 400 concurrent tokio tasks.
- The 400 are for stress-testing fairness.
- Flamegraphs show > 75% of CPU time spent in the kernel doing the actual work.
+* With 1200 tasks (100MiB file per task), the workload is about twice the page cache size.
+  Hence we're maxing out the IOPS supported by the `i4i.2xlarge`'s Instance Store NVMe (~130k IOPS).
+  Our crate has performance equivalent to `tokio::fs`/`tokio::spawn_blocking` and outperforms `tokio_uring` by about 2x.
+  Again, `tokio_uring` is bottlenecked by its limitation to a single executor thread / CPU core.
 
- Regarding latency jitter, the maximally fair configuration has mean latency of 204us and a p99.99 latency of 793us.
- The most performant configuration had a mean of 2us, p99.99 of 19us; which implies very-long-tail outliers.
+Fairness is measured as follows: each tokio task in the benchmark is given a fixed amount of 8k random reads to perform.
+We measure per task the time from benchmark start (same for all tasks) to the time the task finished.
+Assuming a fair kernel page cache, a fair system will result in all tasks finishing at about the same time.
+An unfair system will result in some tasks finishing earlier than others.
+By sorting & plotting task runtimes on a scatter plot (x axis: index of sorted result, y axis: task runtime)
+we get a visualization of task fairness: a flat line is maximum fairness, a steep line means some tasks were heavily favored over others.
+We can also compare `min` and `max` task runtime for a given configuration and calculate the spread factor `max/min`.
+A lower spread factor means higher fairness.
 
- More investigation is needed to understand what is going on there, as the 2.5mio vs 1.8mio advantage in throughput is attractive.
+Detailed results: <https://docs.google.com/spreadsheets/d/1bs_q7IyoTzF43SeEIBWCJk7z2mdZZVsLbqvVwE88YWA/edit?usp=sharing>
+See `tokio-epoll-uring.git:{README.md,benchmark/scripts/runbench.py}` for details on how the benchmark is run.
 
- For comparison, `tokio::fs` will do just about ca 370k IOPS; I didn't measure latency jitter.
-
- ## 2x Page Cache Size 8k Random Reads
-
- Another benchmark is to use twice the page-cache-sized working set (120 GiB on the `i4i.2xlarge`).
- This will result in an about 50% page cache hit rate, i.e., 2x the IOPS than if we would always hit the disk.
-
- There is no meaningful difference between the fairness-tuned and the performance-tuned configurations.
- Both yield ca 216k 8k random reads per second from 1200 concurrent tokio tasks.
- The mean latency is 5.2ms, and p99.99 latency is 21ms.
- The reason for these high latencies is that the disk is at its throughput limit; queuing is happening in software.
- A real application would likely reject clients and try to scale out to keep latency at bay.
-
- Total CPU utilization was less than 20% busy in this configuration.
-
- For comparison, `tokio::fs` achieves about 180k IOPS.
- CPU utilization is higher but acceptable.
- We did not measure latency jitter.
 

@@ -11,6 +11,7 @@ Use `cargo doc --no-deps`, then view `./target/doc/tokio_epoll_uring`.
 # Benchmark
 
 The `./benchmark` crate is a microbenchmark that evaluates this crate against other solutions.
+
 How to use it:
 
 ## Get an `i4i.2xlarge` AWS EC2 instance
