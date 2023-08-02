@@ -53,39 +53,31 @@ impl FromStr for RunDuration {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        fn parse_multiplied(s: &str) -> Result<RunDuration, String> {
+            let (s, multiplier) = if let Some(prefix) = s.strip_suffix("k-") {
+                (prefix, 1000)
+            } else if let Some(prefix) = s.strip_suffix("m-") {
+                (prefix, 1000 * 1000)
+            } else if let Some(prefix) = s.strip_suffix("g-") {
+                (prefix, 1000 * 1000 * 1000)
+            } else {
+                (s, 1)
+            };
+            match s.parse::<NonZeroU64>() {
+                Ok(n) => Ok(RunDuration::FixedPerClientIoCount(n.get() * multiplier)),
+                Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
+            }
+        }
+
         match s {
             "until-ctrl-c" => Ok(RunDuration::UntilCtrlC),
             x if x.ends_with("ios-total") => {
                 let stripped = &s[..s.len() - "ios-total".len()];
-                let (stripped, multiplier) = if stripped.ends_with("k-") {
-                    (&stripped[..stripped.len() - 2], 1000)
-                } else if stripped.ends_with("m-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000)
-                } else if stripped.ends_with("g-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000 * 1000)
-                } else {
-                    (stripped, 1)
-                };
-                match stripped.parse::<NonZeroU64>() {
-                    Ok(n) => Ok(RunDuration::FixedTotalIoCount(n.get() * multiplier)),
-                    Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
-                }
+                parse_multiplied(s)
             }
             x if x.ends_with("ios-per-client") => {
                 let stripped = &s[..s.len() - "ios-per-client".len()];
-                let (stripped, multiplier) = if stripped.ends_with("k-") {
-                    (&stripped[..stripped.len() - 2], 1000)
-                } else if stripped.ends_with("m-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000)
-                } else if stripped.ends_with("g-") {
-                    (&stripped[..stripped.len() - 2], 1000 * 1000 * 1000)
-                } else {
-                    (stripped, 1)
-                };
-                match stripped.parse::<NonZeroU64>() {
-                    Ok(n) => Ok(RunDuration::FixedPerClientIoCount(n.get() * multiplier)),
-                    Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
-                }
+                parse_multiplied(stripped)
             }
             x => match humantime::parse_duration(x) {
                 Ok(d) => Ok(RunDuration::FixedDuration(d)),
