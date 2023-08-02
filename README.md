@@ -6,7 +6,7 @@ Context: https://github.com/neondatabase/neon/issues/4744
 
 # Documentation
 
-Use `cargo doc --no-deps`, then view `./target/doc/tokio_epoll_uring`.
+Use `cargo doc --no-deps`, then view `./target/doc/tokio_epoll_uring` in the browser. Alternatively, specify the `--open` flag to cargo.
 
 # Benchmark
 
