@@ -3,7 +3,7 @@
 //! # Usage
 //!
 //! 1. Launch a [`System`] to get a [`SystemHandle`].
-//! 2. On the handle, call the [`Ops`] method that corresponds to the desired io_uring operation.
+//! 2. On the handle, call method that corresponds to the desired io_uring operation.
 //!    The method/returned future will *own* resources such as buffers and file descriptors
 //!    until the operation completes.
 //! 4. Await the future returned by the invocation.
