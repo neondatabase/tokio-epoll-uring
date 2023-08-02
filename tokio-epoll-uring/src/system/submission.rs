@@ -89,20 +89,10 @@ impl SubmitSideWeak {
                     // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
                     // This is in the hope that we'll wake ourselves up.
 
-                    static PROCESS_COMPLETIONS_ON_QUEUE_FULL: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
-                        std::env::var("EPOLL_URING_PROCESS_COMPLETIONS_ON_QUEUE_FULL")
-                            .map(|v| v == "1")
-                            .unwrap_or_else(|e| match e {
-                                std::env::VarError::NotPresent => true, // default-on
-                                std::env::VarError::NotUnicode(_) => panic!("EPOLL_URING_PROCESS_COMPLETIONS_ON_QUEUE_FULL must be a unicode string"),
-                            })
-                        });
-
-                    if *PROCESS_COMPLETIONS_ON_QUEUE_FULL {
+                    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
                         // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
                         open.submitter.submit().unwrap();
-                        open
-                            .completion_side
+                        open.completion_side
                             .lock()
                             .unwrap()
                             .process_completions(ProcessCompletionsCause::Regular);

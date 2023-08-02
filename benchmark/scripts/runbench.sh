@@ -47,14 +47,14 @@ page_cache_size_mibs() {
 }
 
 create_files() {
-	EPOLL_URING_FORCE_YIELD=0 RUNTIME=1s SAVE_RESULT=0 DISABLE_STATS=--disable-stats run std
+	RUNTIME=1s SAVE_RESULT=0 DISABLE_STATS=--disable-stats run std
 }
 
 ensure_workload_in_page_cache() {
 	echo page cache warmup done
 	while true; do
 		before="$(kbs_read)"
-		EPOLL_URING_FORCE_YIELD=0 RUNTIME=10s SAVE_RESULT=0 DISABLE_STATS=--disable-stats run std
+		RUNTIME=10s SAVE_RESULT=0 DISABLE_STATS=--disable-stats run std
 		after="$(kbs_read)"
 		delta="$((after - before))"
 		if [ "$delta" -lt 10 ]; then
@@ -67,7 +67,7 @@ ensure_workload_in_page_cache() {
 ensure_page_cache_size_at_least() {
 	echo "loading up page cache to size ${TARGET_MIN_MIBS}"
 	while true; do
-		EPOLL_URING_FORCE_YIELD=0 RUNTIME=10s SAVE_RESULT=0 DISABLE_STATS=--disable-stats run std
+		RUNTIME=10s SAVE_RESULT=0 DISABLE_STATS=--disable-stats run std
 		after="$(page_cache_size_mibs)"
 		if [ "$after" -ge "${TARGET_MIN_MIBS}" ]; then
 			break
