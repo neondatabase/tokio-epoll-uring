@@ -2,10 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::{
-    system::submission::op_fut::{Op, OpFut},
-    System, SystemHandle,
-};
+use crate::{system::submission::op_fut::Op, System, SystemHandle};
 
 thread_local! {
     static THREAD_LOCAL: std::sync::Arc<tokio::sync::OnceCell<SystemHandle>> = Arc::new(tokio::sync::OnceCell::const_new());

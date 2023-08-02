@@ -3,10 +3,11 @@ pub(crate) mod op_fut;
 use std::sync::{Arc, Mutex, Weak};
 
 use io_uring::{SubmissionQueue, Submitter};
+use tokio_util::either::Either;
 
 use super::{
     completion::CompletionSide,
-    slots::{CoOwnerSubmitSide, Slots},
+    slots::{CoOwnerSubmitSide, SlotHandle, Slots, TryGetSlotResult},
 };
 
 pub(crate) struct SubmitSideNewArgs {
@@ -79,6 +80,23 @@ impl SubmitSideWeak {
             None => return f(None),
         };
         SubmitSide { inner: submit_side }.with_submit_side_open(f)
+    }
+
+    pub(crate) async fn get_slot(&self) -> Option<SlotHandle> {
+        let maybe_fut = self.with_submit_side_open(|submit_side_open| match submit_side_open {
+            None => None,
+            Some(open) => match open.slots.try_get_slot() {
+                TryGetSlotResult::Draining => None,
+                TryGetSlotResult::GotSlot(slot) => Some(Either::Left(async move { Ok(slot) })),
+                TryGetSlotResult::NoSlots(later) => Some(Either::Right(later)),
+            },
+        });
+
+        if let Some(maybe_fut) = maybe_fut {
+            maybe_fut.await.ok()
+        } else {
+            None
+        }
     }
 }
 
