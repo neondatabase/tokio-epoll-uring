@@ -8,9 +8,9 @@ async fn main() {
         .init();
     tracing::info!("starting");
 
-    let mut jhs = Vec::new();
+    let mut js = tokio::task::JoinSet::new();
     for _ in 0..8 {
-        jhs.push(tokio::spawn(async move {
+        js.spawn(async move {
             let mut file = tempfile::tempfile().unwrap();
             {
                 use std::io::Write;
@@ -32,7 +32,7 @@ async fn main() {
         });
     }
 
-    for jh in jhs {
-        jh.await.unwrap();
+    while let Some(je) = js.join_next().await {
+        je.unwrap();
     }
 }
