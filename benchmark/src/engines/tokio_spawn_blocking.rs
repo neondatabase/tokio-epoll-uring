@@ -45,7 +45,7 @@ impl Engine for EngineTokioSpawnBlocking {
         rt.block_on(async {
             let mut handles = Vec::new();
             assert_eq!(works.len(), args.num_clients.get() as usize);
-            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
+            for (i, work) in (0..args.num_clients.get()).zip(works) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let clients_ready = Arc::clone(&clients_ready);

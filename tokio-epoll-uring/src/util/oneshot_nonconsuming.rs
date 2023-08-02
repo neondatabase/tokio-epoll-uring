@@ -8,21 +8,21 @@ use tokio::sync::broadcast::{
     error::{RecvError, SendError},
 };
 
-enum State<T> {
+enum State<T: Send> {
     NotSent,
     SentNotTaken(T),
     Taken,
 }
-struct Shared<T>(Arc<Mutex<State<T>>>);
+struct Shared<T: Send>(Arc<Mutex<State<T>>>);
 
-impl<T> Clone for Shared<T> {
+impl<T: Send> Clone for Shared<T> {
     fn clone(&self) -> Self {
         Shared(Arc::clone(&self.0))
     }
 }
 
 /// Create a new sender-receiver pair.
-pub fn channel<T>() -> (SendOnce<T>, Receiver<T>) {
+pub fn channel<T: Send>() -> (SendOnce<T>, Receiver<T>) {
     let shared = Shared(Arc::new(Mutex::new(State::NotSent)));
     let (sender, receiver) = broadcast::channel(1);
     (
@@ -34,20 +34,20 @@ pub fn channel<T>() -> (SendOnce<T>, Receiver<T>) {
 /// The sender half of the channel.
 ///
 /// More [`SendOnce::send`].
-pub struct SendOnce<T>(Shared<T>, broadcast::Sender<()>);
+pub struct SendOnce<T: Send>(Shared<T>, broadcast::Sender<()>);
 
 /// The receiver half of a oneshot channel.
 ///
 /// Clone-able for convenience. See [`Receiver::recv`].
-pub struct Receiver<T>(Shared<T>, broadcast::Receiver<()>);
+pub struct Receiver<T: Send>(Shared<T>, broadcast::Receiver<()>);
 
-impl<T> Clone for Receiver<T> {
+impl<T: Send> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         Receiver(self.0.clone(), self.1.resubscribe())
     }
 }
 
-impl<T> SendOnce<T> {
+impl<T: Send> SendOnce<T> {
     /// Send the given value to the receiver(s).
     pub fn send(self, v: T) -> Result<(), T> {
         let mut guard = self.0 .0.lock().unwrap();
@@ -83,7 +83,7 @@ pub enum RecvResult<T> {
     SenderDropped,
 }
 
-impl<T> Receiver<T> {
+impl<T: Send> Receiver<T> {
     /// See [`RecvResult`].
     pub async fn recv(&mut self) -> RecvResult<T> {
         match self.1.recv().await {
