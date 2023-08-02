@@ -103,7 +103,10 @@ pub(super) fn new(
     let inner = Arc::new_cyclic(|inner_weak| {
         Mutex::new(SlotsInner::Open(Box::new(SlotsInnerOpen {
             id,
-            storage: array_macro::array![_ => None; RING_SIZE as usize],
+            storage: {
+                const NONE: Option<Slot> = None;
+                [NONE; RING_SIZE as usize]
+            },
             unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
             waiters: VecDeque::new(),
             myself: SlotsWeak {
