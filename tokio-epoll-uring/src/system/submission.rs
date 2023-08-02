@@ -89,13 +89,10 @@ impl SubmitSideWeak {
                     // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
                     // This is in the hope that we'll wake ourselves up.
 
-
-
                     if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
                         // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
                         open.submitter.submit().unwrap();
-                        open
-                            .completion_side
+                        open.completion_side
                             .lock()
                             .unwrap()
                             .process_completions(ProcessCompletionsCause::Regular);
