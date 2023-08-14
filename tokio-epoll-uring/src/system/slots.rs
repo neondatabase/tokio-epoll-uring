@@ -515,9 +515,9 @@ impl SlotHandle {
                         // and we don't want the system to be generic over it.
                         // Since dropping of inflight IOs is generally rare, the allocations should be fine.
                         // Could optimize by making erause a trait method on ResourcesOwnedByKernel; it could then use a slab allcoator or similar.
-                        let rsrc: Box<dyn std::any::Any + Send> = Box::new(op);
+                        let op: Box<dyn std::any::Any + Send> = Box::new(op);
                         *slot_mut = Slot::PendingButFutureDropped {
-                            resources_owned_by_kernel: rsrc,
+                            resources_owned_by_kernel: op,
                         };
                     }
                     Slot::Ready { result } => {
@@ -633,18 +633,19 @@ impl SlotHandle {
                 }
             }
         };
-        // SAFETY:
-        // We got a result, so, kernel is done with the operation and ownership is back with us.
-        #[allow(unused_unsafe)]
-        let rsrc = unsafe {
-            op.lock().unwrap().take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self")
-        };
 
         if was_ready_on_first_poll && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL
         {
             tokio::task::yield_now().await;
         }
-        let (resources, res) = rsrc.on_op_completion(res);
+
+        // SAFETY:
+        // We got a result, so, kernel is done with the operation and ownership is back with us.
+        #[allow(unused_unsafe)]
+        let (resources, res) = unsafe {
+            let op = op.lock().unwrap().take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
+            op.on_op_completion(res)
+        };
         (resources, res.map_err(InflightHandleError::Completion))
     }
 }
