@@ -45,8 +45,9 @@ scp -p target/x86_64-unknown-linux-musl/release/benchmark testinstance:/tmp/ && 
 ## Prepare Storage on instance
 
 ```
-mkfs.ext4 /dev/nvme1n1
-mount /dev/nvme1n1 /mnt
+mkfs.ext4 /dev/nvme1n1 && \
+    mount /dev/nvme1n1 /mnt && \
+    echo "DONE"
 ```
 
 ## Run benchmarks

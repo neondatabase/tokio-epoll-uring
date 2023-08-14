@@ -446,6 +446,12 @@ pub(crate) enum UseError {
     SlotsDropped,
 }
 
+/// Returned by [`SlotHandle::use_for_op`].
+pub(crate) enum InflightHandleError<O: Op> {
+    SlotsDropped,
+    Completion(O::Error),
+}
+
 impl SlotHandle {
     pub(crate) fn use_for_op<O>(
         self,
@@ -558,14 +564,60 @@ impl SlotHandle {
             }
         };
 
-        let res;
-        let was_ready_on_first_poll;
-        match slot.poll_inflight() {
-            InflightSlotPollResult::AlreadyDone(r) => {
+        // Now that we've set up the scope guard, get to business.
+        // Inspect the slot to check whether the poller task already processed the completion.
+        // If it has, good for us.
+        // If not, set up a oneshot to notify us. (TODO: in the hand-rolled futures, this was simply a std::task::Waker, now it's a oneshot.)
+        enum InspectSlotResult {
+            AlreadyDone(i32),
+            NeedToWait(tokio::sync::oneshot::Receiver<i32>),
+            ShutDown,
+        }
+        let inspect_slot_res = slot.slots_weak.try_upgrade_mut(move |inner| {
+            let storage = match inner {
+                SlotsInner::Undefined => unreachable!(),
+                SlotsInner::Open(inner) => &mut inner.storage,
+                SlotsInner::Draining(inner) => &mut inner.storage,
+            };
+
+            let slot_storage_ref = &mut storage[slot.idx];
+            let slot_mut = slot_storage_ref.as_mut().unwrap();
+
+            let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
+            let cur: Slot = std::mem::replace(&mut *slot_mut, Slot::Undefined);
+            match cur {
+                Slot::Undefined => panic!("future is in undefined state"),
+                Slot::Pending { waker: Some(_) } => unreachable!("this function here is the only place that transitions to waker: Some(), and it is consuming"),
+                Slot::Pending { waker: None } => {
+                    trace!("op is still pending, storing waker in it");
+                    *slot_mut = Slot::Pending {
+                        waker: Some(waiter_tx),
+                    };
+                    InspectSlotResult::NeedToWait(waiter_rx)
+                }
+                Slot::PendingButFutureDropped { .. } => {
+                    unreachable!("if it's dropped, it's not pollable")
+                }
+                Slot::Ready { result: res } => {
+                    trace!("op is ready, returning resources to user");
+                    *slot_mut = Slot::Ready { result: res };
+                    inner.return_slot(slot.idx);
+                    InspectSlotResult::AlreadyDone(res)
+                }
+            }
+        });
+        let inspect_slot_res = match inspect_slot_res {
+            Err(()) => InspectSlotResult::ShutDown,
+            Ok(res) => res,
+        };
+        let res: i32;
+        let was_ready_on_first_poll: bool;
+        match inspect_slot_res {
+            InspectSlotResult::AlreadyDone(r) => {
                 res = r;
                 was_ready_on_first_poll = true;
             }
-            InflightSlotPollResult::NeedToWait(waiter_rx) => match waiter_rx.await {
+            InspectSlotResult::NeedToWait(waiter_rx) => match waiter_rx.await {
                 Ok(r) => {
                     res = r;
                     was_ready_on_first_poll = false;
@@ -585,7 +637,7 @@ impl SlotHandle {
                     }
                 }
             },
-            InflightSlotPollResult::ShutDown => {
+            InspectSlotResult::ShutDown => {
                 // SAFETY:
                 // This future has an outdated view of the system; it shut down in the meantime.
                 // Shutdown makes sure that all inflight ops complete, so,
@@ -630,60 +682,6 @@ impl SlotsInnerDraining {
                     Slot::Ready { .. } => Some(idx),
                 },
             })
-    }
-}
-
-pub(crate) enum InflightHandleError<O: Op> {
-    SlotsDropped,
-    Completion(O::Error),
-}
-
-enum InflightSlotPollResult {
-    AlreadyDone(i32),
-    NeedToWait(tokio::sync::oneshot::Receiver<i32>),
-    ShutDown,
-}
-
-impl SlotHandle {
-    fn poll_inflight(&self) -> InflightSlotPollResult {
-        let slots_weak = self.slots_weak.clone();
-        let res = slots_weak.try_upgrade_mut(move |inner| {
-            let storage = match inner {
-                SlotsInner::Undefined => unreachable!(),
-                SlotsInner::Open(inner) => &mut inner.storage,
-                SlotsInner::Draining(inner) => &mut inner.storage,
-            };
-
-            let slot_storage_ref = &mut storage[self.idx];
-            let slot_mut = slot_storage_ref.as_mut().unwrap();
-
-            let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
-            let cur: Slot = std::mem::replace(&mut *slot_mut, Slot::Undefined);
-            match cur {
-                Slot::Undefined => panic!("future is in undefined state"),
-                Slot::Pending { waker: Some(_) } => unreachable!("this function here is the only place that transitions to waker: Some(), and it is consuming"),
-                Slot::Pending { waker: None } => {
-                    trace!("op is still pending, storing waker in it");
-                    *slot_mut = Slot::Pending {
-                        waker: Some(waiter_tx),
-                    };
-                    InflightSlotPollResult::NeedToWait(waiter_rx)
-                }
-                Slot::PendingButFutureDropped { .. } => {
-                    unreachable!("if it's dropped, it's not pollable")
-                }
-                Slot::Ready { result: res } => {
-                    trace!("op is ready, returning resources to user");
-                    *slot_mut = Slot::Ready { result: res };
-                    inner.return_slot(self.idx);
-                    InflightSlotPollResult::AlreadyDone(res)
-                }
-            }
-        });
-        match res {
-            Err(()) => InflightSlotPollResult::ShutDown,
-            Ok(res) => res,
-        }
     }
 }
 

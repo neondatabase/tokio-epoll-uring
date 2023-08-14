@@ -593,17 +593,10 @@ mod tests {
             }
         });
 
-        let ((_, _), res) = second_rt.block_on(read_fut);
-        let err = res.expect_err("when poller signals shutdown_done, it has dropped the Slots Arc; read_fut only holds a Weak to it and will fail to upgrade");
-        assert!(
-            matches!(
-                err,
-                crate::SystemError::System(
-                    crate::system::submission::op_fut::OpError::SystemShuttingDown
-                )
-            ),
-            "{err:?}"
-        );
+        let ((_, buf), res) = second_rt.block_on(read_fut);
+        let count = res.expect("the op was already submitted and wait_for_completion already registered the waiter_tx/waiter_rx");
+        assert_eq!(count, 1);
+        assert_eq!(buf, &[23]);
     }
 
     #[test]
