@@ -29,7 +29,6 @@
 //! ownership of the resources that the io_uring operation operates on.
 
 use std::{
-    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, Weak},
 };
@@ -514,7 +513,7 @@ async fn poll_impl<O: Op + Send + 'static>(
     op: O,
 ) -> (O::Resources, Result<O::Success, InflightHandleError<O>>) {
     let slot = slot;
-    let op = RefCell::new(Some(op));
+    let op = std::sync::Mutex::new(Some(op));
 
     // if we get dropped before the op completes, we need to make sure
     // that the resources owned by the kernel continue to live
@@ -535,7 +534,7 @@ async fn poll_impl<O: Op + Send + 'static>(
                     // Now Self is getting dropped, but the uring op is still ongoing.
                     // We must prevent the resources from getting dropped, otherwise the kernel will operate on the dropped resource.
                     // NB: the most concerning resource is the memory buffer into which a read-style uring op will write / from which a write-style uring will read.
-                    let op = op.take().unwrap();
+                    let op = op.lock().unwrap().take().unwrap();
                     // Use Box for type erasure.
                     // Type erasure is necessary because the ResourcesOwnedByKernel trait has an associated type "OpResult",
                     // and we don't want the system to be generic over it.
@@ -566,7 +565,7 @@ async fn poll_impl<O: Op + Send + 'static>(
                 // Shutdown makes sure that all inflight ops complete, so, it is safe to drop the resources owned by kernel at this point.
                 #[allow(unused_unsafe)]
                 unsafe {
-                    drop(op.take().unwrap());
+                    drop(op.lock().unwrap().take().unwrap());
                 }
             }
         }
@@ -591,7 +590,7 @@ async fn poll_impl<O: Op + Send + 'static>(
                 // these resources are no longer owned by the kernel and can be returned as an error.
                 #[allow(unused_unsafe)]
                 unsafe {
-                    let resources_owned_by_kernel = op.take().unwrap();
+                    let resources_owned_by_kernel = op.lock().unwrap().take().unwrap();
                     return (
                         resources_owned_by_kernel.on_failed_submission(),
                         Err(InflightHandleError::SlotsDropped),
@@ -606,7 +605,7 @@ async fn poll_impl<O: Op + Send + 'static>(
             // these resources are no longer owned by the kernel and can be returned as an error.
             #[allow(unused_unsafe)]
             unsafe {
-                let op = op.replace(None).unwrap();
+                let op = op.lock().unwrap().take().unwrap();
                 return (
                     op.on_failed_submission(),
                     Err(InflightHandleError::SlotsDropped),
@@ -618,7 +617,7 @@ async fn poll_impl<O: Op + Send + 'static>(
     // We got a result, so, kernel is done with the operation and ownership is back with us.
     #[allow(unused_unsafe)]
     let rsrc = unsafe {
-        op.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self")
+        op.lock().unwrap().take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self")
     };
 
     if was_ready_on_first_poll && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
