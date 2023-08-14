@@ -15,18 +15,13 @@
 //!
 //! An in-flight io_uring operation occupies a slot in a [`Slots`] instance.
 //!
-//! # Usage
-//!
 //! The consumer of this module is [`crate::system::submission::op_fut::execute_op`].
-//! The role that this module plays in the op submission process:
+//! The two important that it uses are:
+//! - get the slot using [`Slots::try_get_slot`].
+//! - use the slot (and submit the op to the kernel) using [`SlotHandle::use_for_op`]
 //!
-//! 1. Consumer gets a handle to a slot using [`Slots::try_get_slot`].
-//! 2. Consumer uses the slot, getting back an [`InflightHandle`].
-//! 3. Consumer submits the io_uring op to the [`SubmitSide`](crate::system::submission::SubmitSide).
-//! 4. Consumer `await`s the the [`InflightHandle`].
-//!
-//! The [`InflightHandle`] future that enforces correct
-//! ownership of the resources that the io_uring operation operates on.
+//! [`SlotHandle::use_for_op`] enforces correct ownership of the resources that the
+//! io_uring operation operates on.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
