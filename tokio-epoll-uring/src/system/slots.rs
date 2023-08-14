@@ -38,7 +38,7 @@ use std::{
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
-use super::{submission::op_fut::Op, RING_SIZE};
+use super::{submission::{op_fut::Op, SubmitSideOpen}, RING_SIZE, completion::ProcessCompletionsCause};
 
 pub(super) mod co_owner {
     pub const SUBMIT_SIDE: usize = 0;
@@ -445,7 +445,7 @@ impl SlotHandle {
     pub(crate) fn use_for_op<O>(
         self,
         mut op: O,
-        do_submit: &mut dyn FnMut(io_uring::squeue::Entry),
+        submit_side: &mut SubmitSideOpen,
     ) -> Result<
         impl std::future::Future<Output = (O::Resources, Result<O::Success, InflightHandleError<O>>)>,
         (O, UseError),
@@ -470,7 +470,39 @@ impl SlotHandle {
             return Err((op, UseError::SlotsDropped));
         };
 
-        do_submit(sqe);
+        {
+            if submit_side.submit_raw(sqe).is_err() {
+                // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
+                // So, we could just submit_and_wait here. But, that'd prevent the
+                // current executor thread from making progress on other tasks.
+                //
+                // So, for now, keep SQ size == inflight ops size == Slots size.
+                // This potentially limits throughput if SQ size is chosen too small.
+                //
+                // FIXME: why not just async mutex?
+                unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
+            }
+
+            // this allows us to keep the possible guard in cq_guard because the arc lives on stack
+            #[allow(unused_assignments)]
+            let mut cq_owned = None;
+
+            let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+                let cq = Arc::clone(&submit_side.completion_side);
+                cq_owned = Some(cq);
+                Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
+            } else {
+                None
+            };
+
+            if let Some(mut cq) = cq_guard {
+                // opportunistically process completion immediately
+                // TODO do it during ::poll() as well?
+                //
+                // FIXME: why are we doing this while holding the SubmitSideOpen
+                cq.process_completions(ProcessCompletionsCause::Regular);
+            }
+        }
 
         Ok(self.wait_for_completion(op))
     }
@@ -580,9 +612,9 @@ impl SlotHandle {
                 let cur: Slot = std::mem::replace(&mut *slot_mut, Slot::Undefined);
                 match cur {
                     Slot::Undefined => panic!("future is in undefined state"),
-                Slot::Pending {
-                    waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
-                } => {
+                    Slot::Pending {
+                        waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
+                    } => {
                         trace!("op is still pending, storing waker in it");
                         *slot_mut = Slot::Pending {
                             waker: Some(cx.waker().clone()),
@@ -608,7 +640,8 @@ impl SlotHandle {
                 InspectSlotResult::NeedToWait => Poll::Pending,
                 x => Poll::Ready(x),
             }
-        }).await;
+        })
+        .await;
         let res: i32;
         let was_ready_on_first_poll: bool;
         match inspect_slot_res {

@@ -1,4 +1,4 @@
-use std::{fmt::Display, sync::Arc};
+use std::fmt::Display;
 
 /// An io_uring operation and the resources it operates on.
 ///
@@ -12,10 +12,7 @@ pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
     fn make_sqe(&mut self) -> io_uring::squeue::Entry;
 }
 
-use crate::system::{
-    completion::ProcessCompletionsCause,
-    slots::{self, InflightHandleError},
-};
+use crate::system::slots::{self, InflightHandleError};
 
 use super::SubmitSideWeak;
 
@@ -63,51 +60,17 @@ where
     };
 
     let ret = submit_side.with_submit_side_open(|submit_side| {
-
         let submit_side = match submit_side {
             Some(submit_side) => submit_side,
-            None => return Err((
+            None => {
+                return Err((
                     op.on_failed_submission(),
                     Err(Error::System(OpError::SystemShuttingDown)),
-                )),
-        };
-
-        // inlined finish-submit
-
-        let mut do_submit = |sqe|{
-            if submit_side.submit_raw(sqe).is_err() {
-                // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
-                // So, we could just submit_and_wait here. But, that'd prevent the
-                // current executor thread from making progress on other tasks.
-                //
-                // So, for now, keep SQ size == inflight ops size == Slots size.
-                // This potentially limits throughput if SQ size is chosen too small.
-                //
-                // FIXME: why not just async mutex?
-                unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
-            }
-
-            // this allows us to keep the possible guard in cq_guard because the arc lives on stack
-            #[allow(unused_assignments)]
-            let mut cq_owned = None;
-
-            let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-                let cq = Arc::clone(&submit_side.completion_side);
-                cq_owned = Some(cq);
-                Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
-            } else {
-                None
-            };
-
-            if let Some(mut cq) = cq_guard {
-                // opportunistically process completion immediately
-                // TODO do it during ::poll() as well?
-                //
-                // FIXME: why are we doing this while holding the SubmitSideOpen
-                cq.process_completions(ProcessCompletionsCause::Regular);
+                ))
             }
         };
-        Ok(slot.use_for_op(op, &mut do_submit))
+
+        Ok(slot.use_for_op(op, submit_side))
     });
 
     match ret {

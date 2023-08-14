@@ -135,7 +135,7 @@ pub(crate) struct SubmitSideOpen {
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
     slots: Slots<{ slots::co_owner::SUBMIT_SIDE }>,
-    completion_side: Arc<Mutex<CompletionSide>>,
+    pub(super) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
 impl SubmitSide {
