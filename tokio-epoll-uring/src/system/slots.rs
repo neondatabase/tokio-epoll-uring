@@ -29,6 +29,7 @@
 //! ownership of the resources that the io_uring operation operates on.
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, Weak},
 };
@@ -477,14 +478,7 @@ impl SlotHandle {
 
         do_submit(sqe);
 
-        Ok(async move {
-            (InflightHandle {
-                resources_owned_by_kernel: Some(op),
-                slot: self,
-            })
-            .poll_impl()
-            .await
-        })
+        Ok(async move { poll_impl(self, op).await })
     }
 }
 
@@ -515,68 +509,123 @@ pub(crate) enum InflightHandleError<O: Op> {
     Completion(O::Error),
 }
 
-impl<O> InflightHandle<O>
-where
-    O: Op + Send + 'static,
-{
-    async fn poll_impl(mut self) -> (O::Resources, Result<O::Success, InflightHandleError<O>>) {
-        let res;
-        let was_ready_on_first_poll;
-        match self.slot.poll_inflight() {
-            InflightSlotPollResult::AlreadyDone(r) => {
-                res = r;
-                was_ready_on_first_poll = true;
+async fn poll_impl<O: Op + Send + 'static>(
+    slot: SlotHandle,
+    op: O,
+) -> (O::Resources, Result<O::Success, InflightHandleError<O>>) {
+    let slot = slot;
+    let op = RefCell::new(Some(op));
+
+    // if we get dropped before the op completes, we need to make sure
+    // that the resources owned by the kernel continue to live
+    scopeguard::defer! {
+        let res = slot.slots_weak.try_upgrade_mut(|inner| {
+            let storage = match inner {
+                SlotsInner::Undefined => unreachable!(),
+                SlotsInner::Open(inner) => &mut inner.storage,
+                SlotsInner::Draining(inner) => &mut inner.storage,
+            };
+            let slot_storage_mut = &mut storage[slot.idx];
+            let slot_mut = slot_storage_mut.as_mut().unwrap();
+            let cur = std::mem::replace(&mut *slot_mut, Slot::Undefined);
+            match cur {
+                Slot::Undefined => unreachable!("implementation error"),
+                Slot::Pending { .. } => {
+                    // Up until now, Self held the resources that the uring op is operating on.
+                    // Now Self is getting dropped, but the uring op is still ongoing.
+                    // We must prevent the resources from getting dropped, otherwise the kernel will operate on the dropped resource.
+                    // NB: the most concerning resource is the memory buffer into which a read-style uring op will write / from which a write-style uring will read.
+                    let op = op.take().unwrap();
+                    // Use Box for type erasure.
+                    // Type erasure is necessary because the ResourcesOwnedByKernel trait has an associated type "OpResult",
+                    // and we don't want the system to be generic over it.
+                    // Since dropping of inflight IOs is generally rare, the allocations should be fine.
+                    // Could optimize by making erause a trait method on ResourcesOwnedByKernel; it could then use a slab allcoator or similar.
+                    let rsrc: Box<dyn std::any::Any + Send> = Box::new(op);
+                    *slot_mut = Slot::PendingButFutureDropped {
+                        resources_owned_by_kernel: rsrc,
+                    };
+                }
+                Slot::Ready { result } => {
+                    // The op completed and called the waker that would eventually cause this future to be polled
+                    // and transition from Inflight to one of the Done states. But this future got dropped first.
+                    // So, it's our job to drop the slot.
+                    *slot_mut = Slot::Ready { result };
+                    inner.return_slot(slot.idx);
+                }
+                Slot::PendingButFutureDropped { .. } => {
+                    unreachable!("above is the only transition into this state, and this function only runs once")
+                }
             }
-            InflightSlotPollResult::NeedToWait(waiter_rx) => match waiter_rx.await {
-                Ok(r) => {
-                    res = r;
-                    was_ready_on_first_poll = false;
+        });
+        match res {
+            Ok(()) => (),
+            Err(()) => {
+                // SAFETY:
+                // This future has an outdated view of the system; it shut down in the meantime.
+                // Shutdown makes sure that all inflight ops complete, so, it is safe to drop the resources owned by kernel at this point.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    drop(op.take().unwrap());
                 }
-                Err(_sender_dropped) => {
-                    // SAFETY:
-                    // This future has an outdated view of the system; it shut down in the meantime.
-                    // Shutdown makes sure that all inflight ops complete, so,
-                    // these resources are no longer owned by the kernel and can be returned as an error.
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        let resources_owned_by_kernel =
-                            self.resources_owned_by_kernel.take().unwrap();
-                        return (
-                            resources_owned_by_kernel.on_failed_submission(),
-                            Err(InflightHandleError::SlotsDropped),
-                        );
-                    }
-                }
-            },
-            InflightSlotPollResult::ShutDown => {
+            }
+        }
+    };
+
+    let res;
+    let was_ready_on_first_poll;
+    match slot.poll_inflight() {
+        InflightSlotPollResult::AlreadyDone(r) => {
+            res = r;
+            was_ready_on_first_poll = true;
+        }
+        InflightSlotPollResult::NeedToWait(waiter_rx) => match waiter_rx.await {
+            Ok(r) => {
+                res = r;
+                was_ready_on_first_poll = false;
+            }
+            Err(_sender_dropped) => {
                 // SAFETY:
                 // This future has an outdated view of the system; it shut down in the meantime.
                 // Shutdown makes sure that all inflight ops complete, so,
                 // these resources are no longer owned by the kernel and can be returned as an error.
                 #[allow(unused_unsafe)]
                 unsafe {
-                    let resources_owned_by_kernel = self.resources_owned_by_kernel.take().unwrap();
+                    let resources_owned_by_kernel = op.take().unwrap();
                     return (
                         resources_owned_by_kernel.on_failed_submission(),
                         Err(InflightHandleError::SlotsDropped),
                     );
                 }
             }
-        };
-        // SAFETY:
-        // We got a result, so, kernel is done with the operation and ownership is back with us.
-        #[allow(unused_unsafe)]
-        let rsrc = unsafe {
-            self.resources_owned_by_kernel.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self")
-        };
-
-        if was_ready_on_first_poll && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL
-        {
-            tokio::task::yield_now().await;
+        },
+        InflightSlotPollResult::ShutDown => {
+            // SAFETY:
+            // This future has an outdated view of the system; it shut down in the meantime.
+            // Shutdown makes sure that all inflight ops complete, so,
+            // these resources are no longer owned by the kernel and can be returned as an error.
+            #[allow(unused_unsafe)]
+            unsafe {
+                let op = op.replace(None).unwrap();
+                return (
+                    op.on_failed_submission(),
+                    Err(InflightHandleError::SlotsDropped),
+                );
+            }
         }
-        let (resources, res) = rsrc.on_op_completion(res);
-        (resources, res.map_err(InflightHandleError::Completion))
+    };
+    // SAFETY:
+    // We got a result, so, kernel is done with the operation and ownership is back with us.
+    #[allow(unused_unsafe)]
+    let rsrc = unsafe {
+        op.take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self")
+    };
+
+    if was_ready_on_first_poll && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
+        tokio::task::yield_now().await;
     }
+    let (resources, res) = rsrc.on_op_completion(res);
+    (resources, res.map_err(InflightHandleError::Completion))
 }
 
 impl<O> Drop for InflightHandle<O>
