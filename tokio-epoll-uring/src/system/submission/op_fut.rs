@@ -72,8 +72,6 @@ where
                 )),
         };
 
-        // inlined finish-submit
-
         let do_submit = |submit_side: &mut super::SubmitSideOpen, sqe|{
             if submit_side.submit_raw(sqe).is_err() {
                 // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
@@ -107,6 +105,8 @@ where
                 cq.process_completions(ProcessCompletionsCause::Regular);
             }
         };
+
+        // We return a future here, the subsequent code is going to await it.
         Ok(slot.use_for_op(op, do_submit, submit_side))
     });
 

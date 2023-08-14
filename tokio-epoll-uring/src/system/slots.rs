@@ -484,10 +484,13 @@ impl SlotHandle {
         let slot = self;
         let op = std::sync::Mutex::new(Some(op));
 
-        // If this future gets dropped before the op completes, we need to make sure
-        // that the resources owned by the kernel continue to live.
+        // If this future gets dropped _before_ the op completes, we need to make sure
+        // that the resources owned by the kernel continue to live until the op completes.
+        // Otherwise, the kernel will operate on the dropped resource. The most concerning
+        // case are memory buffers which would be use-after-freed by the kernel. For example,
+        // for a read uring op, the kernel could write into the buffer that has been freed and/or re-used.
         //
-        // If this futures gets dropped after the op completes but before this future
+        // If this futures gets dropped _after_ the op completes but before this future
         // is poll()ed, we need to return the slot in addition to freeing the resources.
         scopeguard::defer! {
             if op.lock().unwrap().is_none() {
@@ -509,10 +512,8 @@ impl SlotHandle {
                 match cur {
                     Slot::Undefined => unreachable!("implementation error"),
                     Slot::Pending { .. } => {
-                        // Up until now, Self held the resources that the uring op is operating on.
-                        // Now Self is getting dropped, but the uring op is still ongoing.
-                        // We must prevent the resources from getting dropped, otherwise the kernel will operate on the dropped resource.
-                        // NB: the most concerning resource is the memory buffer into which a read-style uring op will write / from which a write-style uring will read.
+                        // The resource needs to be kept alive until the op completes.
+                        // So, move it into the Slot.
 
                         // Use Box for type erasure.
                         // Type erasure is necessary because the ResourcesOwnedByKernel trait has an associated type "OpResult",
