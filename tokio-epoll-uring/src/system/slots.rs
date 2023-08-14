@@ -442,16 +442,18 @@ pub(crate) enum InflightHandleError<O: Op> {
 }
 
 impl SlotHandle {
-    pub(crate) fn use_for_op<O>(
+    pub(crate) fn use_for_op<O, S, T>(
         self,
         mut op: O,
-        do_submit: &mut dyn FnMut(io_uring::squeue::Entry),
+        do_submit: S,
+        do_submit_arg: &mut T,
     ) -> Result<
         impl std::future::Future<Output = (O::Resources, Result<O::Success, InflightHandleError<O>>)>,
         (O, UseError),
     >
     where
         O: Op + Send + 'static,
+        S: Fn(&mut T, io_uring::squeue::Entry),
     {
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
@@ -470,7 +472,7 @@ impl SlotHandle {
             return Err((op, UseError::SlotsDropped));
         };
 
-        do_submit(sqe);
+        do_submit(do_submit_arg, sqe);
 
         Ok(self.wait_for_completion(op))
     }
@@ -580,9 +582,9 @@ impl SlotHandle {
                 let cur: Slot = std::mem::replace(&mut *slot_mut, Slot::Undefined);
                 match cur {
                     Slot::Undefined => panic!("future is in undefined state"),
-                Slot::Pending {
-                    waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
-                } => {
+                    Slot::Pending {
+                        waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
+                    } => {
                         trace!("op is still pending, storing waker in it");
                         *slot_mut = Slot::Pending {
                             waker: Some(cx.waker().clone()),
@@ -608,7 +610,8 @@ impl SlotHandle {
                 InspectSlotResult::NeedToWait => Poll::Pending,
                 x => Poll::Ready(x),
             }
-        }).await;
+        })
+        .await;
         let res: i32;
         let was_ready_on_first_poll: bool;
         match inspect_slot_res {

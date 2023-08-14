@@ -64,7 +64,7 @@ where
 
     let ret = submit_side.with_submit_side_open(|submit_side| {
 
-        let submit_side = match submit_side {
+        let submit_side: &mut super::SubmitSideOpen = match submit_side {
             Some(submit_side) => submit_side,
             None => return Err((
                     op.on_failed_submission(),
@@ -74,7 +74,7 @@ where
 
         // inlined finish-submit
 
-        let mut do_submit = |sqe|{
+        let do_submit = |submit_side: &mut super::SubmitSideOpen, sqe|{
             if submit_side.submit_raw(sqe).is_err() {
                 // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
                 // So, we could just submit_and_wait here. But, that'd prevent the
@@ -107,7 +107,7 @@ where
                 cq.process_completions(ProcessCompletionsCause::Regular);
             }
         };
-        Ok(slot.use_for_op(op, &mut do_submit))
+        Ok(slot.use_for_op(op, do_submit, submit_side))
     });
 
     match ret {
