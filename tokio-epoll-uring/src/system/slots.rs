@@ -488,6 +488,10 @@ impl SlotHandle {
         // If this futures gets dropped after the op completes but before this future
         // is poll()ed, we need to return the slot in addition to freeing the resources.
         scopeguard::defer! {
+            if op.lock().unwrap().is_none() {
+                // fast-path to avoid the try_upgrade_mut() call
+                return;
+            }
             let res = slot.slots_weak.try_upgrade_mut(|inner| {
                 let Some(op) = op.lock().unwrap().take() else {
                     return;
