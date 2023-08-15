@@ -573,13 +573,16 @@ impl SlotHandle {
                 let cur: Slot = std::mem::replace(&mut *slot_mut, Slot::Undefined);
                 match cur {
                     Slot::Undefined => panic!("slot is in undefined state"),
-                    Slot::Pending {
-                        waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
-                    } => {
+                    Slot::Pending { mut waker } => {
                         trace!("op is still pending, storing waker in it");
-                        *slot_mut = Slot::Pending {
-                            waker: Some(cx.waker().clone()),
-                        };
+                        let waker_mut_ref = waker.get_or_insert_with(|| cx.waker().clone());
+                        if !cx.waker().will_wake(waker_mut_ref) {
+                            *slot_mut = Slot::Pending {
+                                waker: Some(cx.waker().clone()),
+                            };
+                        } else {
+                            *slot_mut = Slot::Pending { waker };
+                        }
                         InspectSlotResult::NeedToWait
                     }
                     Slot::PendingButFutureDropped { .. } => {
