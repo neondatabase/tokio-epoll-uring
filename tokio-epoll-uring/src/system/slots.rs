@@ -577,7 +577,7 @@ impl SlotHandle {
 
                 let cur: Slot = std::mem::replace(&mut *slot_mut, Slot::Undefined);
                 match cur {
-                    Slot::Undefined => panic!("future is in undefined state"),
+                    Slot::Undefined => panic!("slot is in undefined state"),
                     Slot::Pending {
                         waker: _, // don't recycle wakers, it may be from a different Context than the current `cx`
                     } => {
