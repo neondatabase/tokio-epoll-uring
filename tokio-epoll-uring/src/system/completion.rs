@@ -103,7 +103,6 @@ impl Poller {
 }
 
 enum PollerState {
-    Undefined,
     RunningInTask(Arc<Mutex<PollerStateInner>>),
     RunningInThread(Arc<Mutex<PollerStateInner>>),
     ShuttingDownPreemptible(Arc<Mutex<PollerStateInner>>, Arc<ShutdownRequest>),
@@ -114,7 +113,6 @@ enum PollerState {
 impl std::fmt::Debug for PollerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PollerState::Undefined => write!(f, "Undefined"),
             PollerState::RunningInTask(_) => write!(f, "RunningInTask"),
             PollerState::RunningInThread(_) => write!(f, "RunningInThread"),
             PollerState::ShuttingDownPreemptible(_, _) => write!(f, "ShuttingDownPreemptible"),
@@ -172,25 +170,20 @@ async fn poller_task(
             let span = info_span!("poller_task_scopeguard", system=%id);
             let _entered = span.enter(); // safe to use here because there's no more .await
             let mut poller_guard = poller.lock().unwrap();
-            let cur = std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
-            match cur {
+            match &mut poller_guard.state {
                 PollerState::ShutDown => {
                     // we're done
-                    poller_guard.state = PollerState::ShutDown;
                     return;
                 }
-                x @ PollerState::ShuttingDownPreemptible(_, _) => {
+                PollerState::ShuttingDownPreemptible(_, _) => {
                     tracing::info!("poller task dropped while shutting down");
-                    poller_guard.state = x;
                 }
                 PollerState::RunningInTask(inner) => {
                     tracing::info!("poller task dropped while running poller_impl_impl");
-                    poller_guard.state = PollerState::RunningInThread(inner);
+                    poller_guard.state = PollerState::RunningInThread(Arc::clone(inner));
                 }
-                PollerState::RunningInThread(_)
-                | PollerState::Undefined
-                | PollerState::ShuttingDownNoMorePreemptible => {
-                    unreachable!("unexpected state: {cur:?}")
+                PollerState::RunningInThread(_) | PollerState::ShuttingDownNoMorePreemptible => {
+                    unreachable!("unexpected state: {:?}", poller_guard.state)
                 }
             }
             let poller_clone = Arc::clone(&poller);
@@ -207,13 +200,10 @@ async fn poller_task(
                         .unwrap()
                         .block_on(async move {
                             let poller = poller_clone;
-                            let mut poller_guard = poller.lock().unwrap();
-                            let cur =
-                                std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
-                            match cur {
-                                x @ PollerState::RunningInThread(_)
-                                | x @ PollerState::ShuttingDownPreemptible(_, _) => {
-                                    poller_guard.state = x;
+                            let poller_guard = poller.lock().unwrap();
+                            match &poller_guard.state {
+                                PollerState::RunningInThread(_)
+                                | PollerState::ShuttingDownPreemptible(_, _) => {
                                     drop(poller_guard);
                                     if let Some(tx) = poller_switch_to_thread_done {
                                         // receiver must ensure that clone doesn't outlive the try_unwrap during shutdown
@@ -223,11 +213,10 @@ async fn poller_task(
                                         .instrument(info_span!("poller_thread", system=%id))
                                         .await
                                 }
-                                PollerState::Undefined
-                                | PollerState::RunningInTask(_)
+                                PollerState::RunningInTask(_)
                                 | PollerState::ShuttingDownNoMorePreemptible
                                 | PollerState::ShutDown => {
-                                    unreachable!("unexpected state: {cur:x?}")
+                                    unreachable!("unexpected state: {:?}", poller_guard.state)
                                 }
                             }
                         })
@@ -276,30 +265,29 @@ async fn poller_impl(
     // So, keep book about our state.
     let (inner_shared, maybe_shutdown_req_shared) = {
         let mut poller_guard = poller.lock().unwrap();
-        let cur = std::mem::replace(&mut poller_guard.state, PollerState::Undefined);
-        match cur {
-            PollerState::Undefined => {
-                panic!("implementation error")
-            }
+        match &mut poller_guard.state {
             PollerState::ShuttingDownNoMorePreemptible => unreachable!(),
             PollerState::ShutDown => {
                 unreachable!("if poller_impl_impl shuts shuts down, we never get back here, caller guarantees it")
             }
             PollerState::ShuttingDownPreemptible(inner, req) => {
-                let inner_clone = Arc::clone(&inner);
-                let req_clone = Arc::clone(&req);
-                poller_guard.state = PollerState::ShuttingDownPreemptible(inner, req);
-                (inner_clone, Some(req_clone))
+                let new_state =
+                    PollerState::ShuttingDownPreemptible(Arc::clone(inner), Arc::clone(req));
+                let ret = (Arc::clone(inner), Some(Arc::clone(req)));
+                poller_guard.state = new_state;
+                ret
             }
             PollerState::RunningInTask(inner) => {
-                let clone = Arc::clone(&inner);
-                poller_guard.state = PollerState::RunningInTask(inner);
-                (clone, None)
+                let new_state = PollerState::RunningInTask(Arc::clone(inner));
+                let ret = (Arc::clone(inner), None);
+                poller_guard.state = new_state;
+                ret
             }
             PollerState::RunningInThread(inner) => {
-                let clone = Arc::clone(&inner);
-                poller_guard.state = PollerState::RunningInThread(inner);
-                (clone, None)
+                let new_state = PollerState::RunningInThread(Arc::clone(inner));
+                let ret = (Arc::clone(inner), None);
+                poller_guard.state = new_state;
+                ret
             }
         }
     };
@@ -365,11 +353,12 @@ async fn poller_impl(
         );
         drop(poller_guard);
         match cur {
-            x @ PollerState::RunningInTask(_)
-            | x @ PollerState::RunningInThread(_)
-            | x @ PollerState::ShutDown
-            | x @ PollerState::ShuttingDownNoMorePreemptible
-            | x @ PollerState::Undefined => unreachable!("unexpected state: {x:?}"),
+            PollerState::RunningInTask(_)
+            | PollerState::RunningInThread(_)
+            | PollerState::ShutDown
+            | PollerState::ShuttingDownNoMorePreemptible => {
+                unreachable!("unexpected state: {cur:?}")
+            }
             PollerState::ShuttingDownPreemptible(inner, req) => {
                 assert!(Arc::ptr_eq(&inner_shared, &inner));
                 assert!(Arc::ptr_eq(&shutdown_req_shared, &req));
