@@ -23,7 +23,7 @@ impl SharedSystemHandle {
     }
 
     #[cfg(test)]
-    pub(crate) async fn launch_with_testing(poller_testing: PollerTesting) -> Self {
+    pub(crate) async fn launch_with_testing(poller_testing: Option<PollerTesting>) -> Self {
         let handle = System::launch_with_testing(poller_testing).await;
         Self(Arc::new(RwLock::new(Some(handle))))
     }

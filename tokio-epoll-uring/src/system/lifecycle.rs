@@ -1,13 +1,11 @@
 use std::{
     os::fd::AsRawFd,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 pub mod handle;
 pub mod thread_local;
 
-use futures::FutureExt;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
 use crate::system::{submission::SubmitSideOpen, RING_SIZE};
@@ -32,31 +30,7 @@ unsafe impl Send for System {}
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
 unsafe impl Sync for System {}
 
-/// See [`System::launch`].
-pub struct Launch {
-    id: usize,
-    state: LaunchState,
-}
-
-enum LaunchState {
-    Init {
-        // TODO: cfg test
-        poller_preempt: Option<PollerTesting>,
-    },
-    WaitForPollerTaskToStart {
-        poller_ready_fut: Pin<
-            Box<
-                dyn Send
-                    + std::future::Future<
-                        Output = crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
-                    >,
-            >,
-        >,
-        submit_side: SubmitSide,
-    },
-    Launched,
-    Undefined,
-}
+static SYSTEM_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl System {
     /// Returns a future that, when polled, sets up an io_uring instance
@@ -65,101 +39,51 @@ impl System {
     /// interact with the system.
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
-    pub fn launch() -> impl std::future::Future<Output = SystemHandle> {
-        static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Launch {
-            id,
-            state: LaunchState::Init {
-                poller_preempt: None,
-            },
-        }
+    pub async fn launch() -> SystemHandle {
+        Self::launch_with_testing(None).await
     }
-    #[cfg(test)]
-    pub(crate) fn launch_with_testing(poller_preempt: PollerTesting) -> Launch {
-        static POLLER_TASK_ID: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let id = POLLER_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Launch {
-            id,
-            state: LaunchState::Init {
-                poller_preempt: Some(poller_preempt),
-            },
-        }
-    }
-}
 
-impl std::future::Future for Launch {
-    type Output = SystemHandle;
+    pub(crate) async fn launch_with_testing(testing: Option<PollerTesting>) -> SystemHandle {
+        let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let id = self.id;
-        let myself = self.get_mut();
-        loop {
-            let cur = { std::mem::replace(&mut myself.state, LaunchState::Undefined) };
-            match cur {
-                LaunchState::Undefined => unreachable!("implementation error"),
-                LaunchState::Init { poller_preempt } => {
-                    // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
-                    let (ops_submit_side, ops_completion_side, ops_poller) = super::slots::new(id);
-                    let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
-                    let uring_fd = unsafe { (*uring).as_raw_fd() };
-                    let (submitter, sq, cq) = unsafe { (*uring).split() };
+        // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
+        let (submit_side, poller_ready_fut) = {
+            let (slots_submit_side, slots_completion_side, slots_poller) = super::slots::new(id);
+            let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
+            let uring_fd = unsafe { (*uring).as_raw_fd() };
+            let (submitter, sq, cq) = unsafe { (*uring).split() };
 
-                    let completion_side =
-                        Arc::new(Mutex::new(CompletionSide::new(id, cq, ops_completion_side)));
+            let completion_side = Arc::new(Mutex::new(CompletionSide::new(
+                id,
+                cq,
+                slots_completion_side,
+            )));
 
-                    let submit_side = SubmitSide::new(SubmitSideNewArgs {
-                        id,
-                        submitter,
-                        sq,
-                        slots: ops_submit_side,
-                        completion_side: Arc::clone(&completion_side),
-                    });
-                    let system = System {
-                        id,
-                        split_uring: uring,
-                    };
-                    let poller_ready_fut = Poller::launch(PollerNewArgs {
-                        id,
-                        uring_fd,
-                        completion_side,
-                        system,
-                        slots: ops_poller,
-                        testing: poller_preempt,
-                    });
-                    myself.state = LaunchState::WaitForPollerTaskToStart {
-                        poller_ready_fut: Box::pin(poller_ready_fut),
-                        submit_side,
-                    };
-                    continue;
-                }
-                LaunchState::WaitForPollerTaskToStart {
-                    mut poller_ready_fut,
-                    submit_side,
-                } => match poller_ready_fut.poll_unpin(cx) {
-                    std::task::Poll::Ready(poller_shutdown_tx) => {
-                        myself.state = LaunchState::Launched;
-                        let system_handle = SystemHandle::new(id, submit_side, poller_shutdown_tx);
-                        return std::task::Poll::Ready(system_handle);
-                    }
-                    std::task::Poll::Pending => {
-                        myself.state = LaunchState::WaitForPollerTaskToStart {
-                            poller_ready_fut,
-                            submit_side,
-                        };
-                        return std::task::Poll::Pending;
-                    }
-                },
-                LaunchState::Launched => {
-                    unreachable!("we already returned Ready(SystemHandle) above, polling after is not allowed");
-                }
-            }
-        }
+            let submit_side = SubmitSide::new(SubmitSideNewArgs {
+                id,
+                submitter,
+                sq,
+                slots: slots_submit_side,
+                completion_side: Arc::clone(&completion_side),
+            });
+            let system = System {
+                id,
+                split_uring: uring,
+            };
+            let poller_ready_fut = Poller::launch(PollerNewArgs {
+                id,
+                uring_fd,
+                completion_side,
+                system,
+                slots: slots_poller,
+                testing,
+            });
+            (submit_side, poller_ready_fut)
+        };
+
+        let poller_shutdown_tx = poller_ready_fut.await;
+
+        SystemHandle::new(id, submit_side, poller_shutdown_tx)
     }
 }
 
