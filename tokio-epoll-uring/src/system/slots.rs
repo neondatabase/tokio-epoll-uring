@@ -509,15 +509,10 @@ impl SlotHandle {
                     Slot::Pending { .. } => {
                         // The resource needs to be kept alive until the op completes.
                         // So, move it into the Slot.
-
-                        // Use Box for type erasure.
-                        // Type erasure is necessary because the ResourcesOwnedByKernel trait has an associated type "OpResult",
-                        // and we don't want the system to be generic over it.
-                        // Since dropping of inflight IOs is generally rare, the allocations should be fine.
-                        // Could optimize by making erause a trait method on ResourcesOwnedByKernel; it could then use a slab allcoator or similar.
-                        let op: Box<dyn std::any::Any + Send> = Box::new(op);
+                        // `process_completion` will drop the box and return the slot
+                        // once it observes the completion.
                         *slot_mut = Slot::PendingButFutureDropped {
-                            resources_owned_by_kernel: op,
+                            resources_owned_by_kernel: Box::new(op),
                         };
                     }
                     Slot::Ready { result } => {
