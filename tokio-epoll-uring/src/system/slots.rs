@@ -87,13 +87,12 @@ pub(crate) struct SlotHandle {
 }
 
 enum Slot {
-    Undefined,
     Pending {
         waker: Option<std::task::Waker>, // None if it hasn't been polled yet
     },
     PendingButFutureDropped {
         /// When a future gets dropped while the Op is still running, it gets Box'ed  This is a Box'ed `ResourcesOwnedByKernel`
-        resources_owned_by_kernel: Box<dyn std::any::Any + Send>,
+        _resources_owned_by_kernel: Box<dyn std::any::Any + Send>,
     },
     Ready {
         result: i32,
@@ -183,7 +182,6 @@ impl SlotsInner {
             match slot_storage_ref {
                 None => (),
                 Some(slot_ref) => match slot_ref {
-                    Slot::Undefined => unreachable!(),
                     Slot::Pending { .. } | Slot::PendingButFutureDropped { .. } => {
                         panic!("implementation error: potential memory unsafety: we must not return a slot that is still pending  {:?}", slot_ref.discriminant_str());
                     }
@@ -284,10 +282,9 @@ impl SlotsInner {
         };
         let slot = &mut storage[idx];
         let slot = slot.as_mut().unwrap();
-        let cur = std::mem::replace(&mut *slot, Slot::Undefined);
-        match cur {
-            Slot::Undefined => unreachable!("implementation error"),
+        match slot {
             Slot::Pending { waker } => {
+                let waker = waker.take();
                 *slot = Slot::Ready {
                     result: cqe.result(),
                 };
@@ -297,9 +294,8 @@ impl SlotsInner {
                 }
             }
             Slot::PendingButFutureDropped {
-                resources_owned_by_kernel,
+                _resources_owned_by_kernel,
             } => {
-                drop(resources_owned_by_kernel);
                 *slot = Slot::Ready {
                     result: cqe.result(),
                 };
@@ -308,7 +304,7 @@ impl SlotsInner {
             Slot::Ready { .. } => {
                 unreachable!(
                     "completions only come in once: {:?}",
-                    cur.discriminant_str()
+                    slot.discriminant_str()
                 )
             }
         }
@@ -503,23 +499,21 @@ impl SlotHandle {
                 };
                 let slot_storage_mut = &mut storage[slot.idx];
                 let slot_mut = slot_storage_mut.as_mut().unwrap();
-                let cur = std::mem::replace(&mut *slot_mut, Slot::Undefined);
-                match cur {
-                    Slot::Undefined => unreachable!("implementation error"),
+                match &mut *slot_mut {
                     Slot::Pending { .. } => {
                         // The resource needs to be kept alive until the op completes.
                         // So, move it into the Slot.
                         // `process_completion` will drop the box and return the slot
                         // once it observes the completion.
                         *slot_mut = Slot::PendingButFutureDropped {
-                            resources_owned_by_kernel: Box::new(op),
+                            _resources_owned_by_kernel: Box::new(op),
                         };
                     }
                     Slot::Ready { result } => {
                         // The op completed and called the waker that would eventually cause this future to be polled
                         // and transition from Inflight to one of the Done states. But this future got dropped first.
                         // So, it's our job to drop the slot.
-                        *slot_mut = Slot::Ready { result };
+                        *slot_mut = Slot::Ready { result: *result };
                         inner.return_slot(slot.idx);
                         // SAFETY:
                         // The op is ready, hence the resources aren't onwed by the kernel anymore.
@@ -570,18 +564,12 @@ impl SlotHandle {
                 let slot_storage_ref = &mut storage[slot.idx];
                 let slot_mut = slot_storage_ref.as_mut().unwrap();
 
-                let cur: Slot = std::mem::replace(&mut *slot_mut, Slot::Undefined);
-                match cur {
-                    Slot::Undefined => panic!("slot is in undefined state"),
-                    Slot::Pending { mut waker } => {
+                match &mut *slot_mut {
+                    Slot::Pending { waker } => {
                         trace!("op is still pending, storing waker in it");
                         let waker_mut_ref = waker.get_or_insert_with(|| cx.waker().clone());
                         if !cx.waker().will_wake(waker_mut_ref) {
-                            *slot_mut = Slot::Pending {
-                                waker: Some(cx.waker().clone()),
-                            };
-                        } else {
-                            *slot_mut = Slot::Pending { waker };
+                            waker.replace(cx.waker().clone());
                         }
                         InspectSlotResult::NeedToWait
                     }
@@ -590,7 +578,7 @@ impl SlotHandle {
                     }
                     Slot::Ready { result: res } => {
                         trace!("op is ready, returning resources to user");
-                        *slot_mut = Slot::Ready { result: res };
+                        let res = *res;
                         inner.return_slot(slot.idx);
                         InspectSlotResult::AlreadyDone(res)
                     }
@@ -656,7 +644,6 @@ impl SlotsInnerDraining {
             .filter_map(|(idx, x)| match x {
                 None => Some(idx),
                 Some(slot_ref) => match slot_ref {
-                    Slot::Undefined => unreachable!(),
                     Slot::Pending { .. } => None,
                     Slot::PendingButFutureDropped { .. } => None,
                     Slot::Ready { .. } => Some(idx),
@@ -668,7 +655,6 @@ impl SlotsInnerDraining {
 impl Slot {
     pub(super) fn discriminant_str(&self) -> &'static str {
         match self {
-            Slot::Undefined => "Undefined",
             Slot::Pending { .. } => "Pending",
             Slot::PendingButFutureDropped { .. } => "PendingButFutureDropped",
             Slot::Ready { .. } => "Ready",
