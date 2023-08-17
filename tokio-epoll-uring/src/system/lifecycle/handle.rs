@@ -137,7 +137,7 @@ impl crate::SystemHandle {
     > {
         let op = crate::ops::nop::Nop {};
         let inner = self.inner.as_ref().unwrap();
-        execute_op(op, inner.submit_side.weak())
+        execute_op(op, inner.submit_side.weak(), None)
     }
     pub fn read<B: IoBufMut + Send>(
         &self,
@@ -152,6 +152,6 @@ impl crate::SystemHandle {
     > {
         let op = ReadOp { file, offset, buf };
         let inner = self.inner.as_ref().unwrap();
-        execute_op(op, inner.submit_side.weak())
+        execute_op(op, inner.submit_side.weak(), None)
     }
 }

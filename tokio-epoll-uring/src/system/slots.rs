@@ -33,9 +33,12 @@ use std::{
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
-use crate::system::submission::op_fut::{Error, SystemError};
+use crate::system::submission::op_fut::Error;
 
-use super::{submission::op_fut::Op, RING_SIZE};
+use super::{
+    submission::op_fut::{Op, SystemError},
+    RING_SIZE,
+};
 
 pub(super) mod co_owner {
     pub const SUBMIT_SIDE: usize = 0;
