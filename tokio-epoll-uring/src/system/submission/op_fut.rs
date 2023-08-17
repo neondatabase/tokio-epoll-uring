@@ -62,9 +62,9 @@ where
         }
     };
 
-    let inflight = submit_side.with_submit_side_open(|submit_side| {
+    let ret = submit_side.with_submit_side_open(|submit_side| {
 
-        let submit_side = match submit_side {
+        let submit_side: &mut super::SubmitSideOpen = match submit_side {
             Some(submit_side) => submit_side,
             None => return Err((
                     op.on_failed_submission(),
@@ -72,65 +72,60 @@ where
                 )),
         };
 
-        // inlined finish-submit
+        let do_submit = |submit_side: &mut super::SubmitSideOpen, sqe|{
+            if submit_side.submit_raw(sqe).is_err() {
+                // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
+                // So, we could just submit_and_wait here. But, that'd prevent the
+                // current executor thread from making progress on other tasks.
+                //
+                // So, for now, keep SQ size == inflight ops size == Slots size.
+                // This potentially limits throughput if SQ size is chosen too small.
+                //
+                // FIXME: why not just async mutex?
+                unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
+            }
 
-        let (sqe, inflight_op_fut) = match slot.use_for_op(op) {
-            Ok((sqe, inflight_op_handle)) => (sqe, inflight_op_handle),
-            Err((op, slots::UseError::SlotsDropped)) => {
-                return Err((
-                    op.on_failed_submission(),
-                    Err(Error::System(OpError::SystemShuttingDown)),
-                ));
+            // this allows us to keep the possible guard in cq_guard because the arc lives on stack
+            #[allow(unused_assignments)]
+            let mut cq_owned = None;
+
+            let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+                let cq = Arc::clone(&submit_side.completion_side);
+                cq_owned = Some(cq);
+                Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
+            } else {
+                None
+            };
+
+            if let Some(mut cq) = cq_guard {
+                // opportunistically process completion immediately
+                // TODO do it during ::poll() as well?
+                //
+                // FIXME: why are we doing this while holding the SubmitSideOpen
+                cq.process_completions(ProcessCompletionsCause::Regular);
             }
         };
 
-        // this allows us to keep the possible guard in cq_guard because the arc lives on stack
-        #[allow(unused_assignments)]
-        let mut cq_owned = None;
-
-        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-            let cq = Arc::clone(&submit_side.completion_side);
-            cq_owned = Some(cq);
-            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
-        } else {
-            None
-        };
-
-        if submit_side.submit_raw(sqe).is_err() {
-            // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
-            // So, we could just submit_and_wait here. But, that'd prevent the
-            // current executor thread from making progress on other tasks.
-            //
-            // So, for now, keep SQ size == inflight ops size == Slots size.
-            // This potentially limits throughput if SQ size is chosen too small.
-            //
-            // FIXME: why not just async mutex?
-            unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
-        }
-
-        if let Some(mut cq) = cq_guard {
-            // opportunistically process completion immediately
-            // TODO do it during ::poll() as well?
-            //
-            // FIXME: why are we doing this while holding the SubmitSideOpen
-            cq.process_completions(ProcessCompletionsCause::Regular);
-        }
-
-        Ok(inflight_op_fut)
+        // We return a future here, the subsequent code is going to await it.
+        Ok(slot.use_for_op(op, do_submit, submit_side))
     });
 
-    let inflight = match inflight {
-        Ok(fut) => fut,
-        Err(ret) => return ret,
-    };
-
-    // now submitted
-    let (resources, res) = inflight.await;
-    // FIXME: this should be an into
-    let res = res.map_err(|e| match e {
-        InflightHandleError::Completion(err) => Error::Op(err),
-        InflightHandleError::SlotsDropped => Error::System(OpError::SystemShuttingDown),
-    });
-
-    (resources, res)
+    match ret {
+        Err(with_submit_side_err) => with_submit_side_err,
+        Ok(use_for_op_ret) => match use_for_op_ret {
+            Err((op, slots::UseError::SlotsDropped)) => (
+                op.on_failed_submission(),
+                Err(Error::System(OpError::SystemShuttingDown)),
+            ),
+            Ok(inflight) => {
+                let (resources, res) = inflight.await;
+                // FIXME: this should be an into
+                let res = res.map_err(|e| match e {
+                    InflightHandleError::Completion(err) => Error::Op(err),
+                    InflightHandleError::SlotsDropped => Error::System(OpError::SystemShuttingDown),
+                });
+                (resources, res)
+            }
+        },
+    }
 }
