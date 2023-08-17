@@ -17,14 +17,14 @@ use crate::system::completion::ProcessCompletionsCause;
 use super::SubmitSideWeak;
 
 #[derive(Debug, thiserror::Error)]
-pub enum OpError {
+pub enum SystemError {
     #[error("shutting down")]
     SystemShuttingDown,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error<T> {
-    System(OpError),
+    System(SystemError),
     Op(T),
 }
 
@@ -55,7 +55,7 @@ where
         Some(slot) => slot,
         None => {
             let res = op.on_failed_submission();
-            return (res, Err(Error::System(OpError::SystemShuttingDown)));
+            return (res, Err(Error::System(SystemError::SystemShuttingDown)));
         }
     };
 
@@ -65,7 +65,7 @@ where
             Some(submit_side) => submit_side,
             None => return Err((
                     op.on_failed_submission(),
-                    Err(Error::System(OpError::SystemShuttingDown)),
+                    Err(Error::System(SystemError::SystemShuttingDown)),
                 )),
         };
 

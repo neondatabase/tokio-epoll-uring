@@ -33,7 +33,7 @@ use std::{
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
-use crate::system::submission::op_fut::{Error, OpError};
+use crate::system::submission::op_fut::{Error, SystemError};
 
 use super::{submission::op_fut::Op, RING_SIZE};
 
@@ -451,7 +451,7 @@ impl SlotHandle {
             }
         });
         let Ok(()) = res else {
-            return futures::future::Either::Left(async move { (op.on_failed_submission(), Err(Error::<O::Error>::System(OpError::SystemShuttingDown))) });
+            return futures::future::Either::Left(async move { (op.on_failed_submission(), Err(Error::<O::Error>::System(SystemError::SystemShuttingDown))) });
         };
 
         do_submit(do_submit_arg, sqe);
@@ -613,7 +613,7 @@ impl SlotHandle {
                     let op = op.lock().unwrap().take().unwrap();
                     return (
                         op.on_failed_submission(),
-                        Err(Error::System(OpError::SystemShuttingDown)),
+                        Err(Error::System(SystemError::SystemShuttingDown)),
                     );
                 }
             }
