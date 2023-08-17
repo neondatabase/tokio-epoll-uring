@@ -33,6 +33,8 @@ use std::{
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
+use crate::system::submission::op_fut::{Error, OpError};
+
 use super::{submission::op_fut::Op, RING_SIZE};
 
 pub(super) mod co_owner {
@@ -423,18 +425,6 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-// TODO: all of these are the same cause, i.e., system shutdown
-pub(crate) enum UseError {
-    #[error("slots dropped, the handle was stale, system is likely shutting/shut down")]
-    SlotsDropped,
-}
-
-/// Returned by [`SlotHandle::use_for_op`].
-pub(crate) enum InflightHandleError<O: Op> {
-    SlotsDropped,
-    Completion(O::Error),
-}
 
 impl SlotHandle {
     pub(crate) fn use_for_op<O, S, T>(
@@ -442,10 +432,7 @@ impl SlotHandle {
         mut op: O,
         do_submit: S,
         do_submit_arg: &mut T,
-    ) -> Result<
-        impl std::future::Future<Output = (O::Resources, Result<O::Success, InflightHandleError<O>>)>,
-        (O, UseError),
-    >
+    ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
     where
         O: Op + Send + 'static,
         S: Fn(&mut T, io_uring::squeue::Entry),
@@ -464,18 +451,18 @@ impl SlotHandle {
             }
         });
         let Ok(()) = res else {
-            return Err((op, UseError::SlotsDropped));
+            return futures::future::Either::Left(async move { (op.on_failed_submission(), Err(Error::<O::Error>::System(OpError::SystemShuttingDown))) });
         };
 
         do_submit(do_submit_arg, sqe);
 
-        Ok(self.wait_for_completion(op))
+        futures::future::Either::Right(self.wait_for_completion(op))
     }
 
     async fn wait_for_completion<O: Op + Send + 'static>(
         self,
         op: O,
-    ) -> (O::Resources, Result<O::Success, InflightHandleError<O>>) {
+    ) -> (O::Resources, Result<O::Success, Error<O::Error>>) {
         let slot = self;
         let op = std::sync::Mutex::new(Some(op));
 
@@ -626,7 +613,7 @@ impl SlotHandle {
                     let op = op.lock().unwrap().take().unwrap();
                     return (
                         op.on_failed_submission(),
-                        Err(InflightHandleError::SlotsDropped),
+                        Err(Error::System(OpError::SystemShuttingDown)),
                     );
                 }
             }
@@ -644,7 +631,7 @@ impl SlotHandle {
             let op = op.lock().unwrap().take().expect("we only take() it in drop(), and evidently drop() hasn't happened yet because we're executing a method on self");
             op.on_op_completion(res)
         };
-        (resources, res.map_err(InflightHandleError::Completion))
+        (resources, res.map_err(Error::Op))
     }
 }
 
