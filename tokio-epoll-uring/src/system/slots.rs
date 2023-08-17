@@ -433,11 +433,11 @@ impl SlotHandle {
         self,
         mut op: O,
         do_submit: S,
-        do_submit_arg: &mut T,
+        do_submit_arg: T,
     ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
     where
         O: Op + Send + 'static,
-        S: Fn(&mut T, io_uring::squeue::Entry),
+        S: Fn(T, io_uring::squeue::Entry),
     {
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
