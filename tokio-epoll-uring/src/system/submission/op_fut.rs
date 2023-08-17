@@ -59,45 +59,6 @@ where
 {
     let submit_side_weak = submit_side.clone();
 
-    enum Fut<Output, A, B, C, D, E>
-    where
-        A: std::future::Future<Output = Output>,
-        B: std::future::Future<Output = Output>,
-        C: std::future::Future<Output = Output>,
-        D: std::future::Future<Output = Output>,
-        E: std::future::Future<Output = Output>,
-    {
-        A(A),
-        B(B),
-        C(C),
-        D(D),
-        E(E),
-    }
-    impl<Output, A, B, C, D, E> std::future::Future for Fut<Output, A, B, C, D, E>
-    where
-        A: std::future::Future<Output = Output>,
-        B: std::future::Future<Output = Output>,
-        C: std::future::Future<Output = Output>,
-        D: std::future::Future<Output = Output>,
-        E: std::future::Future<Output = Output>,
-    {
-        type Output = Output;
-
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            unsafe {
-                match self.get_unchecked_mut() {
-                    Self::A(x) => Pin::new_unchecked(x).poll(cx),
-                    Self::B(x) => Pin::new_unchecked(x).poll(cx),
-                    Self::C(x) => Pin::new_unchecked(x).poll(cx),
-                    Self::D(x) => Pin::new_unchecked(x).poll(cx),
-                    Self::E(x) => Pin::new_unchecked(x).poll(cx),
-                }
-            }
-        }
-    }
     submit_side.with_submit_side_open(|submit_side| {
         let open: &mut super::SubmitSideOpen = match submit_side {
             Some(submit_side) => submit_side,
@@ -192,4 +153,45 @@ where
             }
         }
     }).await
+}
+
+// Used by `execute_op` to avoid boxing the future returned by the `with_submit_side` closure.
+enum Fut<Output, A, B, C, D, E>
+where
+    A: std::future::Future<Output = Output>,
+    B: std::future::Future<Output = Output>,
+    C: std::future::Future<Output = Output>,
+    D: std::future::Future<Output = Output>,
+    E: std::future::Future<Output = Output>,
+{
+    A(A),
+    B(B),
+    C(C),
+    D(D),
+    E(E),
+}
+impl<Output, A, B, C, D, E> std::future::Future for Fut<Output, A, B, C, D, E>
+where
+    A: std::future::Future<Output = Output>,
+    B: std::future::Future<Output = Output>,
+    C: std::future::Future<Output = Output>,
+    D: std::future::Future<Output = Output>,
+    E: std::future::Future<Output = Output>,
+{
+    type Output = Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        unsafe {
+            match self.get_unchecked_mut() {
+                Self::A(x) => Pin::new_unchecked(x).poll(cx),
+                Self::B(x) => Pin::new_unchecked(x).poll(cx),
+                Self::C(x) => Pin::new_unchecked(x).poll(cx),
+                Self::D(x) => Pin::new_unchecked(x).poll(cx),
+                Self::E(x) => Pin::new_unchecked(x).poll(cx),
+            }
+        }
+    }
 }
