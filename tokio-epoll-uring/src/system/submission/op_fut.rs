@@ -12,22 +12,19 @@ pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
     fn make_sqe(&mut self) -> io_uring::squeue::Entry;
 }
 
-use crate::system::{
-    completion::ProcessCompletionsCause,
-    slots::{self, InflightHandleError},
-};
+use crate::system::completion::ProcessCompletionsCause;
 
 use super::SubmitSideWeak;
 
 #[derive(Debug, thiserror::Error)]
-pub enum OpError {
+pub enum SystemError {
     #[error("shutting down")]
     SystemShuttingDown,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error<T> {
-    System(OpError),
+    System(SystemError),
     Op(T),
 }
 
@@ -58,7 +55,7 @@ where
         Some(slot) => slot,
         None => {
             let res = op.on_failed_submission();
-            return (res, Err(Error::System(OpError::SystemShuttingDown)));
+            return (res, Err(Error::System(SystemError::SystemShuttingDown)));
         }
     };
 
@@ -68,7 +65,7 @@ where
             Some(submit_side) => submit_side,
             None => return Err((
                     op.on_failed_submission(),
-                    Err(Error::System(OpError::SystemShuttingDown)),
+                    Err(Error::System(SystemError::SystemShuttingDown)),
                 )),
         };
 
@@ -112,20 +109,6 @@ where
 
     match ret {
         Err(with_submit_side_err) => with_submit_side_err,
-        Ok(use_for_op_ret) => match use_for_op_ret {
-            Err((op, slots::UseError::SlotsDropped)) => (
-                op.on_failed_submission(),
-                Err(Error::System(OpError::SystemShuttingDown)),
-            ),
-            Ok(inflight) => {
-                let (resources, res) = inflight.await;
-                // FIXME: this should be an into
-                let res = res.map_err(|e| match e {
-                    InflightHandleError::Completion(err) => Error::Op(err),
-                    InflightHandleError::SlotsDropped => Error::System(OpError::SystemShuttingDown),
-                });
-                (resources, res)
-            }
-        },
+        Ok(use_for_op_ret) => use_for_op_ret.await,
     }
 }

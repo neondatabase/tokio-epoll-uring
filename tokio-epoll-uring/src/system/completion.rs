@@ -588,7 +588,7 @@ mod tests {
             matches!(
                 err,
                 crate::SystemError::System(
-                    crate::system::submission::op_fut::OpError::SystemShuttingDown
+                    crate::system::submission::op_fut::SystemError::SystemShuttingDown
                 )
             ),
             "{err:?}"
