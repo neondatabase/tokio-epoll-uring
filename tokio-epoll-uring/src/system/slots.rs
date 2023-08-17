@@ -450,7 +450,12 @@ impl SlotHandle {
             }
         });
         let Ok(()) = res else {
-            return futures::future::Either::Left(async move { (op.on_failed_submission(), Err(Error::<O::Error>::System(SystemError::SystemShuttingDown))) });
+            return futures::future::Either::Left(async move {
+                (
+                    op.on_failed_submission(),
+                    Err(Error::<O::Error>::System(SystemError::SystemShuttingDown)),
+                )
+            });
         };
 
         do_submit(do_submit_arg, sqe);
