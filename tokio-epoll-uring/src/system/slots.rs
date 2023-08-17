@@ -425,7 +425,6 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
     }
 }
 
-
 impl SlotHandle {
     pub(crate) fn use_for_op<O, S, T>(
         self,
