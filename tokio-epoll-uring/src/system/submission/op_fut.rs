@@ -55,7 +55,7 @@ where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
 {
-    let mut open_guard = match submit_side.with_submit_side_open().await {
+    let open_guard = match submit_side.with_submit_side_open().await {
         Some(open) => open,
         None => {
             return (
@@ -64,10 +64,9 @@ where
             );
         }
     };
-    let open = &mut *open_guard;
 
-    let do_submit = |mut submit_side: SubmitSideOpenGuard, sqe| {
-        if submit_side.submit_raw(sqe).is_err() {
+    fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
+        if open_guard.submit_raw(sqe).is_err() {
             // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
             // So, we could just submit_and_wait here. But, that'd prevent the
             // current executor thread from making progress on other tasks.
@@ -84,12 +83,13 @@ where
         let mut cq_owned = None;
 
         let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-            let cq = Arc::clone(&submit_side.completion_side);
+            let cq = Arc::clone(&open_guard.completion_side);
             cq_owned = Some(cq);
             Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
         } else {
             None
         };
+        drop(open_guard); // drop it asap
 
         if let Some(mut cq) = cq_guard {
             // opportunistically process completion immediately
@@ -98,18 +98,18 @@ where
             // FIXME: why are we doing this while holding the SubmitSideOpen
             cq.process_completions(ProcessCompletionsCause::Regular);
         }
-    };
+    }
 
     match slot {
-        Some(slot) => slot.use_for_op(op, do_submit, open_guard).await,
+        Some(slot) => slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await,
         None => {
-            match open.slots.try_get_slot() {
+            match open_guard.slots.try_get_slot() {
                 slots::TryGetSlotResult::Draining => (
                     op.on_failed_submission(),
                     Err(Error::System(SystemError::SystemShuttingDown)),
                 ),
                 slots::TryGetSlotResult::GotSlot(slot) => {
-                    slot.use_for_op(op, do_submit, open_guard).await
+                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
                 }
                 slots::TryGetSlotResult::NoSlots(later) => {
                     // All slots are taken and we're waiting in line.
@@ -118,8 +118,9 @@ where
 
                     if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
                         // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
-                        open.submitter.submit().unwrap();
-                        open.completion_side
+                        open_guard.submitter.submit().unwrap();
+                        open_guard
+                            .completion_side
                             .lock()
                             .unwrap()
                             .process_completions(ProcessCompletionsCause::Regular);
@@ -133,7 +134,7 @@ where
                             )
                         }
                     };
-                    slot.use_for_op(op, do_submit, open_guard).await
+                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
                 }
             }
         }
