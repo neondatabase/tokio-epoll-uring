@@ -8,13 +8,13 @@ pub mod thread_local;
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
-use crate::system::{submission::SubmitSideOpen, RING_SIZE};
+use crate::system::{submission::SubmitSide, RING_SIZE};
 
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::SystemHandle,
     slots::{self, Slots},
-    submission::{SubmitSide, SubmitSideNewArgs},
+    submission::SubmitSideNewArgs,
 };
 
 /// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
@@ -89,7 +89,7 @@ impl System {
 
 pub(crate) struct ShutdownRequest {
     pub done_tx: tokio::sync::oneshot::Sender<()>,
-    pub open_state: SubmitSideOpen,
+    pub open_state: SubmitSide,
 }
 
 pub(crate) fn poller_impl_finish_shutdown(

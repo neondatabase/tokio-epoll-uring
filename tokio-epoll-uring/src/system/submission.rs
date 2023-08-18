@@ -1,9 +1,6 @@
 pub(crate) mod op_fut;
 
-use std::{
-    ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, Weak},
-};
+use std::sync::{Arc, Mutex};
 
 use io_uring::{SubmissionQueue, Submitter};
 
@@ -20,11 +17,6 @@ pub(crate) struct SubmitSideNewArgs {
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
 }
 
-pub(crate) struct SubmitSide {
-    // This is the only long-lived strong reference to the `SubmitSideInner`.
-    inner: Arc<tokio::sync::Mutex<SubmitSideInner>>,
-}
-
 impl SubmitSide {
     pub(crate) fn new(args: SubmitSideNewArgs) -> SubmitSide {
         let SubmitSideNewArgs {
@@ -35,20 +27,16 @@ impl SubmitSide {
             completion_side,
         } = args;
         SubmitSide {
-            inner: Arc::new(tokio::sync::Mutex::new(SubmitSideInner::Open(
-                SubmitSideOpen {
-                    id,
-                    submitter,
-                    sq,
-                    slots: ops,
-                    completion_side: Arc::clone(&completion_side),
-                },
-            ))),
+            id,
+            submitter,
+            sq,
+            slots: ops,
+            completion_side: Arc::clone(&completion_side),
         }
     }
 }
 
-impl SubmitSideOpen {
+impl SubmitSide {
     pub(crate) fn submit_raw(
         &mut self,
         sqe: io_uring::squeue::Entry,
@@ -66,50 +54,7 @@ impl SubmitSideOpen {
     }
 }
 
-#[derive(Clone)]
-pub struct SubmitSideWeak(Weak<tokio::sync::Mutex<SubmitSideInner>>);
-
-impl SubmitSideWeak {
-    pub(crate) async fn with_submit_side_open(&self) -> Option<SubmitSideOpenGuard> {
-        let inner = match self.0.upgrade() {
-            Some(inner) => inner,
-            None => return None,
-        };
-        let mut inner_guard = inner.lock_owned().await;
-        match &mut *inner_guard {
-            SubmitSideInner::Open(_) => Some(SubmitSideOpenGuard(inner_guard)),
-            SubmitSideInner::Plugged => None,
-        }
-    }
-}
-
-pub(crate) struct SubmitSideOpenGuard(tokio::sync::OwnedMutexGuard<SubmitSideInner>);
-
-impl Deref for SubmitSideOpenGuard {
-    type Target = SubmitSideOpen;
-    fn deref(&self) -> &Self::Target {
-        match &*self.0 {
-            SubmitSideInner::Open(open) => open,
-            SubmitSideInner::Plugged => unreachable!(),
-        }
-    }
-}
-
-impl DerefMut for SubmitSideOpenGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match &mut *self.0 {
-            SubmitSideInner::Open(open) => open,
-            SubmitSideInner::Plugged => unreachable!(),
-        }
-    }
-}
-
-pub(crate) enum SubmitSideInner {
-    Open(SubmitSideOpen),
-    Plugged,
-}
-
-pub(crate) struct SubmitSideOpen {
+pub(crate) struct SubmitSide {
     #[allow(dead_code)]
     id: usize,
     submitter: Submitter<'static>,
@@ -119,31 +64,14 @@ pub(crate) struct SubmitSideOpen {
 }
 
 impl SubmitSide {
-    pub(crate) fn weak(&self) -> SubmitSideWeak {
-        SubmitSideWeak(Arc::downgrade(&self.inner))
-    }
-    pub(crate) fn plug(self) -> SubmitSideOpen {
-        let mut inner = self.inner.blocking_lock(); // TODO: is there deadlock risk by using this?
-        let cur = std::mem::replace(&mut *inner, SubmitSideInner::Plugged);
-        match cur {
-            SubmitSideInner::Open(open) => {
-                open.slots.set_draining();
-                open
-            }
-            SubmitSideInner::Plugged => unreachable!(),
-        }
-    }
-}
-
-impl SubmitSideOpen {
     pub(crate) fn deconstruct(self) -> (Submitter<'static>, SubmissionQueue<'static>) {
-        let SubmitSideOpen { submitter, sq, .. } = self;
+        let SubmitSide { submitter, sq, .. } = self;
         (submitter, sq)
     }
 }
 
-unsafe impl Send for SubmitSideOpen {}
-unsafe impl Sync for SubmitSideOpen {}
+unsafe impl Send for SubmitSide {}
+unsafe impl Sync for SubmitSide {}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SubmitError {

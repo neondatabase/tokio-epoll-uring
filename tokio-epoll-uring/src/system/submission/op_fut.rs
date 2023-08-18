@@ -17,7 +17,7 @@ use crate::system::{
     slots::{self, SlotHandle},
 };
 
-use super::{SubmitSideOpenGuard, SubmitSideWeak};
+use super::SubmitSide;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SystemError {
@@ -48,24 +48,14 @@ impl<T: Display> Display for Error<T> {
 
 pub(crate) async fn execute_op<O>(
     op: O,
-    submit_side: SubmitSideWeak,
+    open_guard: &mut SubmitSide,
     slot: Option<SlotHandle>,
 ) -> (O::Resources, Result<O::Success, Error<O::Error>>)
 where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
 {
-    let open_guard = match submit_side.with_submit_side_open().await {
-        Some(open) => open,
-        None => {
-            return (
-                op.on_failed_submission(),
-                Err(Error::System(SystemError::SystemShuttingDown)),
-            );
-        }
-    };
-
-    fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
+    fn do_submit(open_guard: &mut SubmitSide, sqe: io_uring::squeue::Entry) {
         if open_guard.submit_raw(sqe).is_err() {
             // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
             // So, we could just submit_and_wait here. But, that'd prevent the

@@ -1,6 +1,6 @@
 //! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
-use futures::FutureExt;
+use futures::{FutureExt, TryFutureExt};
 use std::{os::fd::OwnedFd, task::ready};
 use tokio_uring::buf::IoBufMut;
 
@@ -116,7 +116,7 @@ impl SystemHandleInner {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let req = ShutdownRequest {
             done_tx,
-            open_state: submit_side.plug(),
+            open_state: submit_side,
         };
         shutdown_tx
             .send(req)
@@ -127,20 +127,20 @@ impl SystemHandleInner {
 }
 
 impl crate::SystemHandle {
-    pub fn nop(
-        &self,
-    ) -> impl std::future::Future<
-        Output = (
-            (),
-            Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
-        ),
-    > {
-        let op = crate::ops::nop::Nop {};
-        let inner = self.inner.as_ref().unwrap();
-        execute_op(op, inner.submit_side.weak(), None)
-    }
+    // pub fn nop(
+    //     &mut self,
+    // ) -> impl std::future::Future<
+    //     Output = (
+    //         (),
+    //         Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+    //     ),
+    // > {
+    //     let op = crate::ops::nop::Nop {};
+    //     let inner = self.inner.as_mut().unwrap();
+    //     execute_op(op, &mut inner.submit_side, None)
+    // }
     pub fn read<B: IoBufMut + Send>(
-        &self,
+        &mut self,
         file: OwnedFd,
         offset: u64,
         buf: B,
@@ -149,9 +149,9 @@ impl crate::SystemHandle {
             (OwnedFd, B),
             Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
         ),
-    > {
+    > + '_ {
         let op = ReadOp { file, offset, buf };
-        let inner = self.inner.as_ref().unwrap();
-        execute_op(op, inner.submit_side.weak(), None)
+        let inner = self.inner.as_mut().unwrap();
+        execute_op(op, &mut inner.submit_side, None)
     }
 }
