@@ -6,7 +6,7 @@ use crate::{System, SystemHandle};
 
 enum State {
     NotStarted,
-    Launching,
+    Launching(tokio::sync::broadcast::Sender<()>),
     Launched(SystemHandle),
 }
 
@@ -14,10 +14,10 @@ thread_local! {
     static THREAD_LOCAL: RefCell<State> = RefCell::new(State::NotStarted);
 }
 
-pub async fn with_thread_local_system<'a, 'b, F, O, FO>(f: F) -> FO
+pub async fn with_thread_local_system<'a, 'b, F, O, R>(f: F) -> R
 where
     F: FnOnce(&mut SystemHandle) -> O,
-    O: std::future::Future<Output = FO> + 'b,
+    O: std::future::Future<Output = R> + 'b,
     'b: 'a,
 {
     let mut f = Some(f);
@@ -27,7 +27,7 @@ where
             A: std::future::Future<Output = Y>,
         {
             ObservedNotStartedDoStartLaunch(A),
-            ObservedAlreadyLaunching,
+            ObservedAlreadyLaunching(tokio::sync::broadcast::Receiver<()>),
             Launched(R),
         }
         let wait_launched = THREAD_LOCAL.with(|x| {
@@ -35,16 +35,18 @@ where
             match &mut *borrow {
                 State::NotStarted => {
                     drop(borrow);
-                    x.replace(State::Launching);
+                    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+                    x.replace(State::Launching(tx));
                     let fut = async move {
                         let launched_by_us = System::launch().await;
                         THREAD_LOCAL.with(|x| {
                             let mut borrow = x.borrow_mut();
                             match &mut *borrow {
                                 // The likely case: we remained on the same thread where we started launching.
-                                State::Launching => {
+                                State::Launching(_notify_waiters) => {
                                     drop(borrow);
                                     x.replace(State::Launched(launched_by_us));
+                                    // above replace drops the _notify_waiters
                                 }
                                 // We were moved to another thread, and the other thread hasn't started launching yet.
                                 State::NotStarted => {
@@ -62,7 +64,9 @@ where
                     };
                     Outcome::ObservedNotStartedDoStartLaunch(fut)
                 }
-                State::Launching => Outcome::ObservedAlreadyLaunching,
+                State::Launching(notify_waiters) => {
+                    Outcome::ObservedAlreadyLaunching(notify_waiters.subscribe())
+                }
                 State::Launched(handle) => Outcome::Launched((f.take().unwrap())(handle)),
             }
         });
@@ -71,11 +75,12 @@ where
                 fut.await;
                 continue;
             }
-            Outcome::ObservedAlreadyLaunching => {
-                todo!()
+            Outcome::ObservedAlreadyLaunching(mut wait) => {
+                let _ = wait.recv().await;
+                continue;
             }
-            Outcome::Launched(fut) => {
-                return fut.await;
+            Outcome::Launched(op_fut) => {
+                return op_fut.await;
             }
         }
     }
