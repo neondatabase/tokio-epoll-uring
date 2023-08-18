@@ -12,6 +12,8 @@ pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
     fn make_sqe(&mut self) -> io_uring::squeue::Entry;
 }
 
+use futures::future;
+
 use crate::system::{
     completion::ProcessCompletionsCause,
     slots::{self, SlotHandle},
@@ -46,86 +48,81 @@ impl<T: Display> Display for Error<T> {
     }
 }
 
-pub(crate) async fn execute_op<O>(
+pub(crate) fn execute_op<O>(
     op: O,
     open_guard: &mut SubmitSide,
     slot: Option<SlotHandle>,
-) -> (O::Resources, Result<O::Success, Error<O::Error>>)
+) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
 where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
 {
-    fn do_submit(open_guard: &mut SubmitSide, sqe: io_uring::squeue::Entry) {
-        if open_guard.submit_raw(sqe).is_err() {
-            // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
-            // So, we could just submit_and_wait here. But, that'd prevent the
-            // current executor thread from making progress on other tasks.
-            //
-            // So, for now, keep SQ size == inflight ops size == Slots size.
-            // This potentially limits throughput if SQ size is chosen too small.
-            //
-            // FIXME: why not just async mutex?
-            unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
-        }
-
-        // this allows us to keep the possible guard in cq_guard because the arc lives on stack
-        #[allow(unused_assignments)]
-        let mut cq_owned = None;
-
-        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-            let cq = Arc::clone(&open_guard.completion_side);
-            cq_owned = Some(cq);
-            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
-        } else {
-            None
-        };
-        drop(open_guard); // drop it asap
-
-        if let Some(mut cq) = cq_guard {
-            // opportunistically process completion immediately
-            // TODO do it during ::poll() as well?
-            //
-            // FIXME: why are we doing this while holding the SubmitSideOpen
-            cq.process_completions(ProcessCompletionsCause::Regular);
-        }
-    }
-
     match slot {
-        Some(slot) => slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await,
+        Some(slot) => Fut::A(slot.use_for_op(op)),
         None => {
             match open_guard.slots.try_get_slot() {
-                slots::TryGetSlotResult::Draining => (
-                    op.on_failed_submission(),
-                    Err(Error::System(SystemError::SystemShuttingDown)),
-                ),
-                slots::TryGetSlotResult::GotSlot(slot) => {
-                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
-                }
+                slots::TryGetSlotResult::Draining => Fut::B(async move {
+                    (
+                        op.on_failed_submission(),
+                        Err(Error::System(SystemError::SystemShuttingDown)),
+                    )
+                }),
+                slots::TryGetSlotResult::GotSlot(slot) => Fut::C(slot.use_for_op(op)),
                 slots::TryGetSlotResult::NoSlots(later) => {
                     // All slots are taken and we're waiting in line.
                     // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
                     // This is in the hope that we'll wake ourselves up.
 
-                    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
-                        // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
-                        open_guard.submitter.submit().unwrap();
-                        open_guard
-                            .completion_side
-                            .lock()
-                            .unwrap()
-                            .process_completions(ProcessCompletionsCause::Regular);
-                    }
-                    let slot = match later.await {
-                        Ok(slot) => slot,
-                        Err(_dropped) => {
-                            return (
-                                op.on_failed_submission(),
-                                Err(Error::System(SystemError::SystemShuttingDown)),
-                            )
-                        }
-                    };
-                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+                    Fut::D(async move {
+                        let slot = match later.await {
+                            Ok(slot) => slot,
+                            Err(_dropped) => {
+                                return (
+                                    op.on_failed_submission(),
+                                    Err(Error::System(SystemError::SystemShuttingDown)),
+                                )
+                            }
+                        };
+                        slot.use_for_op(op).await
+                    })
                 }
+            }
+        }
+    }
+}
+
+// Used by `execute_op` to avoid boxing the future returned by the `with_submit_side` closure.
+enum Fut<Output, A, B, C, D>
+where
+    A: std::future::Future<Output = Output>,
+    B: std::future::Future<Output = Output>,
+    C: std::future::Future<Output = Output>,
+    D: std::future::Future<Output = Output>,
+{
+    A(A),
+    B(B),
+    C(C),
+    D(D),
+}
+impl<Output, A, B, C, D> std::future::Future for Fut<Output, A, B, C, D>
+where
+    A: std::future::Future<Output = Output>,
+    B: std::future::Future<Output = Output>,
+    C: std::future::Future<Output = Output>,
+    D: std::future::Future<Output = Output>,
+{
+    type Output = Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        unsafe {
+            match self.get_unchecked_mut() {
+                Self::A(x) => Pin::new_unchecked(x).poll(cx),
+                Self::B(x) => Pin::new_unchecked(x).poll(cx),
+                Self::C(x) => Pin::new_unchecked(x).poll(cx),
+                Self::D(x) => Pin::new_unchecked(x).poll(cx),
             }
         }
     }

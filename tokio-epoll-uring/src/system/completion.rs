@@ -17,7 +17,6 @@ use super::{
 pub(crate) struct CompletionSide {
     #[allow(dead_code)]
     id: usize,
-    cq: CompletionQueue<'static>,
     slots: Slots<{ slots::co_owner::COMPLETION_SIDE }>,
 }
 
@@ -29,25 +28,8 @@ pub(crate) enum ProcessCompletionsCause {
 }
 
 impl CompletionSide {
-    pub(crate) fn new(
-        id: usize,
-        cq: CompletionQueue<'static>,
-        ops: Slots<{ slots::co_owner::COMPLETION_SIDE }>,
-    ) -> Self {
-        Self { id, cq, slots: ops }
-    }
-    pub(crate) fn deconstruct(self) -> CompletionQueue<'static> {
-        let Self {
-            id: _,
-            cq,
-            slots: _,
-        } = { self };
-        cq
-    }
-    pub(crate) fn process_completions(&mut self, _cause: ProcessCompletionsCause) {
-        self.cq.sync();
-        self.slots.process_completions(&mut self.cq);
-        self.cq.sync();
+    pub(crate) fn new(id: usize, ops: Slots<{ slots::co_owner::COMPLETION_SIDE }>) -> Self {
+        Self { id, slots: ops }
     }
 }
 
@@ -330,7 +312,7 @@ async fn poller_impl(
             if pending_count == 0 {
                 break;
             }
-            completion_side_guard.process_completions(ProcessCompletionsCause::Shutdown);
+            completion_side_guard.slots.process_completions();
             drop(completion_side_guard);
             drop(inner_guard);
         }
@@ -462,7 +444,7 @@ async fn poller_impl_impl(
         }
 
         let mut completion_side_guard = completion_side.lock().unwrap();
-        completion_side_guard.process_completions(ProcessCompletionsCause::Regular); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
+        completion_side_guard.slots.process_completions(); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
         if is_timeout_wakeup {
             completion_side_guard.slots.poller_timeout_debug_dump();
         }
@@ -622,7 +604,7 @@ mod tests {
         let (read_task_jh, mut writer) = rt.block_on(async move {
             let (reader, writer) = os_pipe::pipe().unwrap();
             let jh = tokio::spawn(async move {
-                let system = System::launch_with_testing(Some(testing)).await;
+                let mut system = System::launch_with_testing(Some(testing)).await;
                 let reader =
                     unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
                 let buf = vec![0; 1];

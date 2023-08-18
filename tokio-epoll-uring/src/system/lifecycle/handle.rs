@@ -116,7 +116,6 @@ impl SystemHandleInner {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let req = ShutdownRequest {
             done_tx,
-            open_state: submit_side,
         };
         shutdown_tx
             .send(req)

@@ -30,6 +30,7 @@ use std::{
     task::Poll,
 };
 
+use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
@@ -64,6 +65,7 @@ pub(crate) struct SlotsWeak {
 enum SlotsInner {
     Open(Box<SlotsInnerOpen>),
     Draining(Box<SlotsInnerDraining>),
+    Drained,
     Undefined,
 }
 
@@ -75,6 +77,10 @@ struct SlotsInnerOpen {
     waiters: VecDeque<tokio::sync::oneshot::Sender<SlotHandle>>,
     myself: SlotsWeak,
     co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
+    sq: SubmissionQueue<'static>,
+    submitter: Submitter<'static>,
+    cq: CompletionQueue<'static>,
+    split_uring: *mut io_uring::IoUring,
 }
 
 struct SlotsInnerDraining {
@@ -83,7 +89,17 @@ struct SlotsInnerDraining {
     storage: [Option<Slot>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
     co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
+    sq: SubmissionQueue<'static>,
+    submitter: Submitter<'static>,
+    cq: CompletionQueue<'static>,
+    split_uring: *mut io_uring::IoUring,
 }
+
+unsafe impl Send for SlotsInnerOpen {}
+unsafe impl Sync for SlotsInnerOpen {}
+
+unsafe impl Send for SlotsInnerDraining {}
+unsafe impl Sync for SlotsInnerDraining {}
 
 pub(crate) struct SlotHandle {
     // FIXME: why is this weak?
@@ -107,6 +123,10 @@ enum Slot {
 
 pub(super) fn new(
     id: usize,
+    sq: SubmissionQueue<'static>,
+    submitter: Submitter<'static>,
+    cq: CompletionQueue<'static>,
+    split_uring: *mut io_uring::IoUring,
 ) -> (
     Slots<{ co_owner::SUBMIT_SIDE }>,
     Slots<{ co_owner::COMPLETION_SIDE }>,
@@ -126,6 +146,10 @@ pub(super) fn new(
                 inner_weak: inner_weak.clone(),
             },
             co_owner_live: [false; co_owner::NUM_CO_OWNERS],
+            submitter,
+            sq,
+            cq,
+            split_uring,
         })))
     });
     fn make_co_owner<const O: usize>(inner: &Arc<Mutex<SlotsInner>>) -> Slots<O> {
@@ -157,11 +181,13 @@ impl<const O: usize> Drop for Slots<O> {
                 SlotsInner::Undefined => (),
                 SlotsInner::Open(open) => open.co_owner_live[O] = false,
                 SlotsInner::Draining(draining) => draining.co_owner_live[O] = false,
+                SlotsInner::Drained => (),
             },
             Err(mut poison) => match &mut **poison.get_mut() {
                 SlotsInner::Open(open) => open.co_owner_live[O] = false,
                 SlotsInner::Draining(draining) => draining.co_owner_live[O] = false,
                 SlotsInner::Undefined => (),
+                SlotsInner::Drained => (),
             },
         }
     }
@@ -182,53 +208,7 @@ impl SlotsWeak {
     }
 }
 
-impl SlotsInner {
-    fn return_slot(&mut self, idx: usize) {
-        fn clear_slot(slot_storage_ref: &mut Option<Slot>) {
-            match slot_storage_ref {
-                None => (),
-                Some(slot_ref) => match slot_ref {
-                    Slot::Undefined => unreachable!(),
-                    Slot::Pending { .. } | Slot::PendingButFutureDropped { .. } => {
-                        panic!("implementation error: potential memory unsafety: we must not return a slot that is still pending  {:?}", slot_ref.discriminant_str());
-                    }
-                    Slot::Ready { .. } => {
-                        *slot_storage_ref = None;
-                    }
-                },
-            }
-        }
-
-        match self {
-            SlotsInner::Undefined => unreachable!(),
-            SlotsInner::Open(inner) => {
-                clear_slot(&mut inner.storage[idx]);
-                while let Some(waiter) = inner.waiters.pop_front() {
-                    match waiter.send(SlotHandle {
-                        slots_weak: inner.myself.clone(),
-                        idx,
-                    }) {
-                        Ok(()) => {
-                            trace!("handed `idx` to a waiter");
-                            return;
-                        }
-                        Err(_) => {
-                            // the future requesting wakeup got dropped. wake up next one
-                            continue;
-                        }
-                    }
-                }
-                trace!("no waiters, returning idx to unused_indices");
-                inner.unused_indices.push(idx);
-            }
-            SlotsInner::Draining(inner) => {
-                clear_slot(&mut inner.storage[idx]);
-                trace!("draining, returning idx to unused_indices");
-                inner.unused_indices.push(idx);
-            }
-        }
-    }
-}
+impl SlotsInner {}
 
 impl<const O: usize> Slots<O> {
     pub(super) fn poller_timeout_debug_dump(&self) {
@@ -238,6 +218,7 @@ impl<const O: usize> Slots<O> {
             SlotsInner::Undefined => unreachable!(),
             SlotsInner::Open(inner) => (&inner.storage, &inner.unused_indices),
             SlotsInner::Draining(inner) => (&inner.storage, &inner.unused_indices),
+            SlotsInner::Drained => unreachable!(),
         };
         let mut by_state_discr = HashMap::new();
         for s in storage {
@@ -266,57 +247,137 @@ impl<const O: usize> Slots<O> {
 }
 
 impl Slots<{ co_owner::COMPLETION_SIDE }> {
-    pub(super) fn process_completions(
-        &mut self,
-        cqes: impl Iterator<Item = io_uring::cqueue::Entry>,
-    ) {
+    pub(super) fn process_completions(&mut self) {
         let mut inner_guard = self.inner.lock().unwrap();
-        for cqe in cqes {
-            inner_guard.process_completion(cqe);
+        match &mut *inner_guard {
+            SlotsInner::Undefined => unreachable!(),
+            SlotsInner::Open(inner) => inner.process_completions(),
+            SlotsInner::Draining(inner) => inner.process_completions(),
+            SlotsInner::Drained => panic!("should not be called after draining done"),
         }
     }
 }
 
-impl SlotsInner {
-    fn process_completion(&mut self, cqe: io_uring::cqueue::Entry) {
-        let idx: u64 = cqe.user_data();
-        let idx = usize::try_from(idx).unwrap();
+trait ProcessCompletions {
+    fn storage(&mut self) -> &mut [Option<Slot>];
+    fn cq(&mut self) -> &mut io_uring::CompletionQueue<'static>;
+    fn process_completions(&mut self) {
+        self.cq().sync();
+        loop {
+            let Some(cqe) = self.cq().next() else { break; };
 
-        let storage = match self {
-            SlotsInner::Undefined => unreachable!(),
-            SlotsInner::Open(inner) => &mut inner.storage,
-            SlotsInner::Draining(inner) => &mut inner.storage,
-        };
-        let slot = &mut storage[idx];
-        let slot = slot.as_mut().unwrap();
-        let cur = std::mem::replace(&mut *slot, Slot::Undefined);
-        match cur {
-            Slot::Undefined => unreachable!("implementation error"),
-            Slot::Pending { waker } => {
-                *slot = Slot::Ready {
-                    result: cqe.result(),
-                };
-                if let Some(waker) = waker {
-                    trace!("waking up future");
-                    waker.wake();
+            let idx: u64 = cqe.user_data();
+            let idx = usize::try_from(idx).unwrap();
+
+            let storage = self.storage();
+            let slot_storage_ref = &mut storage[idx];
+            let slot = slot_storage_ref.as_mut().unwrap();
+            let cur = std::mem::replace(&mut *slot, Slot::Undefined);
+            match cur {
+                Slot::Undefined => unreachable!("implementation error"),
+                Slot::Pending { waker } => {
+                    *slot = Slot::Ready {
+                        result: cqe.result(),
+                    };
+                    if let Some(waker) = waker {
+                        trace!("waking up future");
+                        waker.wake();
+                    }
+                }
+                Slot::PendingButFutureDropped {
+                    resources_owned_by_kernel,
+                } => {
+                    drop(resources_owned_by_kernel);
+                    *slot = Slot::Ready {
+                        result: cqe.result(),
+                    };
+                    self.return_slot(idx);
+                }
+                Slot::Ready { .. } => {
+                    unreachable!(
+                        "completions only come in once: {:?}",
+                        cur.discriminant_str()
+                    )
                 }
             }
-            Slot::PendingButFutureDropped {
-                resources_owned_by_kernel,
-            } => {
-                drop(resources_owned_by_kernel);
-                *slot = Slot::Ready {
-                    result: cqe.result(),
-                };
-                self.return_slot(idx);
-            }
-            Slot::Ready { .. } => {
-                unreachable!(
-                    "completions only come in once: {:?}",
-                    cur.discriminant_str()
-                )
+        }
+        self.cq().sync();
+    }
+
+    fn return_slot(&mut self, idx: usize) {
+        let storage = self.storage();
+        let slot_storage_ref = &mut storage[idx];
+        match slot_storage_ref {
+            None => (),
+            Some(slot_ref) => match slot_ref {
+                Slot::Undefined => unreachable!(),
+                Slot::Pending { .. } | Slot::PendingButFutureDropped { .. } => {
+                    panic!("implementation error: potential memory unsafety: we must not clear a slot that is still pending  {:?}", slot_ref.discriminant_str());
+                }
+                Slot::Ready { .. } => {
+                    *slot_storage_ref = None;
+                }
+            },
+        }
+        self.return_slot_impl(idx);
+    }
+
+    fn return_slot_impl(&mut self, idx: usize);
+}
+
+impl ProcessCompletions for SlotsInnerOpen {
+    fn storage(&mut self) -> &mut [Option<Slot>] {
+        &mut self.storage
+    }
+    fn cq(&mut self) -> &mut io_uring::CompletionQueue<'static> {
+        &mut self.cq
+    }
+    fn return_slot_impl(&mut self, idx: usize) {
+        while let Some(waiter) = self.waiters.pop_front() {
+            match waiter.send(SlotHandle {
+                slots_weak: self.myself.clone(),
+                idx,
+            }) {
+                Ok(()) => {
+                    trace!("handed `idx` to a waiter");
+                    return;
+                }
+                Err(_) => {
+                    // the future requesting wakeup got dropped. wake up next one
+                    continue;
+                }
             }
         }
+        trace!("no waiters, returning idx to unused_indices");
+        self.unused_indices.push(idx);
+    }
+}
+
+impl ProcessCompletions for SlotsInnerDraining {
+    fn storage(&mut self) -> &mut [Option<Slot>] {
+        &mut self.storage
+    }
+    fn cq(&mut self) -> &mut io_uring::CompletionQueue<'static> {
+        &mut self.cq
+    }
+    fn return_slot_impl(&mut self, idx: usize) {
+        trace!("draining, returning idx to unused_indices");
+        self.unused_indices.push(idx);
+    }
+}
+
+impl SlotsInnerOpen {
+    fn submit_raw(&mut self, sqe: io_uring::squeue::Entry) -> std::result::Result<(), SubmitError> {
+        self.sq.sync();
+        match unsafe { self.sq.push(&sqe) } {
+            Ok(()) => {}
+            Err(_queue_full) => {
+                return Err(SubmitError::QueueFull);
+            }
+        }
+        self.sq.sync();
+        self.submitter.submit().unwrap();
+        Ok(())
     }
 }
 
@@ -334,17 +395,26 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                     waiters: _, // cancels all waiters
                     myself: _,
                     co_owner_live,
+                    sq,
+                    cq,
+                    submitter,
+                    split_uring,
                 } = *open;
                 *inner_guard = SlotsInner::Draining(Box::new(SlotsInnerDraining {
                     id,
                     storage,
                     unused_indices,
                     co_owner_live,
+                    sq,
+                    cq,
+                    submitter,
+                    split_uring,
                 }));
             }
             SlotsInner::Draining(_draining) => {
                 panic!("implementation error: must only call set_draining once")
             }
+            SlotsInner::Drained => panic!("implementation error: must only call set_draining once"),
         }
     }
 }
@@ -364,18 +434,22 @@ impl Slots<{ co_owner::COMPLETION_SIDE }> {
                 *inner_guard = SlotsInner::Draining(draining);
                 pending_count
             }
+            SlotsInner::Drained => unreachable!(),
         }
     }
 }
 
 impl<const O: usize> Slots<O> {
-    pub(super) fn shutdown_assertions(self) {
-        let ops_inner_guard = self.inner.lock().unwrap();
-        let inner = match &*ops_inner_guard {
+    pub(super) fn shutdown(self) -> Box<io_uring::IoUring> {
+        let mut ops_inner_guard = self.inner.lock().unwrap();
+        let before = std::mem::replace(&mut *ops_inner_guard, SlotsInner::Drained);
+        let inner = match before {
             SlotsInner::Undefined => unreachable!(),
             SlotsInner::Open(_open) => panic!("we should be Draining by now"),
+            SlotsInner::Drained => panic!("we never get back here"),
             SlotsInner::Draining(inner) => inner,
         };
+
         let slots_owned_by_user_space = inner.slots_owned_by_user_space().collect::<HashSet<_>>();
         let unused_indices = inner
             .unused_indices
@@ -389,10 +463,33 @@ impl<const O: usize> Slots<O> {
         );
         assert!(unused_indices.is_subset(&slots_owned_by_user_space));
 
-        // assert the calling owner is the only remaining owner
-        let mut expected_co_owner_live = [false; co_owner::NUM_CO_OWNERS];
-        expected_co_owner_live[O] = true;
-        assert_eq!(inner.co_owner_live, expected_co_owner_live);
+        let SlotsInnerDraining {
+            id,
+            storage,
+            unused_indices,
+            co_owner_live,
+            mut sq,
+            submitter,
+            mut cq,
+            split_uring,
+        } = *inner;
+
+        // We now own all the parts from the IoUring::split() again.
+        // Some final assertions, then drop them all, unleak the IoUring, and drop it as well.
+        // That cleans up the SQ, CQs, registrations, etc.
+        cq.sync();
+        assert_eq!(cq.len(), 0, "cqe: {:?}", cq.next());
+        sq.sync();
+        assert_eq!(sq.len(), 0);
+
+        #[allow(clippy::drop_non_drop)]
+        {
+            drop(cq);
+            drop(sq);
+            drop(submitter);
+        }
+        let uring: Box<io_uring::IoUring> = unsafe { Box::from_raw(split_uring) };
+        uring
     }
 }
 
@@ -411,6 +508,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             SlotsInner::Draining(_) => {
                 return TryGetSlotResult::Draining;
             }
+            SlotsInner::Drained => return TryGetSlotResult::Draining,
         };
         match open.unused_indices.pop() {
             Some(idx) => TryGetSlotResult::GotSlot({
@@ -422,22 +520,35 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             None => {
                 let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
                 open.waiters.push_back(wake_up_tx);
+
+                if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
+                    // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
+                    open.submitter.submit().unwrap();
+                    open.process_completions();
+                }
+
                 TryGetSlotResult::NoSlots(wake_up_rx)
             }
         }
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SubmitError {
+    #[error("queue full")]
+    QueueFull,
+}
+
+impl Slots<{ co_owner::SUBMIT_SIDE }> {}
+
 impl SlotHandle {
-    pub(crate) fn use_for_op<'s, 'f, O, S>(
+    pub(crate) fn use_for_op<'s, 'f, O>(
         self,
         mut op: O,
-        do_submit: S,
     ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)> + 'f
     where
         O: Op + Send + 'static,
-        S: FnOnce(io_uring::squeue::Entry) + 's,
-        'f: 's
+        'f: 's,
     {
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
@@ -447,10 +558,32 @@ impl SlotHandle {
             SlotsInner::Open(open) => {
                 assert!(open.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
                 open.storage[self.idx] = Some(Slot::Pending { waker: None });
+                {
+                    if open.submit_raw(sqe).is_err() {
+                        // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
+                        // So, we could just submit_and_wait here. But, that'd prevent the
+                        // current executor thread from making progress on other tasks.
+                        //
+                        // So, for now, keep SQ size == inflight ops size == Slots size.
+                        // This potentially limits throughput if SQ size is chosen too small.
+                        //
+                        // FIXME: why not just async mutex?
+                        unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
+                    }
+
+                    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+                        // opportunistically process completion immediately
+                        // TODO do it during ::poll() as well?
+                        //
+                        // FIXME: why are we doing this while holding the SubmitSideOpen
+                        open.process_completions();
+                    }
+                }
             }
-            SlotsInner::Draining(_) => {
-                inner.return_slot(self.idx);
+            SlotsInner::Draining(draining) => {
+                draining.return_slot(self.idx);
             }
+            SlotsInner::Drained => unreachable!(),
         });
         let Ok(()) = res else {
             return futures::future::Either::Left(async move {
@@ -460,8 +593,6 @@ impl SlotHandle {
                 )
             });
         };
-
-        do_submit(sqe);
 
         futures::future::Either::Right(self.wait_for_completion(op))
     }
@@ -490,11 +621,13 @@ impl SlotHandle {
                 let Some(op) = op.lock().unwrap().take() else {
                     return;
                 };
-                let storage = match inner {
+                let inner: &mut dyn ProcessCompletions = match inner {
                     SlotsInner::Undefined => unreachable!(),
-                    SlotsInner::Open(inner) => &mut inner.storage,
-                    SlotsInner::Draining(inner) => &mut inner.storage,
+                    SlotsInner::Open(inner) => &mut **inner,
+                    SlotsInner::Draining(inner) => &mut **inner,
+                    SlotsInner::Drained => unreachable!(),
                 };
+                let storage = inner.storage();
                 let slot_storage_mut = &mut storage[slot.idx];
                 let slot_mut = slot_storage_mut.as_mut().unwrap();
                 let cur = std::mem::replace(&mut *slot_mut, Slot::Undefined);
@@ -555,12 +688,14 @@ impl SlotHandle {
         }
         let inspect_slot_res = poll_fn(|cx| {
             let inspect_slot_res = slot.slots_weak.try_upgrade_mut(move |inner| {
-                let storage = match inner {
+                let inner: &mut dyn ProcessCompletions = match inner {
                     SlotsInner::Undefined => unreachable!(),
-                    SlotsInner::Open(inner) => &mut inner.storage,
-                    SlotsInner::Draining(inner) => &mut inner.storage,
+                    SlotsInner::Open(inner) => &mut **inner,
+                    SlotsInner::Draining(inner) => &mut **inner,
+                    SlotsInner::Drained => unreachable!(),
                 };
 
+                let storage = inner.storage();
                 let slot_storage_ref = &mut storage[slot.idx];
                 let slot_mut = slot_storage_ref.as_mut().unwrap();
 

@@ -39,6 +39,7 @@ where
             let mut borrow = x.borrow_mut();
             match &mut *borrow {
                 State::NotStarted => {
+                    drop(borrow);
                     x.replace(State::Launching);
                     let fut = async move {
                         let handle = System::launch().await;
@@ -46,6 +47,7 @@ where
                             let mut borrow = x.borrow_mut();
                             match &mut *borrow {
                                 State::Launching => {
+                                    drop(borrow);
                                     x.replace(State::Launched(handle));
                                 }
                                 _ => todo!(),

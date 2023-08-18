@@ -18,7 +18,7 @@ async fn main() {
 
     let file: OwnedFd = file.into();
 
-    let system = tokio_epoll_uring::System::launch().await;
+    let mut system = tokio_epoll_uring::System::launch().await;
 
     let buf = vec![0; 1024];
 

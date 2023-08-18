@@ -53,9 +53,9 @@ impl SharedSystemHandle {
             Result<usize, SystemError<std::io::Error>>,
         ),
     > {
-        let guard = self.0.read().unwrap();
+        let mut guard = self.0.write().unwrap();
         let guard = guard
-            .as_ref()
+            .as_mut()
             .expect("SharedSystemHandle is shut down, cannot submit new operations");
         guard.read(file, offset, buf)
     }
