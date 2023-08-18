@@ -26,8 +26,8 @@ where
         where
             A: std::future::Future<Output = Y>,
         {
-            DidStartLaunch(A),
-            AlreadyLaunching,
+            ObservedNotStartedDoStartLaunch(A),
+            ObservedAlreadyLaunching,
             Launched(R),
         }
         let wait_launched = THREAD_LOCAL.with(|x| {
@@ -37,30 +37,41 @@ where
                     drop(borrow);
                     x.replace(State::Launching);
                     let fut = async move {
-                        let handle = System::launch().await;
+                        let launched_by_us = System::launch().await;
                         THREAD_LOCAL.with(|x| {
                             let mut borrow = x.borrow_mut();
                             match &mut *borrow {
+                                // The likely case: we remained on the same thread where we started launching.
                                 State::Launching => {
                                     drop(borrow);
-                                    x.replace(State::Launched(handle));
+                                    x.replace(State::Launched(launched_by_us));
                                 }
-                                _ => todo!(),
+                                // We were moved to another thread, and the other thread hasn't started launching yet.
+                                State::NotStarted => {
+                                    drop(borrow);
+                                    x.replace(State::Launched(launched_by_us));
+                                }
+                                // We were moved to another thread, and the other thread already had a system running.
+                                // Use the other thread's system and drop the one we launched. Sad but unavoidable.
+                                // Should be quite rare though.
+                                State::Launched(_other_threads_system) => {
+                                    drop(launched_by_us);
+                                }
                             };
                         });
                     };
-                    Outcome::DidStartLaunch(fut)
+                    Outcome::ObservedNotStartedDoStartLaunch(fut)
                 }
-                State::Launching => Outcome::AlreadyLaunching,
+                State::Launching => Outcome::ObservedAlreadyLaunching,
                 State::Launched(handle) => Outcome::Launched((f.take().unwrap())(handle)),
             }
         });
         match wait_launched {
-            Outcome::DidStartLaunch(fut) => {
+            Outcome::ObservedNotStartedDoStartLaunch(fut) => {
                 fut.await;
                 continue;
             }
-            Outcome::AlreadyLaunching => {
+            Outcome::ObservedAlreadyLaunching => {
                 todo!()
             }
             Outcome::Launched(fut) => {
