@@ -1,13 +1,8 @@
 //! Lazily-launched [`System`] thread-local to current tokio executor thread.
 
-use std::{
-    cell::RefCell,
-    sync::{Arc, Mutex},
-};
+use std::cell::RefCell;
 
-use futures::future;
-
-use crate::{system::submission::SubmitSide, System, SystemHandle};
+use crate::{System, SystemHandle};
 
 enum State {
     NotStarted,

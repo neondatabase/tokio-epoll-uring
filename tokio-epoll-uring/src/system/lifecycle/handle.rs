@@ -1,7 +1,7 @@
 //! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
-use futures::{FutureExt, TryFutureExt};
 use std::{os::fd::OwnedFd, task::ready};
+use futures::FutureExt;
 use tokio_uring::buf::IoBufMut;
 
 use crate::{
@@ -110,7 +110,7 @@ impl SystemHandleInner {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send + Unpin {
         let SystemHandleInner {
             id: _,
-            submit_side,
+            submit_side: _,
             shutdown_tx,
         } = self;
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();

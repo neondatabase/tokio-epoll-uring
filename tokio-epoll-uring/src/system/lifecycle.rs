@@ -6,15 +6,12 @@ use std::{
 pub mod handle;
 pub mod thread_local;
 
-use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
-
 use crate::system::{submission::SubmitSide, RING_SIZE};
 
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::SystemHandle,
     slots::{self, Slots},
-    submission::SubmitSideNewArgs,
 };
 
 /// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
@@ -57,11 +54,7 @@ impl System {
             let completion_side =
                 Arc::new(Mutex::new(CompletionSide::new(id, slots_completion_side)));
 
-            let submit_side = SubmitSide::new(SubmitSideNewArgs {
-                id,
-                slots: slots_submit_side,
-                completion_side: Arc::clone(&completion_side),
-            });
+            let submit_side = SubmitSide::new(id, slots_submit_side);
             let system = System { id };
             let poller_ready_fut = Poller::launch(PollerNewArgs {
                 id,
@@ -101,7 +94,7 @@ pub(crate) fn poller_impl_finish_shutdown(
     let completion_side = Arc::try_unwrap(completion_side)
         .ok()
         .expect("we plugged the SubmitSide, so, all refs to CompletionSide are gone");
-    let completion_side = Mutex::into_inner(completion_side).unwrap();
+    let _completion_side = Mutex::into_inner(completion_side).unwrap();
 
     // Unsplit the uring
     // explicit type to ensure we get compile-time-errors if we don't have the owned io_uring crate types

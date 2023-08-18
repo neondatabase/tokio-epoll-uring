@@ -3,7 +3,6 @@ use std::{
     time::Duration,
 };
 
-use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
@@ -21,11 +20,6 @@ pub(crate) struct CompletionSide {
 }
 
 unsafe impl Send for CompletionSide {}
-
-pub(crate) enum ProcessCompletionsCause {
-    Regular,
-    Shutdown,
-}
 
 impl CompletionSide {
     pub(crate) fn new(id: usize, ops: Slots<{ slots::co_owner::COMPLETION_SIDE }>) -> Self {

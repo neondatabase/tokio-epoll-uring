@@ -31,7 +31,7 @@ use std::{
 };
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
-use tokio::sync::oneshot;
+
 use tracing::{debug, trace};
 
 use crate::system::submission::op_fut::Error;
@@ -461,10 +461,10 @@ impl<const O: usize> Slots<O> {
         assert!(unused_indices.is_subset(&slots_owned_by_user_space));
 
         let SlotsInnerDraining {
-            id,
-            storage,
-            unused_indices,
-            co_owner_live,
+            id: _,
+            storage: _,
+            unused_indices: _,
+            co_owner_live: _,
             mut sq,
             submitter,
             mut cq,
@@ -490,12 +490,6 @@ impl<const O: usize> Slots<O> {
     }
 }
 
-pub(crate) enum TryGetSlotResult {
-    GotSlot(SlotHandle),
-    NoSlots(oneshot::Receiver<SlotHandle>),
-    Draining,
-}
-
 impl Slots<{ co_owner::SUBMIT_SIDE }> {
     pub(crate) fn submit<'s, 'f, O>(
         &self,
@@ -510,7 +504,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             SlotsInner::Undefined => unreachable!(),
             SlotsInner::Open(open) => open,
             SlotsInner::Draining(_) | SlotsInner::Drained => {
-                return Fut::<_, _, _, _, futures::future::Pending<_>>::A(async move {
+                return Fut::<_, _, _, _>::A(async move {
                     (
                         op.on_failed_submission(),
                         Err(Error::System(SystemError::SystemShuttingDown)),
