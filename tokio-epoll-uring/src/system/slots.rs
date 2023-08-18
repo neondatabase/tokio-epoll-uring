@@ -37,7 +37,7 @@ use tracing::{debug, trace};
 use crate::system::submission::op_fut::Error;
 
 use super::{
-    submission::op_fut::{Op, SystemError},
+    submission::op_fut::{Fut, Op, SystemError},
     RING_SIZE,
 };
 
@@ -74,7 +74,7 @@ struct SlotsInnerOpen {
     storage: [Option<Slot>; RING_SIZE as usize],
     unused_indices: Vec<usize>,
     // FIXME: this is a basic channel right? could be a tokio::sync::mpsc::channel(1) instead
-    waiters: VecDeque<tokio::sync::oneshot::Sender<SlotHandle>>,
+    waiters: VecDeque<tokio::sync::oneshot::Sender<usize>>,
     myself: SlotsWeak,
     co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
     sq: SubmissionQueue<'static>,
@@ -334,10 +334,7 @@ impl ProcessCompletions for SlotsInnerOpen {
     }
     fn return_slot_impl(&mut self, idx: usize) {
         while let Some(waiter) = self.waiters.pop_front() {
-            match waiter.send(SlotHandle {
-                slots_weak: self.myself.clone(),
-                idx,
-            }) {
+            match waiter.send(idx) {
                 Ok(()) => {
                     trace!("handed `idx` to a waiter");
                     return;
@@ -500,23 +497,73 @@ pub(crate) enum TryGetSlotResult {
 }
 
 impl Slots<{ co_owner::SUBMIT_SIDE }> {
-    pub(crate) fn try_get_slot(&self) -> TryGetSlotResult {
+    pub(crate) fn submit<'s, 'f, O>(
+        &self,
+        op: O,
+    ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)> + 'f
+    where
+        O: Op + Send + 'static,
+        'f: 's,
+    {
         let mut inner_guard = self.inner.lock().unwrap();
         let open = match &mut *inner_guard {
             SlotsInner::Undefined => unreachable!(),
             SlotsInner::Open(open) => open,
-            SlotsInner::Draining(_) => {
-                return TryGetSlotResult::Draining;
+            SlotsInner::Draining(_) | SlotsInner::Drained => {
+                return Fut::<_, _, _, _, futures::future::Pending<_>>::A(async move {
+                    (
+                        op.on_failed_submission(),
+                        Err(Error::System(SystemError::SystemShuttingDown)),
+                    )
+                });
             }
-            SlotsInner::Drained => return TryGetSlotResult::Draining,
         };
-        match open.unused_indices.pop() {
-            Some(idx) => TryGetSlotResult::GotSlot({
-                SlotHandle {
-                    slots_weak: open.myself.clone(),
-                    idx,
+
+        fn use_for_op<'s, 'f, O>(
+            open: &'s mut SlotsInnerOpen,
+            idx: usize,
+            mut op: O,
+        ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)> + 'f
+        where
+            O: Op + Send + 'static,
+            'f: 's,
+        {
+            let sqe = op.make_sqe();
+            let sqe = sqe.user_data(u64::try_from(idx).unwrap());
+
+            assert!(open.storage[idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
+            open.storage[idx] = Some(Slot::Pending { waker: None });
+            {
+                if open.submit_raw(sqe).is_err() {
+                    // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
+                    // So, we could just submit_and_wait here. But, that'd prevent the
+                    // current executor thread from making progress on other tasks.
+                    //
+                    // So, for now, keep SQ size == inflight ops size == Slots size.
+                    // This potentially limits throughput if SQ size is chosen too small.
+                    //
+                    // FIXME: why not just async mutex?
+                    unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
                 }
-            }),
+
+                if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+                    // opportunistically process completion immediately
+                    // TODO do it during ::poll() as well?
+                    //
+                    // FIXME: why are we doing this while holding the SubmitSideOpen
+                    open.process_completions();
+                }
+            }
+
+            SlotHandle {
+                idx,
+                slots_weak: open.myself.clone(),
+            }
+            .wait_for_completion(op)
+        }
+
+        match open.unused_indices.pop() {
+            Some(idx) => Fut::B(use_for_op(open, idx, op)),
             None => {
                 let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
                 open.waiters.push_back(wake_up_tx);
@@ -527,7 +574,35 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                     open.process_completions();
                 }
 
-                TryGetSlotResult::NoSlots(wake_up_rx)
+                let myself = open.myself.clone();
+
+                Fut::C(async move {
+                    let idx = match wake_up_rx.await {
+                        Ok(idx) => idx,
+                        Err(_) => {
+                            return (
+                                op.on_failed_submission(),
+                                Err(Error::System(SystemError::SystemShuttingDown)),
+                            );
+                        }
+                    };
+                    let inner = Weak::upgrade(&myself.inner_weak)
+                        .expect("we got an idx, so, we know the system is still alive");
+                    let fut = {
+                        let mut inner_guard = inner.lock().unwrap();
+                        match &mut *inner_guard {
+                            SlotsInner::Undefined => unreachable!(),
+                            SlotsInner::Open(open) => use_for_op(open, idx, op),
+                            SlotsInner::Draining(_) | SlotsInner::Drained => {
+                                return (
+                                    op.on_failed_submission(),
+                                    Err(Error::System(SystemError::SystemShuttingDown)),
+                                );
+                            }
+                        }
+                    };
+                    fut.await
+                })
             }
         }
     }
@@ -542,61 +617,6 @@ pub(crate) enum SubmitError {
 impl Slots<{ co_owner::SUBMIT_SIDE }> {}
 
 impl SlotHandle {
-    pub(crate) fn use_for_op<'s, 'f, O>(
-        self,
-        mut op: O,
-    ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)> + 'f
-    where
-        O: Op + Send + 'static,
-        'f: 's,
-    {
-        let sqe = op.make_sqe();
-        let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
-
-        let res = self.slots_weak.try_upgrade_mut(|inner| match inner {
-            SlotsInner::Undefined => unreachable!(),
-            SlotsInner::Open(open) => {
-                assert!(open.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
-                open.storage[self.idx] = Some(Slot::Pending { waker: None });
-                {
-                    if open.submit_raw(sqe).is_err() {
-                        // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
-                        // So, we could just submit_and_wait here. But, that'd prevent the
-                        // current executor thread from making progress on other tasks.
-                        //
-                        // So, for now, keep SQ size == inflight ops size == Slots size.
-                        // This potentially limits throughput if SQ size is chosen too small.
-                        //
-                        // FIXME: why not just async mutex?
-                        unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
-                    }
-
-                    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-                        // opportunistically process completion immediately
-                        // TODO do it during ::poll() as well?
-                        //
-                        // FIXME: why are we doing this while holding the SubmitSideOpen
-                        open.process_completions();
-                    }
-                }
-            }
-            SlotsInner::Draining(draining) => {
-                draining.return_slot(self.idx);
-            }
-            SlotsInner::Drained => unreachable!(),
-        });
-        let Ok(()) = res else {
-            return futures::future::Either::Left(async move {
-                (
-                    op.on_failed_submission(),
-                    Err(Error::<O::Error>::System(SystemError::SystemShuttingDown)),
-                )
-            });
-        };
-
-        futures::future::Either::Right(self.wait_for_completion(op))
-    }
-
     async fn wait_for_completion<O: Op + Send + 'static>(
         self,
         op: O,

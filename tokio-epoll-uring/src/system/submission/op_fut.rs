@@ -57,42 +57,43 @@ where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
 {
-    match slot {
-        Some(slot) => Fut::A(slot.use_for_op(op)),
-        None => {
-            match open_guard.slots.try_get_slot() {
-                slots::TryGetSlotResult::Draining => Fut::B(async move {
-                    (
-                        op.on_failed_submission(),
-                        Err(Error::System(SystemError::SystemShuttingDown)),
-                    )
-                }),
-                slots::TryGetSlotResult::GotSlot(slot) => Fut::C(slot.use_for_op(op)),
-                slots::TryGetSlotResult::NoSlots(later) => {
-                    // All slots are taken and we're waiting in line.
-                    // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
-                    // This is in the hope that we'll wake ourselves up.
+    open_guard.slots.submit(op)
+    // match slot {
+    //     Some(slot) => Fut::A(slot.use_for_op(op)),
+    //     None => {
+    //         match open_guard.slots.try_get_slot() {
+    //             slots::TryGetSlotResult::Draining => Fut::B(async move {
+    //                 (
+    //                     op.on_failed_submission(),
+    //                     Err(Error::System(SystemError::SystemShuttingDown)),
+    //                 )
+    //             }),
+    //             slots::TryGetSlotResult::GotSlot(slot) => Fut::C(slot.use_for_op(op)),
+    //             slots::TryGetSlotResult::NoSlots(later) => {
+    //                 // All slots are taken and we're waiting in line.
+    //                 // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
+    //                 // This is in the hope that we'll wake ourselves up.
 
-                    Fut::D(async move {
-                        let slot = match later.await {
-                            Ok(slot) => slot,
-                            Err(_dropped) => {
-                                return (
-                                    op.on_failed_submission(),
-                                    Err(Error::System(SystemError::SystemShuttingDown)),
-                                )
-                            }
-                        };
-                        slot.use_for_op(op).await
-                    })
-                }
-            }
-        }
-    }
+    //                 Fut::D(async move {
+    //                     let slot = match later.await {
+    //                         Ok(slot) => slot,
+    //                         Err(_dropped) => {
+    //                             return (
+    //                                 op.on_failed_submission(),
+    //                                 Err(Error::System(SystemError::SystemShuttingDown)),
+    //                             )
+    //                         }
+    //                     };
+    //                     slot.use_for_op(op).await
+    //                 })
+    //             }
+    //         }
+    //     }
+    // }
 }
 
 // Used by `execute_op` to avoid boxing the future returned by the `with_submit_side` closure.
-enum Fut<Output, A, B, C, D>
+pub(crate) enum Fut<Output, A, B, C, D>
 where
     A: std::future::Future<Output = Output>,
     B: std::future::Future<Output = Output>,
