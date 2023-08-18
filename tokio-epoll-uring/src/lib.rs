@@ -21,7 +21,7 @@
 //! #[tokio::main]
 //! async fn main() {
 //!   // Launch the uring system.
-//!   let system = tokio_epoll_uring::System::launch().await;
+//!   let mut system = tokio_epoll_uring::System::launch().await;
 //!
 //!   let file = std::fs::File::open("/dev/zero").unwrap();
 //!   let fd: std::os::fd::OwnedFd = file.into();
@@ -55,8 +55,9 @@
 //!     let file = std::fs::File::open("/dev/zero").unwrap();
 //!     let fd: std::os::fd::OwnedFd = file.into();
 //!     let buf = vec![1; 1024];
-//!     let system = tokio_epoll_uring::thread_local_system().await;
-//!     let ((_, _), res) = system.read(fd, 0, buf).await;
+//!     let ((_, _), res) = tokio_epoll_uring::with_thread_local_system(|system| {
+//!         system.read(fd, 0, buf)
+//!     }).await;
 //!     println!("task {i} result: {res:?}");
 //! }
 //! ```
@@ -76,7 +77,7 @@ pub mod ops;
 mod system;
 
 pub use system::lifecycle::handle::SystemHandle;
-pub use system::lifecycle::thread_local::{Handle, with_thread_local_system};
+pub use system::lifecycle::thread_local::{with_thread_local_system, Handle};
 pub use system::lifecycle::System;
 pub use system::submission::op_fut::Error as SystemError;
 
