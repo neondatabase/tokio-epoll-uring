@@ -139,8 +139,8 @@ impl crate::SystemHandle {
     //     let inner = self.inner.as_mut().unwrap();
     //     execute_op(op, &mut inner.submit_side, None)
     // }
-    pub fn read<B: IoBufMut + Send>(
-        &mut self,
+    pub fn read<'a, 'b, B: IoBufMut + Send>(
+        &'a mut self,
         file: OwnedFd,
         offset: u64,
         buf: B,
@@ -149,7 +149,10 @@ impl crate::SystemHandle {
             (OwnedFd, B),
             Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
         ),
-    > + '_ {
+    > + 'b
+    where
+        'b: 'a,
+    {
         let op = ReadOp { file, offset, buf };
         let inner = self.inner.as_mut().unwrap();
         execute_op(op, &mut inner.submit_side, None)

@@ -1,4 +1,4 @@
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, pin::Pin, sync::Arc};
 
 /// An io_uring operation and the resources it operates on.
 ///

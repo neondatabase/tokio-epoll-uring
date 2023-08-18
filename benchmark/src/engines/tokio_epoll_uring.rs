@@ -194,10 +194,11 @@ impl EngineTokioEpollUring {
                     // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
                     //  affine to a completion queue somehow... The design space is big.)
 
-                    let mut handle = tokio_epoll_uring::thread_local_system().await;
-
                     let ((file, owned_buf), res) =
-                        handle.read(file, offset_in_file, owned_buf).await;
+                        tokio_epoll_uring::with_thread_local_system(|handle| {
+                            handle.read(file, offset_in_file, owned_buf)
+                        })
+                        .await;
 
                     let count = res.unwrap();
                     assert_eq!(count, owned_buf.len());

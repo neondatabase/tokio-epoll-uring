@@ -429,14 +429,15 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
 }
 
 impl SlotHandle {
-    pub(crate) fn use_for_op<O, S>(
+    pub(crate) fn use_for_op<'s, 'f, O, S>(
         self,
         mut op: O,
         do_submit: S,
-    ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
+    ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)> + 'f
     where
         O: Op + Send + 'static,
-        S: FnOnce(io_uring::squeue::Entry),
+        S: FnOnce(io_uring::squeue::Entry) + 's,
+        'f: 's
     {
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());

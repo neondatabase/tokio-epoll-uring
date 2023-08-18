@@ -76,7 +76,7 @@ pub mod ops;
 mod system;
 
 pub use system::lifecycle::handle::SystemHandle;
-pub use system::lifecycle::thread_local::{thread_local_system, Handle};
+pub use system::lifecycle::thread_local::{Handle, with_thread_local_system};
 pub use system::lifecycle::System;
 pub use system::submission::op_fut::Error as SystemError;
 

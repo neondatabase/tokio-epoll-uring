@@ -1,22 +1,76 @@
 //! Lazily-launched [`System`] thread-local to current tokio executor thread.
 
-use std::sync::Arc;
+use std::{
+    cell::RefCell,
+    sync::{Arc, Mutex},
+};
 
-use crate::{System, SystemHandle};
+use futures::future;
 
-thread_local! {
-    static THREAD_LOCAL: std::sync::Arc<tokio::sync::Mutex<tokio::sync::OnceCell<SystemHandle>>> = Arc::new(
-        tokio::sync::Mutex::const_new(
-        tokio::sync::OnceCell::const_new()));
+use crate::{system::submission::SubmitSide, System, SystemHandle};
+
+enum State {
+    NotStarted,
+    Launching,
+    Launched(SystemHandle),
 }
 
-pub async fn thread_local_system() -> Handle {
-    let arc = THREAD_LOCAL.with(|arc| arc.clone());
+thread_local! {
+    static THREAD_LOCAL: RefCell<State> = RefCell::new(State::NotStarted);
+}
 
-    let guard = arc.lock_owned().await;
-    guard.get_or_init(System::launch).await;
-
-    Handle(guard)
+pub async fn with_thread_local_system<'a, 'b, F, O, FO>(f: F) -> FO
+where
+    F: FnOnce(&mut SystemHandle) -> O,
+    O: std::future::Future<Output = FO> + 'b,
+    'b: 'a,
+{
+    let mut f = Some(f);
+    loop {
+        enum Outcome<A, Y, R>
+        where
+            A: std::future::Future<Output = Y>,
+        {
+            DidStartLaunch(A),
+            AlreadyLaunching,
+            Launched(R),
+        }
+        let wait_launched = THREAD_LOCAL.with(|x| {
+            let mut borrow = x.borrow_mut();
+            match &mut *borrow {
+                State::NotStarted => {
+                    x.replace(State::Launching);
+                    let fut = async move {
+                        let handle = System::launch().await;
+                        THREAD_LOCAL.with(|x| {
+                            let mut borrow = x.borrow_mut();
+                            match &mut *borrow {
+                                State::Launching => {
+                                    x.replace(State::Launched(handle));
+                                }
+                                _ => todo!(),
+                            };
+                        });
+                    };
+                    Outcome::DidStartLaunch(fut)
+                }
+                State::Launching => Outcome::AlreadyLaunching,
+                State::Launched(handle) => Outcome::Launched((f.take().unwrap())(handle)),
+            }
+        });
+        match wait_launched {
+            Outcome::DidStartLaunch(fut) => {
+                fut.await;
+                continue;
+            }
+            Outcome::AlreadyLaunching => {
+                todo!()
+            }
+            Outcome::Launched(fut) => {
+                return fut.await;
+            }
+        }
+    }
 }
 
 pub struct Handle(tokio::sync::OwnedMutexGuard<tokio::sync::OnceCell<SystemHandle>>);
