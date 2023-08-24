@@ -9,6 +9,7 @@ use io_uring::{SubmissionQueue, Submitter};
 
 use super::{
     completion::CompletionSide,
+    lifecycle::ShutdownRequest,
     slots::{self, Slots},
 };
 
@@ -18,11 +19,14 @@ pub(crate) struct SubmitSideNewArgs {
     pub(crate) sq: SubmissionQueue<'static>,
     pub(crate) slots: Slots<{ slots::co_owner::SUBMIT_SIDE }>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
+    pub(crate) shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
 }
 
 pub(crate) struct SubmitSide {
     // This is the only long-lived strong reference to the `SubmitSideInner`.
     inner: Arc<tokio::sync::Mutex<SubmitSideInner>>,
+    shutdown_tx: Option<crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>>,
+    shutdown_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl SubmitSide {
@@ -33,6 +37,7 @@ impl SubmitSide {
             sq,
             slots: ops,
             completion_side,
+            shutdown_tx,
         } = args;
         SubmitSide {
             inner: Arc::new(tokio::sync::Mutex::new(SubmitSideInner::Open(
@@ -44,7 +49,39 @@ impl SubmitSide {
                     completion_side: Arc::clone(&completion_side),
                 },
             ))),
+            shutdown_tx: Some(shutdown_tx),
+            shutdown_done_tx: None,
         }
+    }
+}
+
+impl SubmitSide {
+    pub fn shutdown(mut self) -> impl std::future::Future<Output = ()> + Send {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let prev = self.shutdown_done_tx.replace(done_tx);
+        assert!(prev.is_none());
+        drop(self);
+        async {
+            done_rx
+                .await
+                // TODO: return the error?
+                .unwrap()
+        }
+    }
+}
+
+impl Drop for SubmitSide {
+    fn drop(&mut self) {
+        self.shutdown_tx
+            .take()
+            .unwrap()
+            .send(ShutdownRequest {
+                done_tx: None,
+                submit_side_inner: Arc::clone(&self.inner),
+            })
+            // TODO: can we just ignore the error?
+            .ok()
+            .unwrap();
     }
 }
 
@@ -78,7 +115,7 @@ impl SubmitSideWeak {
         let mut inner_guard = inner.lock_owned().await;
         match &mut *inner_guard {
             SubmitSideInner::Open(_) => Some(SubmitSideOpenGuard(inner_guard)),
-            SubmitSideInner::Plugged => None,
+            SubmitSideInner::ShutDownInitiated => None,
         }
     }
 }
@@ -90,7 +127,7 @@ impl Deref for SubmitSideOpenGuard {
     fn deref(&self) -> &Self::Target {
         match &*self.0 {
             SubmitSideInner::Open(open) => open,
-            SubmitSideInner::Plugged => unreachable!(),
+            SubmitSideInner::ShutDownInitiated => unreachable!(),
         }
     }
 }
@@ -99,14 +136,14 @@ impl DerefMut for SubmitSideOpenGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut *self.0 {
             SubmitSideInner::Open(open) => open,
-            SubmitSideInner::Plugged => unreachable!(),
+            SubmitSideInner::ShutDownInitiated => unreachable!(),
         }
     }
 }
 
 pub(crate) enum SubmitSideInner {
     Open(SubmitSideOpen),
-    Plugged,
+    ShutDownInitiated,
 }
 
 pub(crate) struct SubmitSideOpen {
@@ -124,13 +161,13 @@ impl SubmitSide {
     }
     pub(crate) fn plug(self) -> SubmitSideOpen {
         let mut inner = self.inner.blocking_lock(); // TODO: is there deadlock risk by using this?
-        let cur = std::mem::replace(&mut *inner, SubmitSideInner::Plugged);
+        let cur = std::mem::replace(&mut *inner, SubmitSideInner::ShutDownInitiated);
         match cur {
             SubmitSideInner::Open(open) => {
                 open.slots.set_draining();
                 open
             }
-            SubmitSideInner::Plugged => unreachable!(),
+            SubmitSideInner::ShutDownInitiated => unreachable!(),
         }
     }
 }

@@ -7,7 +7,7 @@ use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
 
-use crate::util::oneshot_nonconsuming;
+use crate::{system::submission::SubmitSideInner, util::oneshot_nonconsuming};
 
 use super::{
     lifecycle::{ShutdownRequest, System},
@@ -63,12 +63,11 @@ pub(crate) struct PollerNewArgs {
     pub system: System,
     pub(crate) slots: Slots<{ slots::co_owner::POLLER }>,
     pub testing: Option<PollerTesting>,
+    pub shutdown_rx: oneshot_nonconsuming::Receiver<ShutdownRequest>,
 }
 
 impl Poller {
-    pub(crate) async fn launch(
-        args: PollerNewArgs,
-    ) -> oneshot_nonconsuming::SendOnce<ShutdownRequest> {
+    pub(crate) fn launch(args: PollerNewArgs) -> impl std::future::Future<Output = ()> + Send {
         let PollerNewArgs {
             id,
             uring_fd,
@@ -76,8 +75,8 @@ impl Poller {
             system,
             slots: ops,
             testing,
+            shutdown_rx,
         } = args;
-        let (shutdown_tx, shutdown_rx) = oneshot_nonconsuming::channel();
         let poller_task_state = Arc::new(Mutex::new(Poller {
             id,
             state: PollerState::RunningInTask(Arc::new(Mutex::new(PollerStateInner {
@@ -94,11 +93,12 @@ impl Poller {
             poller_ready_tx,
             testing,
         ));
-        poller_ready_rx
-            .await
-            // TODO make launch fallible and propagate this error
-            .expect("poller task must not die during startup");
-        shutdown_tx
+        async move {
+            poller_ready_rx
+                .await
+                // TODO make launch fallible and propagate this error
+                .expect("poller task must not die during startup");
+        }
     }
 }
 
@@ -344,6 +344,13 @@ async fn poller_impl(
     // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
     // (See comment on `yield_now().await` above why cancellation is safe earlier.)
     // Use a closure to enforce it.
+    let mut guard = shutdown_req_shared.submit_side_inner.lock().await;
+    let open = match std::mem::replace(&mut *guard, SubmitSideInner::ShutDownInitiated) {
+        SubmitSideInner::Open(open) => open,
+        SubmitSideInner::ShutDownInitiated => unreachable!(),
+    };
+    drop(guard);
+
     #[allow(clippy::redundant_closure_call)]
     (move || {
         let mut poller_guard = poller.lock().unwrap();
@@ -384,7 +391,8 @@ async fn poller_impl(
                     system,
                     ops,
                     completion_side,
-                    req,
+                    open,
+                    req.done_tx,
                 );
             }
         };
@@ -561,7 +569,7 @@ mod tests {
             .build()
             .unwrap();
         second_rt.block_on(async move {
-            let mut shutdown_done_fut = shutdown_done_fut;
+            let mut shutdown_done_fut = Box::pin(shutdown_done_fut);
             tokio::select! {
                 // TODO don't rely on timing
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => { }

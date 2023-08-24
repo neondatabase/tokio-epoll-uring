@@ -9,8 +9,6 @@ use crate::{
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
-use super::ShutdownRequest;
-
 /// Owned handle to the [`System`](crate::System) created by [`System::launch`](crate::System::launch).
 ///
 /// The only use of this handle is to shut down the [`System`](crate::System).
@@ -28,31 +26,12 @@ struct SystemHandleInner {
     #[allow(dead_code)]
     pub(super) id: usize,
     pub(crate) submit_side: SubmitSide,
-    pub(super) shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
-}
-
-impl Drop for SystemHandle {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            let wait_shutdown_done = inner.shutdown();
-            // we don't care about the result
-            drop(wait_shutdown_done);
-        }
-    }
 }
 
 impl SystemHandle {
-    pub(crate) fn new(
-        id: usize,
-        submit_side: SubmitSide,
-        shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
-    ) -> Self {
+    pub(crate) fn new(id: usize, submit_side: SubmitSide) -> Self {
         SystemHandle {
-            inner: Some(SystemHandleInner {
-                id,
-                submit_side,
-                shutdown_tx,
-            }),
+            inner: Some(SystemHandleInner { id, submit_side }),
         }
     }
 
@@ -78,7 +57,7 @@ impl SystemHandle {
     /// the shutdown procedure makes sure to continue in a new `std::thread`.
     ///
     /// So, it is safe to drop the tokio runtime on which the poller task runs.
-    pub fn initiate_shutdown(mut self) -> impl std::future::Future<Output = ()> + Send + Unpin {
+    pub fn initiate_shutdown(mut self) -> impl std::future::Future<Output = ()> + Send {
         let inner = self
             .inner
             .take()
@@ -107,22 +86,8 @@ impl std::future::Future for WaitShutdownFut {
 }
 
 impl SystemHandleInner {
-    fn shutdown(self) -> impl std::future::Future<Output = ()> + Send + Unpin {
-        let SystemHandleInner {
-            id: _,
-            submit_side,
-            shutdown_tx,
-        } = self;
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let req = ShutdownRequest {
-            done_tx,
-            open_state: submit_side.plug(),
-        };
-        shutdown_tx
-            .send(req)
-            .ok()
-            .expect("implementation error: poller task must not die before SystemHandle");
-        WaitShutdownFut { done_rx }
+    fn shutdown(self) -> impl std::future::Future<Output = ()> + Send {
+        self.submit_side.shutdown()
     }
 }
 
