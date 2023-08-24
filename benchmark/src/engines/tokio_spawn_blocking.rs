@@ -112,6 +112,11 @@ impl EngineTokioSpawnBlocking {
             assert!(!buf_ptr.is_null());
             #[derive(Clone, Copy)]
             struct SendPtr(*mut u8);
+            impl SendPtr {
+                fn as_mut_ptr(&self) -> *mut u8 {
+                    self.0
+                }
+            }
             unsafe impl Send for SendPtr {} // the thread spawned in the loop below doesn't outlive this function (we're polled t completion)
             unsafe impl Sync for SendPtr {} // the loop below ensures only one thread accesses it at a time
             SendPtr(buf_ptr)
@@ -140,9 +145,8 @@ impl EngineTokioSpawnBlocking {
                         if validate {
                             unimplemented!()
                         }
-                        let buf = buf;
                         let buf: &mut [u8] =
-                            unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
+                            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), block_size) };
                         let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
                         file.read_at(buf, offset_in_file).unwrap();
                         file.into_raw_fd(); // so that it's there for next iteration

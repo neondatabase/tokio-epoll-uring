@@ -107,7 +107,7 @@ impl EngineStd {
         &self,
         _client_num: u64,
         _args: &Args,
-        file: &mut std::fs::File,
+        file: &std::fs::File,
         offset: u64,
         buf: &mut [u8],
     ) {
