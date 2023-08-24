@@ -45,7 +45,7 @@ scp -p target/x86_64-unknown-linux-musl/release/benchmark testinstance:/tmp/ && 
 ## Prepare Storage on instance
 
 ```
-mkfs.ext4 /dev/nvme1n1 && \
+mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0 /dev/nvme1n1 && \
     mount /dev/nvme1n1 /mnt && \
     echo "DONE"
 ```
