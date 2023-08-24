@@ -8,6 +8,7 @@ repository = "https://github.com/neondatabase/tokio-epoll-uring"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+auto_enums = "0.8.2"
 futures = "0.3.28"
 io-uring = "0.6.0"
 once_cell = "1.18.0"
