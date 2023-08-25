@@ -9,7 +9,7 @@ pub mod thread_local;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
 use crate::{
-    system::{submission::SubmitSideOpen, RING_SIZE},
+    system::{completion::ShutdownRequest2, RING_SIZE},
     util::oneshot_nonconsuming,
 };
 
@@ -94,8 +94,9 @@ impl System {
     }
 }
 
+type ShutdownDoneTx = tokio::sync::oneshot::Sender<()>;
 pub(crate) struct ShutdownRequest {
-    pub done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub done_tx: Option<ShutdownDoneTx>,
     pub submit_side_inner: Arc<tokio::sync::Mutex<SubmitSideInner>>,
 }
 
@@ -103,8 +104,7 @@ pub(crate) fn poller_impl_finish_shutdown(
     system: System,
     ops: Slots<{ slots::co_owner::POLLER }>,
     completion_side: Arc<Mutex<CompletionSide>>,
-    submit_side_open: SubmitSideOpen,
-    mut done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_request: ShutdownRequest2,
 ) {
     tracing::info!("poller shutdown start");
     scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
@@ -112,10 +112,13 @@ pub(crate) fn poller_impl_finish_shutdown(
 
     let System { id: _, split_uring } = { system };
 
+    let ShutdownRequest2 {
+        mut done_tx,
+        submit_side_open,
+    } = { shutdown_request };
+
     let (submitter, sq) = submit_side_open.deconstruct();
-    let completion_side = Arc::try_unwrap(completion_side)
-        .ok()
-        .expect("we plugged the SubmitSide, so, all refs to CompletionSide are gone");
+    let completion_side = Arc::try_unwrap(completion_side).ok().unwrap();
     let completion_side = Mutex::into_inner(completion_side).unwrap();
 
     // Unsplit the uring

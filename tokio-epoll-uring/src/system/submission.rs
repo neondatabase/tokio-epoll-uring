@@ -60,7 +60,7 @@ impl SubmitSide {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let prev = self.shutdown_done_tx.replace(done_tx);
         assert!(prev.is_none());
-        drop(self);
+        drop(self); // sends the shutdown request
         async {
             done_rx
                 .await
@@ -76,7 +76,7 @@ impl Drop for SubmitSide {
             .take()
             .unwrap()
             .send(ShutdownRequest {
-                done_tx: None,
+                done_tx: self.shutdown_done_tx.take(),
                 submit_side_inner: Arc::clone(&self.inner),
             })
             // TODO: can we just ignore the error?
@@ -158,17 +158,6 @@ pub(crate) struct SubmitSideOpen {
 impl SubmitSide {
     pub(crate) fn weak(&self) -> SubmitSideWeak {
         SubmitSideWeak(Arc::downgrade(&self.inner))
-    }
-    pub(crate) fn plug(self) -> SubmitSideOpen {
-        let mut inner = self.inner.blocking_lock(); // TODO: is there deadlock risk by using this?
-        let cur = std::mem::replace(&mut *inner, SubmitSideInner::ShutDownInitiated);
-        match cur {
-            SubmitSideInner::Open(open) => {
-                open.slots.set_draining();
-                open
-            }
-            SubmitSideInner::ShutDownInitiated => unreachable!(),
-        }
     }
 }
 

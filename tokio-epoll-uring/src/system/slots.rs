@@ -294,8 +294,8 @@ impl SlotsInner {
     }
 }
 
-impl Slots<{ co_owner::SUBMIT_SIDE }> {
-    pub(super) fn set_draining(&self) {
+impl Slots<{ co_owner::COMPLETION_SIDE }> {
+    pub(super) fn transition_to_draining(&self) {
         let mut inner_guard = self.inner.lock().unwrap();
         match &mut inner_guard.state {
             SlotsInnerState::Open {
@@ -306,9 +306,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                 // thereby making all of the op futures return with a shutdown error
                 inner_guard.state = SlotsInnerState::Draining;
             }
-            SlotsInnerState::Draining => {
-                panic!("implementation error: must only call set_draining once")
-            }
+            SlotsInnerState::Draining => {}
         }
     }
 }

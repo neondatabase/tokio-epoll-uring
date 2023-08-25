@@ -12,6 +12,7 @@ use crate::{system::submission::SubmitSideInner, util::oneshot_nonconsuming};
 use super::{
     lifecycle::{ShutdownRequest, System},
     slots::{self, Slots},
+    submission::SubmitSideOpen,
 };
 
 pub(crate) struct CompletionSide {
@@ -105,7 +106,7 @@ impl Poller {
 enum PollerState {
     RunningInTask(Arc<Mutex<PollerStateInner>>),
     RunningInThread(Arc<Mutex<PollerStateInner>>),
-    ShuttingDownPreemptible(Arc<Mutex<PollerStateInner>>, Arc<ShutdownRequest>),
+    ShuttingDownPreemptible(Arc<Mutex<PollerStateInner>>, Arc<ShutdownRequest2>),
     ShuttingDownNoMorePreemptible,
     ShutDown,
 }
@@ -293,7 +294,7 @@ async fn poller_impl(
     };
     let shutdown_req_shared = match maybe_shutdown_req_shared {
         None => {
-            let shutdown_req: ShutdownRequest = tokio::select! {
+            let shutdown_req: ShutdownRequest2 = tokio::select! {
                 req = poller_impl_impl(Arc::clone(&inner_shared), preempt_in_epoll) => { req },
             };
             let shared = Arc::new(shutdown_req);
@@ -319,12 +320,13 @@ async fn poller_impl(
     }
 
     // 1. Prevent new ops from being submitted and wait for all inflight ops to finish.
-    // `SystemHandleInner::shutdown` already plugged the sumit side & transitioned Ops to `Draining` state.
+    // `poller_impl_impl` already transitioned `slots` to `Draining` state.
     // So, all that's left is to wait for pending count to reach 0.
     loop {
         {
             let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
+            completion_side_guard.slots.transition_to_draining();
             let pending_count = completion_side_guard.slots.pending_slot_count();
             debug!(pending_count, "waiting for pending operations to complete");
             if pending_count == 0 {
@@ -344,12 +346,6 @@ async fn poller_impl(
     // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
     // (See comment on `yield_now().await` above why cancellation is safe earlier.)
     // Use a closure to enforce it.
-    let mut guard = shutdown_req_shared.submit_side_inner.lock().await;
-    let open = match std::mem::replace(&mut *guard, SubmitSideInner::ShutDownInitiated) {
-        SubmitSideInner::Open(open) => open,
-        SubmitSideInner::ShutDownInitiated => unreachable!(),
-    };
-    drop(guard);
 
     #[allow(clippy::redundant_closure_call)]
     (move || {
@@ -391,8 +387,7 @@ async fn poller_impl(
                     system,
                     ops,
                     completion_side,
-                    open,
-                    req.done_tx,
+                    req,
                 );
             }
         };
@@ -401,10 +396,15 @@ async fn poller_impl(
     })()
 }
 
+pub(crate) struct ShutdownRequest2 {
+    pub(crate) done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) submit_side_open: SubmitSideOpen,
+}
+
 async fn poller_impl_impl(
     inner: Arc<Mutex<PollerStateInner>>,
     mut preempt_in_epoll: Option<tokio::sync::broadcast::Receiver<mpsc::UnboundedSender<()>>>,
-) -> ShutdownRequest {
+) -> ShutdownRequest2 {
     let (uring_fd, completion_side, mut shutdown_rx) = {
         let mut inner_guard = inner.lock().unwrap();
         let PollerStateInner {
@@ -444,9 +444,14 @@ async fn poller_impl_impl(
                 }
                 rx = shutdown_rx.recv()  => {
                     match rx {
-                        crate::util::oneshot_nonconsuming::RecvResult::FirstRecv(req) => {
+                        crate::util::oneshot_nonconsuming::RecvResult::FirstRecv(ShutdownRequest { done_tx, submit_side_inner }) => {
                             tracing::debug!("got explicit shutdown request");
-                            return req;
+                            let mut inner = submit_side_inner.lock().await;
+                            let open = match std::mem::replace(&mut *inner, SubmitSideInner::ShutDownInitiated) {
+                                SubmitSideInner::Open(open) => open,
+                                SubmitSideInner::ShutDownInitiated => unreachable!(),
+                            };
+                            return ShutdownRequest2 { done_tx, submit_side_open: open };
                         }
                         crate::util::oneshot_nonconsuming::RecvResult::NotFirstRecv => {
                             panic!("once we observe a shutdown request, we return it and the caller does through with shutdown, without a chance for the executor to intervene")
