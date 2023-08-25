@@ -33,7 +33,7 @@ impl SharedSystemHandle {
     /// For more details, see [`crate::SystemHandle::initiate_shutdown`].
     ///
     /// TODO: change API to return an error, using [`Arc::try_unwrap`] or similar?
-    pub fn initiate_shutdown(self) -> impl Future<Output = ()> + Send  {
+    pub fn initiate_shutdown(self) -> impl Future<Output = ()> + Send {
         self.0
             .write()
             .unwrap()
