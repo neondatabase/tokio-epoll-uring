@@ -1,11 +1,18 @@
 //! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
 use futures::FutureExt;
-use std::{os::fd::OwnedFd, task::ready};
+use std::{
+    os::fd::OwnedFd,
+    path::{Path, PathBuf},
+    task::ready,
+};
 use tokio_uring::buf::IoBufMut;
 
 use crate::{
-    ops::read::ReadOp,
+    ops::{
+        open_at::{open_options::OpenOptions, OpenAtOp},
+        read::ReadOp,
+    },
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -153,5 +160,27 @@ impl crate::SystemHandle {
         let op = ReadOp { file, offset, buf };
         let inner = self.inner.as_ref().unwrap();
         execute_op(op, inner.submit_side.weak())
+    }
+    pub fn open<P: AsRef<Path>>(
+        &self,
+        path: P,
+        options: &OpenOptions,
+    ) -> impl std::future::Future<
+        Output = Result<OwnedFd, crate::system::submission::op_fut::Error<std::io::Error>>,
+    > {
+        let op = match OpenAtOp::new(None, path.as_ref(), options) {
+            Ok(op) => op,
+            Err(e) => {
+                return futures::future::Either::Left(async move {
+                    Err(crate::system::submission::op_fut::Error::Op(e))
+                })
+            }
+        };
+        let inner = self.inner.as_ref().unwrap();
+        let weak = inner.submit_side.weak();
+        futures::future::Either::Right(async move {
+            let (_, res) = execute_op(op, weak).await;
+            res
+        })
     }
 }

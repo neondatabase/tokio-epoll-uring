@@ -1612,6 +1612,7 @@ dependencies = [
  "assert-panic",
  "futures",
  "io-uring 0.6.0",
+ "libc",
  "nix 0.26.2",
  "once_cell",
  "os_pipe",
