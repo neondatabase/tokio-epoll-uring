@@ -3,13 +3,10 @@ pub(crate) mod op_fut;
 use std::sync::{Arc, Mutex, Weak};
 
 use io_uring::{SubmissionQueue, Submitter};
-use tokio_util::either::Either;
-
-use crate::system::completion::ProcessCompletionsCause;
 
 use super::{
     completion::CompletionSide,
-    slots::{self, SlotHandle, Slots, TryGetSlotResult},
+    slots::{self, Slots},
 };
 
 pub(crate) struct SubmitSideNewArgs {
@@ -64,6 +61,7 @@ impl SubmitSideOpen {
     }
 }
 
+#[derive(Clone)]
 pub struct SubmitSideWeak(Weak<Mutex<SubmitSideInner>>);
 
 impl SubmitSideWeak {
@@ -76,37 +74,6 @@ impl SubmitSideWeak {
             None => return f(None),
         };
         SubmitSide { inner: submit_side }.with_submit_side_open(f)
-    }
-
-    pub(crate) async fn get_slot(&self) -> Option<SlotHandle> {
-        let maybe_fut = self.with_submit_side_open(|submit_side_open| match submit_side_open {
-            None => None,
-            Some(open) => match open.slots.try_get_slot() {
-                TryGetSlotResult::Draining => None,
-                TryGetSlotResult::GotSlot(slot) => Some(Either::Left(async move { Ok(slot) })),
-                TryGetSlotResult::NoSlots(later) => {
-                    // All slots are taken and we're waiting in line.
-                    // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
-                    // This is in the hope that we'll wake ourselves up.
-
-                    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
-                        // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
-                        open.submitter.submit().unwrap();
-                        open.completion_side
-                            .lock()
-                            .unwrap()
-                            .process_completions(ProcessCompletionsCause::Regular);
-                    }
-                    Some(Either::Right(later))
-                }
-            },
-        });
-
-        if let Some(maybe_fut) = maybe_fut {
-            maybe_fut.await.ok()
-        } else {
-            None
-        }
     }
 }
 
