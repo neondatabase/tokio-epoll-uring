@@ -294,8 +294,8 @@ impl SlotsInner {
     }
 }
 
-impl Slots<{ co_owner::SUBMIT_SIDE }> {
-    pub(super) fn set_draining(&self) {
+impl Slots<{ co_owner::COMPLETION_SIDE }> {
+    pub(super) fn transition_to_draining(&self) {
         let mut inner_guard = self.inner.lock().unwrap();
         match &mut inner_guard.state {
             SlotsInnerState::Open {
@@ -306,9 +306,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                 // thereby making all of the op futures return with a shutdown error
                 inner_guard.state = SlotsInnerState::Draining;
             }
-            SlotsInnerState::Draining => {
-                panic!("implementation error: must only call set_draining once")
-            }
+            SlotsInnerState::Draining => {}
         }
     }
 }
@@ -387,15 +385,14 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
 }
 
 impl SlotHandle {
-    pub(crate) fn use_for_op<O, S, T>(
+    pub(crate) fn use_for_op<O, S>(
         self,
         mut op: O,
         do_submit: S,
-        do_submit_arg: &mut T,
     ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
     where
         O: Op + Send + 'static,
-        S: Fn(&mut T, io_uring::squeue::Entry),
+        S: FnOnce(io_uring::squeue::Entry),
     {
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
@@ -418,7 +415,7 @@ impl SlotHandle {
             });
         };
 
-        do_submit(do_submit_arg, sqe);
+        do_submit(sqe);
 
         futures::future::Either::Right(self.wait_for_completion(op))
     }

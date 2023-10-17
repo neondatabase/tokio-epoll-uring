@@ -1,11 +1,15 @@
 pub(crate) mod op_fut;
 
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{Arc, Mutex, Weak},
+};
 
 use io_uring::{SubmissionQueue, Submitter};
 
 use super::{
     completion::CompletionSide,
+    lifecycle::ShutdownRequest,
     slots::{self, Slots},
 };
 
@@ -15,11 +19,14 @@ pub(crate) struct SubmitSideNewArgs {
     pub(crate) sq: SubmissionQueue<'static>,
     pub(crate) slots: Slots<{ slots::co_owner::SUBMIT_SIDE }>,
     pub(crate) completion_side: Arc<Mutex<CompletionSide>>,
+    pub(crate) shutdown_tx: crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>,
 }
 
 pub(crate) struct SubmitSide {
     // This is the only long-lived strong reference to the `SubmitSideInner`.
-    inner: Arc<Mutex<SubmitSideInner>>,
+    inner: Arc<tokio::sync::Mutex<SubmitSideInner>>,
+    shutdown_tx: Option<crate::util::oneshot_nonconsuming::SendOnce<ShutdownRequest>>,
+    shutdown_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl SubmitSide {
@@ -30,16 +37,51 @@ impl SubmitSide {
             sq,
             slots: ops,
             completion_side,
+            shutdown_tx,
         } = args;
         SubmitSide {
-            inner: Arc::new(Mutex::new(SubmitSideInner::Open(SubmitSideOpen {
-                id,
-                submitter,
-                sq,
-                slots: ops,
-                completion_side: Arc::clone(&completion_side),
-            }))),
+            inner: Arc::new(tokio::sync::Mutex::new(SubmitSideInner::Open(
+                SubmitSideOpen {
+                    id,
+                    submitter,
+                    sq,
+                    slots: ops,
+                    completion_side: Arc::clone(&completion_side),
+                },
+            ))),
+            shutdown_tx: Some(shutdown_tx),
+            shutdown_done_tx: None,
         }
+    }
+}
+
+impl SubmitSide {
+    pub fn shutdown(mut self) -> impl std::future::Future<Output = ()> + Send {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let prev = self.shutdown_done_tx.replace(done_tx);
+        assert!(prev.is_none());
+        drop(self); // sends the shutdown request
+        async {
+            done_rx
+                .await
+                // TODO: return the error?
+                .unwrap()
+        }
+    }
+}
+
+impl Drop for SubmitSide {
+    fn drop(&mut self) {
+        self.shutdown_tx
+            .take()
+            .unwrap()
+            .send(ShutdownRequest {
+                done_tx: self.shutdown_done_tx.take(),
+                submit_side_inner: Arc::clone(&self.inner),
+            })
+            // TODO: can we just ignore the error?
+            .ok()
+            .unwrap();
     }
 }
 
@@ -62,38 +104,46 @@ impl SubmitSideOpen {
 }
 
 #[derive(Clone)]
-pub struct SubmitSideWeak(Weak<Mutex<SubmitSideInner>>);
+pub struct SubmitSideWeak(Weak<tokio::sync::Mutex<SubmitSideInner>>);
 
 impl SubmitSideWeak {
-    pub(crate) fn with_submit_side_open<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(Option<&mut SubmitSideOpen>) -> R,
-    {
-        let submit_side = match self.0.upgrade() {
-            Some(submit_side) => submit_side,
-            None => return f(None),
+    pub(crate) async fn upgrade_to_open(&self) -> Option<SubmitSideOpenGuard> {
+        let inner: Arc<tokio::sync::Mutex<SubmitSideInner>> = match self.0.upgrade() {
+            Some(inner) => inner,
+            None => return None,
         };
-        SubmitSide { inner: submit_side }.with_submit_side_open(f)
+        let mut inner_guard = inner.lock_owned().await;
+        match &mut *inner_guard {
+            SubmitSideInner::Open(_) => Some(SubmitSideOpenGuard(inner_guard)),
+            SubmitSideInner::ShutDownInitiated => None,
+        }
     }
 }
 
-impl SubmitSide {
-    pub(crate) fn with_submit_side_open<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(Option<&mut SubmitSideOpen>) -> R,
-    {
-        let mut inner_guard = self.inner.lock().unwrap();
-        let submit_side_open = match &mut *inner_guard {
+pub(crate) struct SubmitSideOpenGuard(tokio::sync::OwnedMutexGuard<SubmitSideInner>);
+
+impl Deref for SubmitSideOpenGuard {
+    type Target = SubmitSideOpen;
+    fn deref(&self) -> &Self::Target {
+        match &*self.0 {
             SubmitSideInner::Open(open) => open,
-            SubmitSideInner::Plugged => return f(None),
-        };
-        f(Some(submit_side_open))
+            SubmitSideInner::ShutDownInitiated => unreachable!(),
+        }
+    }
+}
+
+impl DerefMut for SubmitSideOpenGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut *self.0 {
+            SubmitSideInner::Open(open) => open,
+            SubmitSideInner::ShutDownInitiated => unreachable!(),
+        }
     }
 }
 
 pub(crate) enum SubmitSideInner {
     Open(SubmitSideOpen),
-    Plugged,
+    ShutDownInitiated,
 }
 
 pub(crate) struct SubmitSideOpen {
@@ -108,17 +158,6 @@ pub(crate) struct SubmitSideOpen {
 impl SubmitSide {
     pub(crate) fn weak(&self) -> SubmitSideWeak {
         SubmitSideWeak(Arc::downgrade(&self.inner))
-    }
-    pub(crate) fn plug(self) -> SubmitSideOpen {
-        let mut inner = self.inner.lock().unwrap();
-        let cur = std::mem::replace(&mut *inner, SubmitSideInner::Plugged);
-        match cur {
-            SubmitSideInner::Open(open) => {
-                open.slots.set_draining();
-                open
-            }
-            SubmitSideInner::Plugged => unreachable!(),
-        }
     }
 }
 

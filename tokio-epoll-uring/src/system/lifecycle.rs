@@ -8,13 +8,16 @@ pub mod thread_local;
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
-use crate::system::{submission::SubmitSideOpen, RING_SIZE};
+use crate::{
+    system::{completion::ShutdownRequestImpl, RING_SIZE},
+    util::oneshot_nonconsuming,
+};
 
 use super::{
     completion::{CompletionSide, Poller, PollerNewArgs, PollerTesting},
     lifecycle::handle::SystemHandle,
     slots::{self, Slots},
-    submission::{SubmitSide, SubmitSideNewArgs},
+    submission::{SubmitSide, SubmitSideInner, SubmitSideNewArgs},
 };
 
 /// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
@@ -59,12 +62,15 @@ impl System {
                 slots_completion_side,
             )));
 
+            let (shutdown_tx, shutdown_rx) = oneshot_nonconsuming::channel();
+
             let submit_side = SubmitSide::new(SubmitSideNewArgs {
                 id,
                 submitter,
                 sq,
                 slots: slots_submit_side,
                 completion_side: Arc::clone(&completion_side),
+                shutdown_tx,
             });
             let system = System {
                 id,
@@ -77,26 +83,27 @@ impl System {
                 system,
                 slots: slots_poller,
                 testing,
+                shutdown_rx,
             });
             (submit_side, poller_ready_fut)
         };
 
-        let poller_shutdown_tx = poller_ready_fut.await;
+        poller_ready_fut.await;
 
-        SystemHandle::new(id, submit_side, poller_shutdown_tx)
+        SystemHandle::new(id, submit_side)
     }
 }
 
 pub(crate) struct ShutdownRequest {
-    pub done_tx: tokio::sync::oneshot::Sender<()>,
-    pub open_state: SubmitSideOpen,
+    pub done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub submit_side_inner: Arc<tokio::sync::Mutex<SubmitSideInner>>,
 }
 
 pub(crate) fn poller_impl_finish_shutdown(
     system: System,
     ops: Slots<{ slots::co_owner::POLLER }>,
     completion_side: Arc<Mutex<CompletionSide>>,
-    req: ShutdownRequest,
+    shutdown_request: ShutdownRequestImpl,
 ) {
     tracing::info!("poller shutdown start");
     scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
@@ -104,15 +111,13 @@ pub(crate) fn poller_impl_finish_shutdown(
 
     let System { id: _, split_uring } = { system };
 
-    let ShutdownRequest {
-        done_tx,
-        open_state,
-    } = req;
+    let ShutdownRequestImpl {
+        mut done_tx,
+        submit_side_open,
+    } = { shutdown_request };
 
-    let (submitter, sq) = open_state.deconstruct();
-    let completion_side = Arc::try_unwrap(completion_side)
-        .ok()
-        .expect("we plugged the SubmitSide, so, all refs to CompletionSide are gone");
+    let (submitter, sq) = submit_side_open.deconstruct();
+    let completion_side = Arc::try_unwrap(completion_side).ok().unwrap();
     let completion_side = Mutex::into_inner(completion_side).unwrap();
 
     // Unsplit the uring
@@ -154,5 +159,7 @@ pub(crate) fn poller_impl_finish_shutdown(
 
     // notify about completed shutdown;
     // ignore send errors, interest may be gone if it's implicit shutdown through SystemHandle::drop
-    let _ = done_tx.send(());
+    if let Some(done_tx) = done_tx.take() {
+        let _ = done_tx.send(());
+    }
 }
