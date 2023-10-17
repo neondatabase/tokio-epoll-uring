@@ -448,7 +448,7 @@ async fn poller_impl_impl(
                             let mut inner = submit_side_inner.lock().await;
                             let open = match std::mem::replace(&mut *inner, SubmitSideInner::ShutDownInitiated) {
                                 SubmitSideInner::Open(open) => open,
-                                SubmitSideInner::ShutDownInitiated => unreachable!(),
+                                SubmitSideInner::ShutDownInitiated => unreachable!("poller_impl transitions to state ShuttingDownPreemptible when we return a shutdown request, so, it won't call poller_impl_impl again"),
                             };
                             return ShutdownRequestImpl { done_tx, submit_side_open: open };
                         }
