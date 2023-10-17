@@ -294,9 +294,8 @@ async fn poller_impl(
     };
     let shutdown_req_shared = match maybe_shutdown_req_shared {
         None => {
-            let shutdown_req: ShutdownRequestImpl = tokio::select! {
-                req = poller_impl_impl(Arc::clone(&inner_shared), preempt_in_epoll) => { req },
-            };
+            let shutdown_req: ShutdownRequestImpl =
+                poller_impl_impl(Arc::clone(&inner_shared), preempt_in_epoll).await;
             let shared = Arc::new(shutdown_req);
             poller.lock().unwrap().state = PollerState::ShuttingDownPreemptible(
                 Arc::clone(&inner_shared),
