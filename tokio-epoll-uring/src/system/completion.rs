@@ -201,25 +201,31 @@ async fn poller_task(
                         .unwrap()
                         .block_on(async move {
                             let poller = poller_clone;
-                            let poller_guard = poller.lock().unwrap();
-                            match &poller_guard.state {
-                                PollerState::RunningInThread(_)
-                                | PollerState::ShuttingDownPreemptible(_, _) => {
-                                    drop(poller_guard);
-                                    if let Some(tx) = poller_switch_to_thread_done {
-                                        // receiver must ensure that clone doesn't outlive the try_unwrap during shutdown
-                                        tx.send(Arc::clone(&poller)).ok().unwrap();
+                            {
+                                let poller_guard = poller.lock().unwrap();
+                                match &poller_guard.state {
+                                    PollerState::RunningInThread(_)
+                                    | PollerState::ShuttingDownPreemptible(_, _) => {
+                                        drop(poller_guard);
+                                        // Code continues below, outside of the scope that
+                                        // holds poller_guard. The control flow needs to be this
+                                        // weird to make clippy happy:
+                                        // https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_lock
                                     }
-                                    poller_impl(poller, None, shutdown_loop_reached.clone())
-                                        .instrument(info_span!("poller_thread", system=%id))
-                                        .await
-                                }
-                                PollerState::RunningInTask(_)
-                                | PollerState::ShuttingDownNoMorePreemptible
-                                | PollerState::ShutDown => {
-                                    unreachable!("unexpected state: {:?}", poller_guard.state)
+                                    PollerState::RunningInTask(_)
+                                    | PollerState::ShuttingDownNoMorePreemptible
+                                    | PollerState::ShutDown => {
+                                        unreachable!("unexpected state: {:?}", poller_guard.state)
+                                    }
                                 }
                             }
+                            if let Some(tx) = poller_switch_to_thread_done {
+                                // receiver must ensure that clone doesn't outlive the try_unwrap during shutdown
+                                tx.send(Arc::clone(&poller)).ok().unwrap();
+                            }
+                            poller_impl(poller, None, shutdown_loop_reached.clone())
+                                .instrument(info_span!("poller_thread", system=%id))
+                                .await
                         })
                 })
                 .unwrap();
