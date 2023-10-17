@@ -190,7 +190,7 @@ impl SlotsInner {
                         idx,
                     }) {
                         Ok(()) => {
-                            trace!("handed `idx` to a waiter");
+                            // trace!("handed `idx` to a waiter");
                             return;
                         }
                         Err(_) => {
@@ -199,12 +199,12 @@ impl SlotsInner {
                         }
                     }
                 }
-                trace!("no waiters, returning idx to unused_indices");
+                // trace!("no waiters, returning idx to unused_indices");
                 self.unused_indices.push(idx);
             }
             SlotsInnerState::Draining => {
                 clear_slot(&mut self.storage[idx]);
-                trace!("draining, returning idx to unused_indices");
+                // trace!("draining, returning idx to unused_indices");
                 self.unused_indices.push(idx);
             }
         }
@@ -269,7 +269,7 @@ impl SlotsInner {
                     result: cqe.result(),
                 };
                 if let Some(waker) = waker {
-                    trace!("waking up future");
+                    // trace!("waking up future");
                     waker.wake();
                 }
             }
@@ -509,7 +509,7 @@ impl SlotHandle {
 
                 match &mut *slot_mut {
                     Slot::Pending { waker } => {
-                        trace!("op is still pending, storing waker in it");
+                        // trace!("op is still pending, storing waker in it");
                         let waker_mut_ref = waker.get_or_insert_with(|| cx.waker().clone());
                         if !cx.waker().will_wake(waker_mut_ref) {
                             waker.replace(cx.waker().clone());
@@ -520,7 +520,7 @@ impl SlotHandle {
                         unreachable!("if it's dropped, it's not pollable")
                     }
                     Slot::Ready { result: res } => {
-                        trace!("op is ready, returning resources to user");
+                        // trace!("op is ready, returning resources to user");
                         let res = *res;
                         inner.return_slot(slot.idx);
                         InspectSlotResult::AlreadyDone(res)

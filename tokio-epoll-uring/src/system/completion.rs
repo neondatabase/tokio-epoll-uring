@@ -5,7 +5,7 @@ use std::{
 
 use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
-use tracing::{debug, info, info_span, trace, Instrument};
+use tracing::{debug, info, info_span, trace, Instrument, trace_span};
 
 use crate::util::oneshot_nonconsuming;
 
@@ -210,7 +210,7 @@ async fn poller_task(
                                         tx.send(Arc::clone(&poller)).ok().unwrap();
                                     }
                                     poller_impl(poller, None, shutdown_loop_reached.clone())
-                                        .instrument(info_span!("poller_thread", system=%id))
+                                        .instrument(trace_span!("poller_thread", system=%id))
                                         .await
                                 }
                                 PollerState::RunningInTask(_)
@@ -238,7 +238,7 @@ async fn poller_task(
         });
     }
     tokio::select! {
-        _ = poller_impl(Arc::clone(&poller), Some(preempt_during_epoll_doit_rx) , shutdown_loop_reached.clone()).instrument(info_span!("poller_task", system=%id)) => {},
+        _ = poller_impl(Arc::clone(&poller), Some(preempt_during_epoll_doit_rx) , shutdown_loop_reached.clone()).instrument(trace_span!("poller_task", system=%id)) => {},
         _ = preempt_due_to_preempt_during_epoll_rx.recv() => { },
         _ = async move { match preempt_outer_rx {
             Some(preempt) => {
@@ -454,7 +454,7 @@ async fn poller_impl_impl(
                 }
             };
             if !guard.ready().is_readable() {
-                trace!("spurious wakeup");
+                // trace!("spurious wakeup");
                 continue;
             }
             guard.clear_ready_matching(tokio::io::Ready::READABLE);
