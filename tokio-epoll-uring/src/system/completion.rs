@@ -345,7 +345,6 @@ async fn poller_impl(
     // From here on, we cannot let ourselves be cancelled at an `.await` anymore.
     // (See comment on `yield_now().await` above why cancellation is safe earlier.)
     // Use a closure to enforce it.
-
     #[allow(clippy::redundant_closure_call)]
     (move || {
         let mut poller_guard = poller.lock().unwrap();

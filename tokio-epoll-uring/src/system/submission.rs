@@ -107,8 +107,8 @@ impl SubmitSideOpen {
 pub struct SubmitSideWeak(Weak<tokio::sync::Mutex<SubmitSideInner>>);
 
 impl SubmitSideWeak {
-    pub(crate) async fn with_submit_side_open(&self) -> Option<SubmitSideOpenGuard> {
-        let inner = match self.0.upgrade() {
+    pub(crate) async fn upgrade_to_open(&self) -> Option<SubmitSideOpenGuard> {
+        let inner: Arc<tokio::sync::Mutex<SubmitSideInner>> = match self.0.upgrade() {
             Some(inner) => inner,
             None => return None,
         };

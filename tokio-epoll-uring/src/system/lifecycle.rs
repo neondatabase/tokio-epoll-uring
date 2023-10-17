@@ -94,9 +94,8 @@ impl System {
     }
 }
 
-type ShutdownDoneTx = tokio::sync::oneshot::Sender<()>;
 pub(crate) struct ShutdownRequest {
-    pub done_tx: Option<ShutdownDoneTx>,
+    pub done_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub submit_side_inner: Arc<tokio::sync::Mutex<SubmitSideInner>>,
 }
 

@@ -55,7 +55,7 @@ where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
 {
-    let open_guard = match submit_side.with_submit_side_open().await {
+    let open_guard = match submit_side.upgrade_to_open().await {
         Some(open) => open,
         None => {
             return (
@@ -89,7 +89,7 @@ where
         } else {
             None
         };
-        drop(open_guard); // drop it asap
+        drop(open_guard); // drop it asap to enable timely shutdown
 
         if let Some(mut cq) = cq_guard {
             // opportunistically process completion immediately
