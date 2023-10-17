@@ -106,7 +106,7 @@ impl Poller {
 enum PollerState {
     RunningInTask(Arc<Mutex<PollerStateInner>>),
     RunningInThread(Arc<Mutex<PollerStateInner>>),
-    ShuttingDownPreemptible(Arc<Mutex<PollerStateInner>>, Arc<ShutdownRequest2>),
+    ShuttingDownPreemptible(Arc<Mutex<PollerStateInner>>, Arc<ShutdownRequestImpl>),
     ShuttingDownNoMorePreemptible,
     ShutDown,
 }
@@ -294,7 +294,7 @@ async fn poller_impl(
     };
     let shutdown_req_shared = match maybe_shutdown_req_shared {
         None => {
-            let shutdown_req: ShutdownRequest2 = tokio::select! {
+            let shutdown_req: ShutdownRequestImpl = tokio::select! {
                 req = poller_impl_impl(Arc::clone(&inner_shared), preempt_in_epoll) => { req },
             };
             let shared = Arc::new(shutdown_req);
@@ -396,7 +396,7 @@ async fn poller_impl(
     })()
 }
 
-pub(crate) struct ShutdownRequest2 {
+pub(crate) struct ShutdownRequestImpl {
     pub(crate) done_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub(crate) submit_side_open: SubmitSideOpen,
 }
@@ -404,7 +404,7 @@ pub(crate) struct ShutdownRequest2 {
 async fn poller_impl_impl(
     inner: Arc<Mutex<PollerStateInner>>,
     mut preempt_in_epoll: Option<tokio::sync::broadcast::Receiver<mpsc::UnboundedSender<()>>>,
-) -> ShutdownRequest2 {
+) -> ShutdownRequestImpl {
     let (uring_fd, completion_side, mut shutdown_rx) = {
         let mut inner_guard = inner.lock().unwrap();
         let PollerStateInner {
@@ -451,7 +451,7 @@ async fn poller_impl_impl(
                                 SubmitSideInner::Open(open) => open,
                                 SubmitSideInner::ShutDownInitiated => unreachable!(),
                             };
-                            return ShutdownRequest2 { done_tx, submit_side_open: open };
+                            return ShutdownRequestImpl { done_tx, submit_side_open: open };
                         }
                         crate::util::oneshot_nonconsuming::RecvResult::NotFirstRecv => {
                             panic!("once we observe a shutdown request, we return it and the caller does through with shutdown, without a chance for the executor to intervene")

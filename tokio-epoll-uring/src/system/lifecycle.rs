@@ -9,7 +9,7 @@ pub mod thread_local;
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 
 use crate::{
-    system::{completion::ShutdownRequest2, RING_SIZE},
+    system::{completion::ShutdownRequestImpl, RING_SIZE},
     util::oneshot_nonconsuming,
 };
 
@@ -104,7 +104,7 @@ pub(crate) fn poller_impl_finish_shutdown(
     system: System,
     ops: Slots<{ slots::co_owner::POLLER }>,
     completion_side: Arc<Mutex<CompletionSide>>,
-    shutdown_request: ShutdownRequest2,
+    shutdown_request: ShutdownRequestImpl,
 ) {
     tracing::info!("poller shutdown start");
     scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
@@ -112,7 +112,7 @@ pub(crate) fn poller_impl_finish_shutdown(
 
     let System { id: _, split_uring } = { system };
 
-    let ShutdownRequest2 {
+    let ShutdownRequestImpl {
         mut done_tx,
         submit_side_open,
     } = { shutdown_request };
