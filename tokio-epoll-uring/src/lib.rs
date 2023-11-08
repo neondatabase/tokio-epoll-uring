@@ -80,7 +80,11 @@ pub use system::lifecycle::thread_local::{thread_local_system, Handle};
 pub use system::lifecycle::System;
 pub use system::submission::op_fut::Error as SystemError;
 
+pub use tokio_uring::buf::{IoBuf, IoBufMut};
+
 pub(crate) mod util;
+
+pub use crate::system::submission::op_fut::Error;
 
 #[doc(hidden)]
 pub mod env_tunables {
