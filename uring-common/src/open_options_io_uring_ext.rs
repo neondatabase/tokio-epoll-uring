@@ -18,11 +18,11 @@ pub trait OpenOptionsIoUringExt {
     /// The caller must ensure that it remains valid until either the returned
     /// SQE is dropped without being submitted, or if the SQE is submitted until
     /// the corresponding completion is observed.
-    unsafe fn as_openat_sqe(&self, path: *const u8) -> io::Result<io_uring::squeue::Entry>;
+    unsafe fn as_openat_sqe(&self, path: *const libc::c_char) -> io::Result<io_uring::squeue::Entry>;
 }
 
 impl OpenOptionsIoUringExt for OpenOptions {
-    unsafe fn as_openat_sqe(&self, path: *const u8) -> io::Result<io_uring::squeue::Entry> {
+    unsafe fn as_openat_sqe(&self, path: *const libc::c_char) -> io::Result<io_uring::squeue::Entry> {
         use io_uring::{opcode, types};
         let flags = libc::O_CLOEXEC
             | self.access_mode()?
