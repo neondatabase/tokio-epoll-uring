@@ -1,21 +1,23 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
+use uring_common::{buf::IoBufMut, io_uring};
+
 use crate::system::submission::op_fut::Op;
 
 pub struct ReadOp<B>
 where
-    B: tokio_uring::buf::IoBufMut + Send,
+    B: IoBufMut + Send,
 {
     pub(crate) file: OwnedFd,
     pub(crate) offset: u64,
     pub(crate) buf: B,
 }
 
-impl<B> crate::sealed::Sealed for ReadOp<B> where B: tokio_uring::buf::IoBufMut + Send {}
+impl<B> crate::sealed::Sealed for ReadOp<B> where B: IoBufMut + Send {}
 
 impl<B> Op for ReadOp<B>
 where
-    B: tokio_uring::buf::IoBufMut + Send,
+    B: IoBufMut + Send,
 {
     type Resources = (OwnedFd, B);
     type Success = usize;
@@ -43,7 +45,7 @@ where
         let res = if res < 0 {
             Err(std::io::Error::from_raw_os_error(-res))
         } else {
-            unsafe { tokio_uring::buf::IoBufMut::set_init(&mut self.buf, res as usize) };
+            unsafe { IoBufMut::set_init(&mut self.buf, res as usize) };
             Ok(res as usize)
         };
         ((self.file, self.buf), res)

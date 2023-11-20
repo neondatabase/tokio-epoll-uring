@@ -7,6 +7,7 @@ pub mod handle;
 pub mod thread_local;
 
 use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
+use uring_common::io_uring;
 
 use crate::{
     system::{completion::ShutdownRequestImpl, RING_SIZE},

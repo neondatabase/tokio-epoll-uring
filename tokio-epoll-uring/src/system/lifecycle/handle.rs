@@ -2,7 +2,7 @@
 
 use futures::FutureExt;
 use std::{os::fd::OwnedFd, task::ready};
-use tokio_uring::buf::IoBufMut;
+use uring_common::buf::IoBufMut;
 
 use crate::{
     ops::read::ReadOp,

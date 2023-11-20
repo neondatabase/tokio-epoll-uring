@@ -1611,7 +1611,6 @@ version = "0.1.0"
 dependencies = [
  "assert-panic",
  "futures",
- "io-uring 0.6.0",
  "nix 0.26.2",
  "once_cell",
  "os_pipe",
@@ -1619,10 +1618,10 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-uring",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uring-common",
 ]
 
 [[package]]
@@ -1730,6 +1729,14 @@ name = "unicode-ident"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
+
+[[package]]
+name = "uring-common"
+version = "0.1.0"
+dependencies = [
+ "io-uring 0.6.0",
+ "libc",
+]
 
 [[package]]
 name = "utf8parse"
