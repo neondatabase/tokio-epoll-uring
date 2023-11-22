@@ -11,7 +11,6 @@ use crate::open_options::OpenOptions;
 pub trait OpenOptionsIoUringExt {
     /// Turn `self` into an [`::io_uring::opcode::OpenAt`] SQE for the given `path`.
     ///
-    ///
     /// # Safety
     ///
     /// The returned SQE stores the provided `path` pointer.

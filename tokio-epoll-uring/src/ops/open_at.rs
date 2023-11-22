@@ -9,18 +9,18 @@ pub use uring_common::open_options::OpenOptions;
 
 pub struct OpenAtOp {
     dir_fd: Option<OwnedFd>,
-    _path: CString, // need to keep it alive for lifetime of the operation
+    _path: CString, // need to keep it alive for the lifetime of the operation
     sqe: io_uring::squeue::Entry,
 }
 
 impl OpenAtOp {
     pub(crate) fn new_cwd(path: &Path, options: &OpenOptions) -> std::io::Result<Self> {
         let path = CString::new(path.as_os_str().as_bytes())?;
-        // SAFETY: we keep `pathname` alive inside the OpenAtOp, so, the pointer stored int the SQE remains valid.
+        // SAFETY: we keep `path` alive inside the OpenAtOp, so, the pointer stored in the SQE remains valid.
         let sqe = unsafe {
             uring_common::open_options_io_uring_ext::OpenOptionsIoUringExt::as_openat_sqe(
                 options,
-                path.as_c_str().as_ptr(),
+                path.as_ptr(),
             )
         }?;
         Ok(OpenAtOp {

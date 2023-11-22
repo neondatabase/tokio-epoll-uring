@@ -47,7 +47,6 @@ impl OpenOptions {
     /// Creates a blank new set of options ready for configuration.
     ///
     /// All options are initially set to `false`.
-
     pub fn new() -> OpenOptions {
         OpenOptions {
             // generic
@@ -98,7 +97,6 @@ impl OpenOptions {
     ///
     /// This function doesn't create the file if it doesn't exist. Use the
     /// [`OpenOptions::create`] method to do so.
-
     pub fn append(&mut self, append: bool) -> &mut OpenOptions {
         self.append = append;
         self
