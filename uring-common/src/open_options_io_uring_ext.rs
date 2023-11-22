@@ -1,6 +1,6 @@
 // It's an ext trait to avoid changes in `open_options.rs`.
 //
-// See also: https://github.com/neondatabase/tokio-uring/pull/1
+// See also: https://github.com/neondatabase/tokio-epoll-uring/pull/25
 
 use std::io;
 
