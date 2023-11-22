@@ -12,6 +12,8 @@ pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
     fn make_sqe(&mut self) -> io_uring::squeue::Entry;
 }
 
+use uring_common::io_uring;
+
 use crate::system::{
     completion::ProcessCompletionsCause,
     slots::{self, SlotHandle},

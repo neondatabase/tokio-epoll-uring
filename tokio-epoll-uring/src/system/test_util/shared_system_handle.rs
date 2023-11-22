@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use futures::Future;
+use uring_common::buf::IoBufMut;
 
 use crate::SystemError;
 use crate::{System, SystemHandle};
@@ -42,7 +43,7 @@ impl SharedSystemHandle {
             .initiate_shutdown()
     }
 
-    pub fn read<B: tokio_uring::buf::IoBufMut + Send>(
+    pub fn read<B: IoBufMut + Send>(
         &self,
         file: std::os::fd::OwnedFd,
         offset: u64,

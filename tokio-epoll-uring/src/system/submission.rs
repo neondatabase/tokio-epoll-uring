@@ -6,6 +6,7 @@ use std::{
 };
 
 use io_uring::{SubmissionQueue, Submitter};
+use uring_common::io_uring;
 
 use super::{
     completion::CompletionSide,

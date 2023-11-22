@@ -3,4 +3,5 @@
 members = [
     "tokio-epoll-uring",
     "benchmark",
+    "uring-common",
 ]
