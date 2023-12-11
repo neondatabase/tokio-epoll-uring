@@ -1,31 +1,45 @@
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 
-use uring_common::{buf::IoBufMut, io_uring};
+use uring_common::{buf::IoBufMut, io_fd::IoFd, io_uring};
 
 use crate::system::submission::op_fut::Op;
 
-pub struct ReadOp<B>
+pub struct ReadOp<F, B>
 where
+    F: IoFd + Send,
     B: IoBufMut + Send,
 {
-    pub(crate) file: OwnedFd,
+    pub(crate) file: F,
     pub(crate) offset: u64,
     pub(crate) buf: B,
 }
 
-impl<B> crate::sealed::Sealed for ReadOp<B> where B: IoBufMut + Send {}
-
-impl<B> Op for ReadOp<B>
+impl<F, B> crate::sealed::Sealed for ReadOp<F, B>
 where
+    F: IoFd + Send,
     B: IoBufMut + Send,
 {
-    type Resources = (OwnedFd, B);
+}
+
+impl<F, B> Op for ReadOp<F, B>
+where
+    F: IoFd + Send,
+    B: IoBufMut + Send,
+{
+    type Resources = (F, B);
     type Success = usize;
     type Error = std::io::Error;
 
     fn make_sqe(&mut self) -> io_uring::squeue::Entry {
         io_uring::opcode::Read::new(
-            io_uring::types::Fd(self.file.as_raw_fd()),
+            io_uring::types::Fd(
+                // SAFETY: we hold `AsFd` in self, and if `self` is dropped, hand the fd to the
+                // `System` to keep it live until the operation completes.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    self.file.as_fd().as_raw_fd()
+                },
+            ),
             self.buf.stable_mut_ptr(),
             self.buf.bytes_total() as _,
         )
