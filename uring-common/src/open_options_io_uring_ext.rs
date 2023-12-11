@@ -6,6 +6,8 @@ use std::io;
 
 use crate::open_options::OpenOptions;
 
+use uring_kernel_interface::io_uring;
+
 /// Extension trait to allow re-use of [`OpenOptions`] in other crates that
 /// build on top of [`io_uring`].
 pub trait OpenOptionsIoUringExt {

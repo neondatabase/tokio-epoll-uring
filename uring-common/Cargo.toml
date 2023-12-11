@@ -7,4 +7,4 @@ license = "MIT" # the same as tokio-uring at the time we forked it
 
 [dependencies]
 libc = "0.2.80"
-io-uring = "0.6.0"
+uring-kernel-interface = { path = "../uring-kernel-interface" }
