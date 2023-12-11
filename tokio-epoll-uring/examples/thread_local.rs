@@ -19,7 +19,7 @@ async fn main() {
 
             let system = tokio_epoll_uring::thread_local_system().await;
             let buf = vec![0; 2048];
-            let ((_file, buf), res) = system.read(file.into(), 512, buf).await;
+            let ((_file, buf), res) = system.read(file, 512, buf).await;
             let read = res.unwrap();
             assert_eq!(read, 2048, "not expecting short read");
             assert_eq!(&buf[0..512], &[23u8; 512]);
