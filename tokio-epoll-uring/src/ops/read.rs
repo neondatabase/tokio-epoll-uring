@@ -1,13 +1,13 @@
 use std::os::fd::AsRawFd;
 
-use uring_common::{buf::IoBufMut, io_fd::IoFd, io_uring};
+use uring_common::{buf::BoundedBufMut, io_fd::IoFd, io_uring};
 
 use crate::system::submission::op_fut::Op;
 
 pub struct ReadOp<F, B>
 where
     F: IoFd + Send,
-    B: IoBufMut + Send,
+    B: BoundedBufMut + Send,
 {
     pub(crate) file: F,
     pub(crate) offset: u64,
@@ -17,14 +17,14 @@ where
 impl<F, B> crate::sealed::Sealed for ReadOp<F, B>
 where
     F: IoFd + Send,
-    B: IoBufMut + Send,
+    B: BoundedBufMut + Send,
 {
 }
 
 impl<F, B> Op for ReadOp<F, B>
 where
     F: IoFd + Send,
-    B: IoBufMut + Send,
+    B: BoundedBufMut + Send,
 {
     type Resources = (F, B);
     type Success = usize;
@@ -59,7 +59,7 @@ where
         let res = if res < 0 {
             Err(std::io::Error::from_raw_os_error(-res))
         } else {
-            unsafe { IoBufMut::set_init(&mut self.buf, res as usize) };
+            unsafe { BoundedBufMut::set_init(&mut self.buf, res as usize) };
             Ok(res as usize)
         };
         ((self.file, self.buf), res)
