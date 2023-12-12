@@ -33,7 +33,7 @@ where
     fn make_sqe(&mut self) -> io_uring::squeue::Entry {
         io_uring::opcode::Read::new(
             io_uring::types::Fd(
-                // SAFETY: we hold `AsFd` in self, and if `self` is dropped, hand the fd to the
+                // SAFETY: we hold `F` in self, and if `self` is dropped, we hand the fd to the
                 // `System` to keep it live until the operation completes.
                 #[allow(unused_unsafe)]
                 unsafe {
