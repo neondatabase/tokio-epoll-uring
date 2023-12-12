@@ -34,7 +34,6 @@ allow = [
     "Apache-2.0",
     "MIT",
     "Unicode-DFS-2016",
-    "Zlib",
 ]
 deny = []
 copyleft = "warn"
