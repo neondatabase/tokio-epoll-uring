@@ -18,20 +18,20 @@ For example, a page-cache-missing 8k random `read()` an `i4i.2xlarge` EC2 instan
 In this case, `tokio::fs` is a better choice than blocking the executor thread through sync IO.
 
 But, a page-cache-*hit* 8k random `read()` on the same instance takes `~1us`.
-In this case, `tokio::fs` is clearly a bad choice than blocking the executor thread through sync IO.
+In this case, `tokio::fs` is clearly a worse choice than blocking the executor thread through sync IO.
 
 The problem is that we don't know ahead of time if it will be a hit or miss.
 So, we must use the same code path for both cases.
 And, we can't use `tokio::fs` for both cases because it's a bad choice for the "hit" case.
 But we can't use synchronous IO either because it would block the executor thread for too long if it's a `miss`.
 
-Now, one could argue to just switch to [`tokio_uring`](https://docs.rs/tokio-uring/latest/tokio_uring/).
+Now, one could argue for just switching to [`tokio_uring`](https://docs.rs/tokio-uring/latest/tokio_uring/).
 It's a new async Rust runtime that uses [`io_uring`](https://manpages.debian.org/unstable/liburing-dev/io_uring_enter.2.en.html)
 instead of [`epoll`](https://manpages.debian.org/unstable/manpages/epoll.7.en.html) under the hood.
 Pretty cool, if only ...
 * ... it was as widely used as `tokio`, so one could be sure that it's production-ready and
 * ... [Rust allowed us to be generic over async runtimes](https://github.com/rust-lang/wg-async/issues/45),
-  so all our code that depends on vanilla `tokio` won't be broken at runtime or compile time.
+  so all of our code that depends on vanilla `tokio` won't be broken at runtime or compile time.
 
 So, the next best idea is to use `tokio` and `tokio_uring` within the same process like so:
 - Use `tokio` by default.

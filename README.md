@@ -9,20 +9,19 @@
 
 Use `cargo doc --no-deps --open`.
 
-The Rust docs include sections on the motivation, design of this crate, and benchmarks.
+The Rust docs include sections on the motivation behind this project, the design of the crate, and benchmarks.
 If you prefer to read them in Markdown in your browser, check out the files in [`tokio-epoll-uring/src/doc`](tokio-epoll-uring/src/doc).
 
 # Examples
 
 Check out [`./tokio-epoll-uring/examples`](./tokio-epoll-uring/examples).
 
-
 # Bug Reports, Roadmap, Contributing
 
-Keep in mind the warning at the top of this file: this project is not intended for use outside of Neon (yet).
+As noted at the top of this readme file, this project is not yet intended for use outside of Neon.
 
 * Genuine bug reports are welcome.
-* Feature requests are not welcome.
+* We will not be able to accept feature requests at this time.
 * We are unlikely to accept big refactoring PRs.
 * We are likely to accept PRs that add support for new io_uring opcodes.
   Duplicating some code per opcdoe added is preferred over doing a big DRY refactoring.
