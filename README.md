@@ -1,89 +1,33 @@
-This crate enables high-performance use of Linux's `io_uring` from vanilla `tokio`.
+`tokio-epoll-uring` enables high-performance use of [Linux's `io_uring`](https://kernel.dk/io_uring.pdf) from vanilla [`tokio`](https://tokio.rs/).
 
-Author: Christian Schwarz
-
-Context: https://github.com/neondatabase/neon/issues/4744
+> [!WARNING]
+> This project is currently not intended for use outside of Neon.
+> The plan is to prove the core architectural idea by deploying it to production in [Neon's Pageserver](https://github.com/neondatabase/neon/tree/main/pageserver).
+> We will share the results with the tokio community to push forward `io_uring`-enabled `tokio`.
 
 # Documentation
 
 Use `cargo doc --no-deps --open`.
 
-# Benchmark
+The Rust docs include sections on the motivation, design of this crate, and benchmarks.
+If you prefer to read them in Markdown in your browser, check out the files in [`tokio-epoll-uring/src/doc`](tokio-epoll-uring/src/doc).
 
-The `./benchmark` crate is a microbenchmark that evaluates this crate against other solutions.
+# Examples
 
-How to use it:
+Check out [`./tokio-epoll-uring/examples`](./tokio-epoll-uring/examples).
 
-## Get an `i4i.2xlarge` AWS EC2 instance
 
-Numbers mentioned in the crate docs are for this instance type.
+# Bug Reports, Roadmap, Contributing
 
-## Build the benchmark binary and upload it
+Keep in mind the warning at the top of this file: this project is not intended for use outside of Neon (yet).
 
-In `.cargo/config.toml`:
+* Genuine bug reports are welcome.
+* Feature requests are not welcome.
+* We are unlikely to accept big refactoring PRs.
+* We are likely to accept PRs that add support for new io_uring opcodes.
+  Duplicating some code per opcdoe added is preferred over doing a big DRY refactoring.
+* Feedback on the architecture is best provided by opening an issue.
 
-```
-[target.x86_64-unknown-linux-musl]
-linker = "x86_64-linux-gnu-gcc"
-```
+# Benchmarking
 
-Then build static binary:
-
-```
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-And upload benchmark binary + scripts
-
-```
-scp -p target/x86_64-unknown-linux-musl/release/benchmark testinstance:/tmp/ && \
-    scp -p ./benchmark/scripts/postprocess.py testinstance:/tmp && \
-    scp -p ./benchmark/scripts/runbench.sh testinstance:/tmp/ &&
-    echo DONE
-```
-
-## Prepare Storage on instance
-
-```
-mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0 /dev/nvme1n1 && \
-    mount /dev/nvme1n1 /mnt && \
-    echo "DONE"
-```
-
-## Run benchmarks
-
-```
-cd /mnt
-rm -f *.json *.csv *.tar
-bash -x /tmp/runbench.sh
-python3 /tmp/postprocess.py
-tar -cf results.tar *.json *.csv
-```
-
-The results are in the `.csv` files produced by `postprocess.py`.
-The most interesting one is the `totals.csv`.
-
-## Viz / Summary
-
-Copy this Google Sheet and import the data.
-
-https://docs.google.com/spreadsheets/d/1bs_q7IyoTzF43SeEIBWCJk7z2mdZZVsLbqvVwE88YWA/edit?usp=sharing
-
-```
-# Totals are small enough to fit in RAM
-ssh neon-devvm-mbp ssh testinstance cat /mnt/totals.csv | pbcopy
-# per-client stats need to go through CSV import
-ssh neon-devvm-mbp ssh testinstance cat /mnt/fairness_by_nclients-1200.csv > ~/tmp/data.csv
-ssh neon-devvm-mbp ssh testinstance cat /mnt/fairness_by_nclients-400.csv > ~/tmp/data.csv
-```
-
-For totals, paste into leftmost column, then "Data => Split Text To Columns".
-
-For CSV, move to the right "fairness" sheet in the bottom bar, click File->Import->Upload csv, select "Replace current sheet".
-NB: Not "replace current *spread*sheet", just "replace current sheet".
-
-## Archive data
-
-```
-ssh neon-devvm-mbp ssh testinstance cat /mnt/results.tar > ~/tmp/results.tar
-```
+See [`./BENCHMARKING.md`](BENCHMARKING.md).
