@@ -2,7 +2,7 @@
 
 use futures::FutureExt;
 use std::{os::fd::OwnedFd, path::Path, task::ready};
-use uring_common::buf::IoBufMut;
+use uring_common::{buf::IoBufMut, io_fd::IoFd};
 
 use crate::{
     ops::{open_at::OpenAtOp, read::ReadOp},
@@ -104,14 +104,14 @@ impl crate::SystemHandle {
         let inner = self.inner.as_ref().unwrap();
         execute_op(op, inner.submit_side.weak(), None)
     }
-    pub fn read<B: IoBufMut + Send>(
+    pub fn read<F: IoFd + Send, B: IoBufMut + Send>(
         &self,
-        file: OwnedFd,
+        file: F,
         offset: u64,
         buf: B,
     ) -> impl std::future::Future<
         Output = (
-            (OwnedFd, B),
+            (F, B),
             Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
         ),
     > {
