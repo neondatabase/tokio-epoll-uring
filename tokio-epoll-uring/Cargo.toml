@@ -1,9 +1,8 @@
 [package]
 name = "tokio-epoll-uring"
-description = "High-performance use of Linux’s io_uring from vanilla tokio."
+description = "Use io_uring from vanilla tokio."
 version = "0.1.0"
 edition = "2021"
-authors = [ "Christian Schwarz <me@cschwarz.com>" ]
 repository = "https://github.com/neondatabase/tokio-epoll-uring"
 license = "MIT OR Apache-2.0"
 
