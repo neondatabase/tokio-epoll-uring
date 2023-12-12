@@ -4,7 +4,7 @@ The core insights behind this crate are:
 * We can use Linux's new-ish `io_uring` facility to submit kernel-buffered reads from async Rust.
 * To wait for completions, `io_uring` supports `epoll`ing of the file descriptor that represents an `io_uring` instance
   (This is a lesser-known but supported feature of io_uring).
-* Vanilla `tokio` supports  `epoll`ing arbitrary file descriptors in async Rust via [`tokio::io::unix::AsyncFd`].
+* Vanilla `tokio` supports `epoll`ing arbitrary file descriptors in async Rust via [`tokio::io::unix::AsyncFd`].
 
 Combine the above, and the result is this library:
 
@@ -29,8 +29,6 @@ the lazy initialization of the thread-local.
 
 ## Critique
 
-We shouldn't put too much lipstick on the pig:
-
 The tokio runtime has no idea of the high priority that the *poller task* has in the overall system.
 If the system is under heavy load, the turnaround time for the *poller task* in the tokio scheduler will grow.
 This means completion processing gets delayed, thereby transitively delaying `wake()` of the futures that issued these operations.
@@ -39,7 +37,7 @@ It would be beneficial to prioritize the *poller task* if the io_uring fd become
 Further, in the one-io_uring-per-executor-thread extension to the design:
   1. There is no way to pin the *poller task* to the OS thread as the io_uring it corresponds to.
      This means the *poller task*s float freely among the executor OS threads.
-     In a scenario where a read hits the page cache, the *poller task* will thus run on a different OS thread
+     In a scenario where a read hits the page cache, the *poller task* will run on a different OS thread
      than where the read op was issued. So, tokio will have to do an (intra-runtime) cross-OS-thread `wake()`.
      Which is more expensive than if the *poller task* were on the same OS thread as the task that issued the read op.
      Sadly, there is [little hope](https://discord.com/channels/500028886025895936/500336333500448798/1131667951657955481)
