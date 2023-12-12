@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-/// An `io-uring` compatible file file-descriptor-wrapping struct.
+/// An `io-uring` compatible file descriptor, or wrapper thereof.
 ///
 /// This trait is implemented by structs that hold ownership of a file descriptor.
 ///
@@ -29,6 +29,12 @@ impl IoFd for std::fs::File {
     }
 }
 
+/// A mutable `io-uring` compatible file descriptor, or wrapper thereof.
+///
+/// This trait is implemented by structs that hold ownership of a file descriptor.
+///
+/// Think of this as [`crate::buf::IoBufMut`], but for file descriptors.
+/// See also [`IoFd`].
 pub trait IoFdMut: IoFd {
     /// # Safety
     ///
