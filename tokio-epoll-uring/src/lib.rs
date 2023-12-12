@@ -80,7 +80,7 @@ pub use system::lifecycle::thread_local::{thread_local_system, Handle};
 pub use system::lifecycle::System;
 pub use system::submission::op_fut::Error as SystemError;
 
-pub use uring_common::buf::{IoBuf, IoBufMut, Slice, BoundedBuf, BoundedBufMut};
+pub use uring_common::buf::{BoundedBuf, BoundedBufMut, IoBuf, IoBufMut, Slice};
 pub use uring_common::io_fd::IoFd;
 
 pub(crate) mod util;
