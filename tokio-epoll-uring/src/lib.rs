@@ -71,21 +71,25 @@ pub(crate) mod sealed {
 
 pub mod doc;
 
+#[cfg(target_os = "linux")]
 pub mod ops;
 
+#[cfg(target_os = "linux")]
 mod system;
 
-pub use system::lifecycle::handle::SystemHandle;
-pub use system::lifecycle::thread_local::{thread_local_system, Handle};
-pub use system::lifecycle::System;
-pub use system::submission::op_fut::Error as SystemError;
+#[cfg(target_os = "linux")]
+pub use {
+    crate::system::submission::op_fut::Error,
+    system::lifecycle::handle::SystemHandle,
+    system::lifecycle::thread_local::{thread_local_system, Handle},
+    system::lifecycle::System,
+    system::submission::op_fut::Error as SystemError,
+};
 
 pub use uring_common::buf::{BoundedBuf, BoundedBufMut, IoBuf, IoBufMut, Slice};
 pub use uring_common::io_fd::IoFd;
 
 pub(crate) mod util;
-
-pub use crate::system::submission::op_fut::Error;
 
 #[doc(hidden)]
 pub mod env_tunables {

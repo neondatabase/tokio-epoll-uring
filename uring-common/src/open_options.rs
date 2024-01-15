@@ -39,7 +39,7 @@ pub struct OpenOptions {
     truncate: bool,
     create: bool,
     create_new: bool,
-    pub(crate) mode: libc::mode_t,
+    pub(crate) mode: u32,
     pub(crate) custom_flags: libc::c_int,
 }
 
