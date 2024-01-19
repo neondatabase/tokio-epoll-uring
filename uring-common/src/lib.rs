@@ -7,3 +7,5 @@ pub mod io_fd;
 
 #[cfg(target_os = "linux")]
 pub use io_uring;
+#[cfg(target_os = "linux")]
+pub use libc;

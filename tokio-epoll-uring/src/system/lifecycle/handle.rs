@@ -5,7 +5,7 @@ use std::{os::fd::OwnedFd, path::Path, task::ready};
 use uring_common::{buf::BoundedBufMut, io_fd::IoFd};
 
 use crate::{
-    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp},
+    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx::StatxOp},
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -170,5 +170,16 @@ impl crate::SystemHandle {
         };
         let inner = self.inner.as_ref().unwrap();
         execute_op(op, inner.submit_side.weak(), None).await
+    }
+
+    pub async fn statx<F: IoFd + Send>(
+        &self,
+        file: F,
+    ) -> (
+        F, Result<uring_common::io_uring::types::statx, crate::system::submission::op_fut::Error<std::io::Error>>
+    ) {
+        uring_common::io_uring::types::statx
+        let op = StatxOp::new_fstat(file, statxbuf)
+
     }
 }
