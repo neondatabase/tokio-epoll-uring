@@ -50,10 +50,69 @@ impl System {
     pub(crate) async fn launch_with_testing(testing: Option<PollerTesting>) -> SystemHandle {
         let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
         let (submit_side, poller_ready_fut) = {
+            // TODO: should we mlock `slots`? io_uring mmap is mlocked, slots are equally important for the system to function;
             let (slots_submit_side, slots_completion_side, slots_poller) = super::slots::new(id);
-            let uring = Box::into_raw(Box::new(io_uring::IoUring::new(RING_SIZE).unwrap()));
+
+            let uring = Box::new(
+                io_uring::IoUring::builder()
+                    // Don't fork-inherit the MAP_SHARED memory mapping of the SQs and CQs with any child process.
+                    // Rationale: for an individual io_uring instance, tokio-epoll-uring assumes explusive ownership
+                    // of the user-space part of the io_uring user/kernel interface.
+                    //
+                    // For example, we rely on Arc<Mutex<>> to protect the `SubmitSideInner`.
+                    // A child process would have its cloned `Arc<Mutex<>>` but operate on the same MAP_SHARED memory mapping.
+                    // Disaster would ensure.
+                    .dontfork()
+                    .build(RING_SIZE)
+                    .unwrap(),
+            );
+            let flags_set_by_kernel = nix::fcntl::FdFlag::from_bits_truncate(
+                nix::fcntl::fcntl(uring.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap(),
+            );
+            assert!(flags_set_by_kernel.contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+                // NB: the kernel does this https://sourcegraph.com/github.com/torvalds/linux@v5.10/-/blob/fs/io_uring.c?L9195-9201
+                "for an individual io_uring instance, tokio-epoll-uring assumes explusive ownership \
+                 of the user-space part of the io_uring user/kernel interface; sharing it with another \
+                 process is unsafe; actually we want to prevent fork'ing, but, there's not flag for that, \
+                 so at least guard somewhat against the most common use of forking, which is fork+exec.");
+
+            // Ensure the kernel's io_uring features are sufficient for tokio-epoll-uring / it's use case in Neon Pageserver.
+            //
+            // Kernel 5.10 (Debian bullseye)      https://sourcegraph.com/github.com/torvalds/linux@v5.10/-/blob/fs/io_uring.c?L9368-9371
+            // =>      features     SINGLE_MMAP | NODROP | SUBMIT_STABLE | RW_CUR_POS | CUR_PERSONALITY | FAST_POLL | POLL_32BITS;
+            // Kernel 6.1 (Debian bookworm)       https://sourcegraph.com/github.com/torvalds/linux@v6.1/-/blob/io_uring/io_uring.c?L3534:16-3534:39
+            // => adds features     SQPOLL_NONFIXED | EXT_ARG | NATIVE_WORKERS | RSRC_TAGS | CQE_SKIP | LINKED_FILE;
+            // Kernel 6.7 (no Debian release yet) https://sourcegraph.com/github.com/torvalds/linux@v6.7/-/blob/io_uring/io_uring.c?L4054-4060
+            // => adds features     REG_REG_RING;
+            //
+            // Best man page rendering for features on the web: https://man.archlinux.org/man/io_uring_setup.2.en
+            //
+            // NODROP:
+            //  - https://github.com/golang/go/issues/31908#issuecomment-571651387
+            //  - also https://kernel.dk/io_uring-whatsnew.pdf
+            assert!(uring.params().is_feature_nodrop(), "tokio-epoll-uring has len(slots) == len(sq) == len(cq), so, in theory we don't care, but, better not worry");
+            // SUBMIT_STABLE: https://man.archlinux.org/man/io_uring_submit.3.en#NOTES ;
+            // TODO need to check each op whether it needs this, then safeguard in future ops
+            assert!(uring.params().is_feature_submit_stable(), "we can always put things into resources to avoid depending on this feature, but we haven't thought about it so far, so, let's require it");
+            // RW_CUR_POS: we don't expose current-file-position-style APIs currently.
+            // CUR_PERSONALITY:
+            // - not a problem in Neon's pageserver use case, we don't change personality / seteuid / whatnot
+            // FAST_POLL: "just" a performance feature, not relevant to assert here
+            // POLL_32BITS: we don't expose epoll; if we ever do, I suppose there'd be a submission error with the higher bits flags, so, we'd notice.
+            // SQPOLL_NONFIXED: we don't support fixed files at this time
+            // EXT_ARG: we don't use this functionality currently (io_uring_enter timeout sounds interesting though)
+            // NATIVE_WORKERS: has a performance aspect, and a security/privileges aspect
+            // - https://kernel.dk/axboe-kr2022.pdf (generally a good presentation)
+            // => security/privileges aspect: same argument as for CUR_PERSONALITY
+            // => performance aspect: we don't care about that here
+            // RSRC_TAGS: we don't use fixed FDs / buffers
+            // CQE_SKIP: we don't use flag IOSQE_CQE_SKIP_SUCCESS, unlikely the current design every will
+            // LINKED_FILE: we don't use IOSQE_IO_LINK nor IOSQE_IO_HARDLINK aka linked io_uring operations; so, this doesn't matter
+            // REG_REG_RING: we don't use fxied FDs (and hence not IORING_REGISTER_USE_REGISTERED_RING), so, this doesn't matter.
+
+            let uring = Box::into_raw(uring);
+
             let uring_fd = unsafe { (*uring).as_raw_fd() };
             let (submitter, sq, cq) = unsafe { (*uring).split() };
 
@@ -63,6 +122,7 @@ impl System {
                 slots_completion_side,
             )));
 
+            // TODO: this unbounded channel is the root of all evil: unbounded queue for IOPS; should provie app option to back-pressure instead.
             let (shutdown_tx, shutdown_rx) = oneshot_nonconsuming::channel();
 
             let submit_side = SubmitSide::new(SubmitSideNewArgs {
