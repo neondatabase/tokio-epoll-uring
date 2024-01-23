@@ -21,7 +21,7 @@
 //! #[tokio::main]
 //! async fn main() {
 //!   // Launch the uring system.
-//!   let system = tokio_epoll_uring::System::launch().await;
+//!   let system = tokio_epoll_uring::System::launch().await.unwrap();
 //!
 //!   let file = std::fs::File::open("/dev/zero").unwrap();
 //!   let fd: std::os::fd::OwnedFd = file.into();

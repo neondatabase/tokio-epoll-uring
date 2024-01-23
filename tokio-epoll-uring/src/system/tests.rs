@@ -33,7 +33,7 @@ async fn op_state_pending_but_future_dropped() {
     // Get the op slot into state PendingButFutureDropped
     // then let process_completions run and see what happens.
 
-    let system = SharedSystemHandle::launch().await;
+    let system = SharedSystemHandle::launch().await.unwrap();
 
     let (reader, mut writer) = os_pipe::pipe().unwrap();
     let reader = unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
@@ -73,7 +73,7 @@ async fn op_state_pending_but_future_dropped() {
 
 #[tokio::test]
 async fn basic() {
-    let system = SharedSystemHandle::launch().await;
+    let system = SharedSystemHandle::launch().await.unwrap();
 
     let (reader, mut writer) = os_pipe::pipe().unwrap();
     let reader = unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
@@ -87,4 +87,104 @@ async fn basic() {
     assert_eq!(buf, vec![1]);
 
     system.initiate_shutdown().await;
+}
+
+// This test changes & observes process-wide state.
+// To avoid requiring cargo nextest / --test-threads 1, we do some trickery.
+// TODO: find means to avoid this trickery / make it more robust.
+#[tokio::test]
+async fn hitting_memlock_limit_does_not_panic() {
+    let max_number_of_systems_spawned_by_other_tests: usize = 100; // other tests affect VmLck as well.
+
+    let (soft, hard) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_MEMLOCK).unwrap();
+    let expect_system_memlock_usage = 16 * 1024; // TODO: depends on RING_SIZE
+                                                 // lower the softlimit such that the test will complete quickly but also don't
+                                                 // lower it so much that other tests will fail
+    let temp_softlimit: u64 =
+        2 * (max_number_of_systems_spawned_by_other_tests as u64) * expect_system_memlock_usage;
+    assert!(temp_softlimit <= hard);
+    nix::sys::resource::setrlimit(
+        nix::sys::resource::Resource::RLIMIT_MEMLOCK,
+        temp_softlimit,
+        hard,
+    )
+    .unwrap();
+    scopeguard::defer!({
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_MEMLOCK, soft, hard)
+            .unwrap();
+    });
+
+    let get_vm_lck = || {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let mut iter = s.lines().filter_map(|line| {
+            let (pre, suff) = line.split_once(':')?;
+            if pre != "VmLck" {
+                return None;
+            }
+            let (num, unit) = {
+                let comps: Vec<_> = suff.split_whitespace().collect();
+                assert_eq!(comps.len(), 2);
+                (comps[0], comps[1])
+            };
+            assert_eq!(unit, "kB");
+            let num: u64 = num.parse().unwrap();
+            Some(num * 1024)
+        });
+        let first = iter.next().unwrap();
+        assert!(iter.next().is_none());
+        first
+    };
+
+    let mut systems = Vec::new();
+    let mut vm_lck_observations = vec![];
+    loop {
+        let res = System::launch().await;
+        vm_lck_observations.push(get_vm_lck());
+        match res {
+            Ok(system) => {
+                // use the uring in case the memory is allocated lazily
+                let ((), res) = system.nop().await;
+                res.unwrap();
+                systems.push(system); // keep alive until end of test
+
+                // Pass the test if our kernel
+                // is recent enough that SQ and CQ aren't accounted as locked memory.
+                // E.g., on 5.10 LTS kernels < 5.10.162 (and generally mainline kernels < 5.12),
+                // io_uring will account the memory of the CQ and SQ as locked.
+                // More details: https://github.com/neondatabase/neon/issues/6373#issuecomment-1905814391
+                if vm_lck_observations.len() > max_number_of_systems_spawned_by_other_tests {
+                    let mut sorted = vm_lck_observations.clone();
+                    sorted.sort();
+                    let remainder = &sorted[max_number_of_systems_spawned_by_other_tests..];
+                    if remainder.len() < 2 {
+                        continue;
+                    }
+                    // we should see a trend line
+                    let min = remainder.iter().min();
+                    let max = remainder.iter().max();
+                    if min == max {
+                        println!("it seems like CQ and SQ aren't accounted as locked memory by the kernel");
+                        println!("VmLock observations: {vm_lck_observations:?}");
+                        return;
+                    } else {
+                        // strong monotonicity
+                        let mut last = remainder[0];
+                        for i in &remainder[1..] {
+                            assert!(last < *i);
+                            last = *i;
+                        }
+                    }
+                }
+            }
+            Err(e) => match e {
+                crate::system::lifecycle::LaunchResult::IoUringBuild(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::OutOfMemory);
+                    // run this test with --test-threads=1 or nextest to get predictable results for systems.len() under a given ulimit
+                    println!("hit limit after {} iterations", systems.len(),);
+                    return;
+                }
+            },
+        }
+    }
 }
