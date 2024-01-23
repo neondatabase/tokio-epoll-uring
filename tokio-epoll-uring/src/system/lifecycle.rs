@@ -109,7 +109,7 @@ impl System {
             // RSRC_TAGS: we don't use fixed FDs / buffers
             // CQE_SKIP: we don't use flag IOSQE_CQE_SKIP_SUCCESS, unlikely the current design every will
             // LINKED_FILE: we don't use IOSQE_IO_LINK nor IOSQE_IO_HARDLINK aka linked io_uring operations; so, this doesn't matter
-            // REG_REG_RING: we don't use fxied FDs (and hence not IORING_REGISTER_USE_REGISTERED_RING), so, this doesn't matter.
+            // REG_REG_RING: we don't use fixed FDs (and hence not IORING_REGISTER_USE_REGISTERED_RING), so, this doesn't matter.
 
             let uring = Box::into_raw(uring);
 
