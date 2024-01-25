@@ -36,6 +36,32 @@ unsafe impl Sync for System {}
 
 static SYSTEM_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[derive(Debug)]
+pub enum LaunchResult {
+    IoUringBuild(std::io::Error),
+}
+
+impl std::error::Error for LaunchResult {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LaunchResult::IoUringBuild(e) => Some(e),
+        }
+    }
+}
+
+impl std::fmt::Display for LaunchResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (prefix, e) = match &self {
+            LaunchResult::IoUringBuild(e) => ("build io_uring instance", e),
+        };
+        if f.alternate() {
+            write!(f, "{prefix}: {e:#}")
+        } else {
+            write!(f, "{prefix}: {e}")
+        }
+    }
+}
+
 impl System {
     /// Returns a future that, when polled, sets up an io_uring instance
     /// and a corresponding tokio-epoll-uring *poller task* on the current tokio runtime.
@@ -43,11 +69,13 @@ impl System {
     /// interact with the system.
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
-    pub async fn launch() -> SystemHandle {
+    pub async fn launch() -> Result<SystemHandle, LaunchResult> {
         Self::launch_with_testing(None).await
     }
 
-    pub(crate) async fn launch_with_testing(testing: Option<PollerTesting>) -> SystemHandle {
+    pub(crate) async fn launch_with_testing(
+        testing: Option<PollerTesting>,
+    ) -> Result<SystemHandle, LaunchResult> {
         let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let (submit_side, poller_ready_fut) = {
@@ -65,7 +93,7 @@ impl System {
                     // Disaster would ensure.
                     .dontfork()
                     .build(RING_SIZE)
-                    .unwrap(),
+                    .map_err(LaunchResult::IoUringBuild)?,
             );
             let flags_set_by_kernel = nix::fcntl::FdFlag::from_bits_truncate(
                 nix::fcntl::fcntl(uring.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap(),
@@ -151,7 +179,7 @@ impl System {
 
         poller_ready_fut.await;
 
-        SystemHandle::new(id, submit_side)
+        Ok(SystemHandle::new(id, submit_side))
     }
 }
 

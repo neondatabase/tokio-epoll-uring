@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use futures::Future;
 use uring_common::buf::IoBufMut;
 
+use crate::system::lifecycle::LaunchResult;
 use crate::SystemError;
 use crate::{System, SystemHandle};
 
@@ -18,15 +19,17 @@ pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
 use crate::system::completion::PollerTesting;
 
 impl SharedSystemHandle {
-    pub async fn launch() -> Self {
-        let handle = System::launch().await;
-        Self(Arc::new(RwLock::new(Some(handle))))
+    pub async fn launch() -> Result<Self, LaunchResult> {
+        let handle = System::launch().await?;
+        Ok(Self(Arc::new(RwLock::new(Some(handle)))))
     }
 
     #[cfg(test)]
-    pub(crate) async fn launch_with_testing(poller_testing: Option<PollerTesting>) -> Self {
-        let handle = System::launch_with_testing(poller_testing).await;
-        Self(Arc::new(RwLock::new(Some(handle))))
+    pub(crate) async fn launch_with_testing(
+        poller_testing: Option<PollerTesting>,
+    ) -> Result<Self, LaunchResult> {
+        let handle = System::launch_with_testing(poller_testing).await?;
+        Ok(Self(Arc::new(RwLock::new(Some(handle)))))
     }
 
     /// First shutdown call will succeed, subsequent ones on other [`Clone`]s of `self` will panic.

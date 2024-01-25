@@ -531,7 +531,9 @@ mod tests {
         let reader = unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
 
         let (system, read_fut) = rt.block_on(async move {
-            let system = SharedSystemHandle::launch_with_testing(Some(testing)).await;
+            let system = SharedSystemHandle::launch_with_testing(Some(testing))
+                .await
+                .unwrap();
             let mut read_fut = Box::pin(system.read(reader, 0, vec![0]));
             tokio::select! {
                 _ = &mut read_fut => { panic!("we haven't written to the pipe yet") },
@@ -640,7 +642,7 @@ mod tests {
         let (read_task_jh, mut writer) = rt.block_on(async move {
             let (reader, writer) = os_pipe::pipe().unwrap();
             let jh = tokio::spawn(async move {
-                let system = System::launch_with_testing(Some(testing)).await;
+                let system = System::launch_with_testing(Some(testing)).await.unwrap();
                 let reader =
                     unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
                 let buf = vec![0; 1];
