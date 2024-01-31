@@ -28,7 +28,7 @@ impl SharedSystemHandle {
     pub(crate) async fn launch_with_testing(
         poller_testing: Option<PollerTesting>,
     ) -> Result<Self, LaunchResult> {
-        let handle = System::launch_with_testing(poller_testing).await?;
+        let handle = System::launch_with_testing(poller_testing, None).await?;
         Ok(Self(Arc::new(RwLock::new(Some(handle)))))
     }
 

@@ -21,6 +21,8 @@ use super::{
     submission::{SubmitSide, SubmitSideInner, SubmitSideNewArgs},
 };
 
+use slots::SlotsTesting;
+
 /// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
 pub struct System {
     #[allow(dead_code)]
@@ -70,17 +72,19 @@ impl System {
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
     pub async fn launch() -> Result<SystemHandle, LaunchResult> {
-        Self::launch_with_testing(None).await
+        Self::launch_with_testing(None, None).await
     }
 
     pub(crate) async fn launch_with_testing(
-        testing: Option<PollerTesting>,
+        poller_testing: Option<PollerTesting>,
+        slots_testing: Option<SlotsTesting>,
     ) -> Result<SystemHandle, LaunchResult> {
         let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let (submit_side, poller_ready_fut) = {
             // TODO: should we mlock `slots`? io_uring mmap is mlocked, slots are equally important for the system to function;
-            let (slots_submit_side, slots_completion_side, slots_poller) = super::slots::new(id);
+            let (slots_submit_side, slots_completion_side, slots_poller) =
+                super::slots::new(id, slots_testing.unwrap_or_default());
 
             let uring = Box::new(
                 io_uring::IoUring::builder()
@@ -171,7 +175,7 @@ impl System {
                 completion_side,
                 system,
                 slots: slots_poller,
-                testing,
+                testing: poller_testing,
                 shutdown_rx,
             });
             (submit_side, poller_ready_fut)

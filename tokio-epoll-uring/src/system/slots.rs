@@ -69,6 +69,30 @@ struct SlotsInner {
     unused_indices: Vec<usize>,
     co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
     state: SlotsInnerState,
+    #[cfg(test)]
+    testing: SlotsTesting,
+}
+
+#[cfg(test)]
+pub(crate) struct SlotsTesting {
+    pub(crate) test_on_wake: Box<
+        dyn Send
+            + Sync
+            + Fn() -> Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
+    >,
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+pub(crate) struct SlotsTesting;
+
+#[cfg(test)]
+impl Default for SlotsTesting {
+    fn default() -> Self {
+        Self {
+            test_on_wake: Box::new(|| None),
+        }
+    }
 }
 
 enum SlotsInnerState {
@@ -84,6 +108,9 @@ pub(crate) struct SlotHandle {
     // FIXME: why is this weak?
     slots_weak: SlotsWeak,
     idx: usize,
+    #[cfg(test)]
+    test_on_wake:
+        std::sync::Mutex<Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 enum Slot {
@@ -101,6 +128,7 @@ enum Slot {
 
 pub(super) fn new(
     id: usize,
+    #[allow(unused_variables)] testing: SlotsTesting,
 ) -> (
     Slots<{ co_owner::SUBMIT_SIDE }>,
     Slots<{ co_owner::COMPLETION_SIDE }>,
@@ -122,6 +150,8 @@ pub(super) fn new(
                     inner_weak: inner_weak.clone(),
                 },
             },
+            #[cfg(test)]
+            testing,
         })
     });
     fn make_co_owner<const O: usize>(inner: &Arc<Mutex<SlotsInner>>) -> Slots<O> {
@@ -192,6 +222,8 @@ impl SlotsInner {
                     match waiter.send(SlotHandle {
                         slots_weak: myself.clone(),
                         idx,
+                        #[cfg(test)]
+                        test_on_wake: Mutex::new((self.testing.test_on_wake)()),
                     }) {
                         Ok(()) => {
                             trace!("handed `idx` to a waiter");
@@ -373,6 +405,8 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                     SlotHandle {
                         slots_weak: myself.clone(),
                         idx,
+                        #[cfg(test)]
+                        test_on_wake: Mutex::new((inner.testing.test_on_wake)()),
                     }
                 }),
                 None => {
@@ -546,6 +580,16 @@ impl SlotHandle {
             "poll_fn closure returns Pending in that case"
         );
 
+        #[cfg(test)]
+        {
+            let on_wake = { slot.test_on_wake.lock().unwrap().take() };
+            if let Some(on_wake) = on_wake {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                on_wake.send(tx).unwrap();
+                rx.await.unwrap();
+            }
+        }
+
         let res = match inspect_slot_res {
             InspectSlotResult::AlreadyDone(r) => r,
             InspectSlotResult::NeedToWait => {
@@ -605,5 +649,45 @@ impl Slot {
             Slot::PendingButFutureDropped { .. } => "PendingButFutureDropped",
             Slot::Ready { .. } => "Ready",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::{system::slots::SlotsTesting, System};
+
+    // Regression-test for issue https://github.com/neondatabase/tokio-epoll-uring/issues/37
+    #[tokio::test]
+    async fn test_wait_for_completion_drop_behavior() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let system = System::launch_with_testing(
+            None,
+            Some(SlotsTesting {
+                test_on_wake: Box::new(move || {
+                    Some(
+                        tx.lock()
+                            .unwrap()
+                            .take()
+                            .expect("should only be called once, we only submit one nop here"),
+                    )
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+        let nop = tokio::spawn(system.nop());
+        let at_yield_point: tokio::sync::oneshot::Sender<()> = rx.await.unwrap();
+        nop.abort();
+        let Err(join_err) = nop.await else {
+            panic!("expecting join error after abort");
+        };
+        assert!(join_err.is_cancelled());
+        assert!(
+            at_yield_point.is_closed(),
+            "abort drops the nop op, and hence the oneshot receiver"
+        );
     }
 }
