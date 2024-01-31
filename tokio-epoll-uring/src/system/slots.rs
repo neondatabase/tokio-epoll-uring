@@ -502,7 +502,9 @@ impl SlotHandle {
             NeedToWait,
             ShutDown,
         }
+        let mut poll_count = 0;
         let inspect_slot_res = poll_fn(|cx| {
+            poll_count += 1;
             let inspect_slot_res = slot.slots_weak.try_upgrade_mut(move |inner| {
                 let storage = &mut inner.storage;
                 let slot_storage_ref = &mut storage[slot.idx];
@@ -538,13 +540,14 @@ impl SlotHandle {
             }
         })
         .await;
-        let res: i32;
-        let was_ready_on_first_poll: bool;
-        match inspect_slot_res {
-            InspectSlotResult::AlreadyDone(r) => {
-                res = r;
-                was_ready_on_first_poll = true;
-            }
+        assert!(poll_count >= 1);
+        assert!(
+            !matches!(inspect_slot_res, InspectSlotResult::NeedToWait),
+            "poll_fn closure returns Pending in that case"
+        );
+
+        let res = match inspect_slot_res {
+            InspectSlotResult::AlreadyDone(r) => r,
             InspectSlotResult::NeedToWait => {
                 unreachable!()
             }
@@ -564,8 +567,7 @@ impl SlotHandle {
             }
         };
 
-        if was_ready_on_first_poll && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL
-        {
+        if poll_count == 1 && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
             tokio::task::yield_now().await;
         }
 
