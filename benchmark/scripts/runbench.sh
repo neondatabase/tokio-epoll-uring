@@ -43,7 +43,7 @@ kbs_read() {
 }
 
 page_cache_size_mibs() {
-	cat /proc/meminfo  | grep '^Cached:' | awk '{print int($2/1024)}'
+	sudo cat /proc/meminfo  | grep '^Cached:' | awk '{print int($2/1024)}'
 }
 
 create_files() {
@@ -85,7 +85,7 @@ compare_engines=(
 
 NCLIENTS=400
 create_files
-echo 3 > /proc/sys/vm/drop_caches
+echo 3 | sudo tee /proc/sys/vm/drop_caches
 ensure_workload_in_page_cache
 for engine in "${compare_engines[@]}"; do
 	date # for debugging
@@ -95,7 +95,7 @@ unset NCLIENTS
 
 NCLIENTS=1200
 create_files
-echo 3 > /proc/sys/vm/drop_caches
+echo 3  | sudo tee /proc/sys/vm/drop_caches
 TARGET_MIN_MIBS=$((58*1024)) ensure_page_cache_size_at_least
 for engine in "${compare_engines[@]}"; do
 	date # for debugging

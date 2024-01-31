@@ -24,24 +24,26 @@ cargo build --release --target x86_64-unknown-linux-musl
 And upload benchmark binary + scripts
 
 ```
-scp -p target/x86_64-unknown-linux-musl/release/benchmark testinstance:/tmp/ && \
-    scp -p ./benchmark/scripts/postprocess.py testinstance:/tmp && \
-    scp -p ./benchmark/scripts/runbench.sh testinstance:/tmp/ &&
+scp -C -p target/x86_64-unknown-linux-musl/release/benchmark neon-loadtest:/tmp/ && \
+    scp -p ./benchmark/scripts/postprocess.py neon-loadtest:/tmp && \
+    scp -p ./benchmark/scripts/runbench.sh neon-loadtest:/tmp/ &&
     echo DONE
 ```
 
 ## Prepare Storage on instance
 
 ```
-mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0 /dev/nvme1n1 && \
-    mount /dev/nvme1n1 /mnt && \
+sudo mkdir /instance_store && \
+    sudo mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0 /dev/nvme1n1 && \
+    sudo mount /dev/nvme1n1 /instance_store && \
+    sudo chown "$(id -u):$(id -g)" /instance_store && \
     echo "DONE"
 ```
 
 ## Run benchmarks
 
 ```
-cd /mnt
+cd /instance_store
 rm -f *.json *.csv *.tar
 bash -x /tmp/runbench.sh
 python3 /tmp/postprocess.py
@@ -59,10 +61,10 @@ https://docs.google.com/spreadsheets/d/1bs_q7IyoTzF43SeEIBWCJk7z2mdZZVsLbqvVwE88
 
 ```
 # Totals are small enough to fit in RAM
-ssh neon-devvm-mbp ssh testinstance cat /mnt/totals.csv | pbcopy
+ssh neon-devvm-mbp ssh neon-loadtest cat /instance_store/totals.csv | pbcopy
 # per-client stats need to go through CSV import
-ssh neon-devvm-mbp ssh testinstance cat /mnt/fairness_by_nclients-1200.csv > ~/tmp/data.csv
-ssh neon-devvm-mbp ssh testinstance cat /mnt/fairness_by_nclients-400.csv > ~/tmp/data.csv
+ssh neon-devvm-mbp ssh neon-loadtest cat /instance_store/fairness_by_nclients-1200.csv > ~/tmp/data.csv
+ssh neon-devvm-mbp ssh neon-loadtest cat /instance_store/fairness_by_nclients-400.csv > ~/tmp/data.csv
 ```
 
 For totals, paste into leftmost column, then "Data => Split Text To Columns".
@@ -73,5 +75,5 @@ NB: Not "replace current *spread*sheet", just "replace current sheet".
 ## Archive data
 
 ```
-ssh neon-devvm-mbp ssh testinstance cat /mnt/results.tar > ~/tmp/results.tar
+ssh neon-devvm-mbp ssh neon-loadtest cat /instance_store/results.tar > ~/tmp/results.tar
 ```
