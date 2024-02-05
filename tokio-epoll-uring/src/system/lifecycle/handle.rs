@@ -5,7 +5,12 @@ use std::{os::fd::OwnedFd, path::Path, task::ready};
 use uring_common::{buf::BoundedBufMut, io_fd::IoFd};
 
 use crate::{
-    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx::StatxOp},
+    ops::{
+        fsync::FsyncOp,
+        open_at::OpenAtOp,
+        read::ReadOp,
+        statx::{StatxOp, SubmittingBox},
+    },
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -176,10 +181,28 @@ impl crate::SystemHandle {
         &self,
         file: F,
     ) -> (
-        F, Result<uring_common::io_uring::types::statx, crate::system::submission::op_fut::Error<std::io::Error>>
+        F,
+        Result<
+            Box<uring_common::libc::statx>,
+            crate::system::submission::op_fut::Error<std::io::Error>,
+        >,
     ) {
-        uring_common::io_uring::types::statx
-        let op = StatxOp::new_fstat(file, statxbuf)
-
+        // TODO: avoid the allocation? allow callers to provide their own buffer?
+        let buf: Box<uring_common::libc::statx> = Box::new(
+            // TODO replace with Box<MaybeUninit>, https://github.com/rust-lang/rust/issues/63291
+            // SAFETY: we only use the memory if the fstat succeeds, should be using MaybeUninit here.
+            unsafe { std::mem::zeroed() },
+        );
+        let op = StatxOp::ByFileDescriptor {
+            file,
+            statxbuf: SubmittingBox::NotSubmitting(buf),
+        };
+        let inner = self.inner.as_ref().unwrap();
+        let (resources, result) = execute_op(op, inner.submit_side.weak(), None).await;
+        let crate::ops::statx::Resources::ByFileDescriptor { file, statxbuf } = resources;
+        match result {
+            Ok(()) => (file, Ok(statxbuf)),
+            Err(e) => (file, Err(e)),
+        }
     }
 }

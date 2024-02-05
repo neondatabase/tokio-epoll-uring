@@ -1,3 +1,4 @@
+use core::panic;
 use std::os::fd::AsRawFd;
 use uring_common::libc;
 
@@ -8,6 +9,8 @@ use uring_common::{
 
 use crate::system::submission::op_fut::Op;
 
+pub use uring_common::libc::statx;
+
 // See `https://man.archlinux.org/man/statx.2.en#Invoking_%3Cb%3Estatx%3C/b%3E():`
 // to understand why there are different variants and why they're named the way they are.
 pub enum StatxOp<F>
@@ -16,10 +19,7 @@ where
 {
     ByFileDescriptor {
         file: F,
-        statxbuf: Submitting<
-            Box<uring_common::io_uring::types::statx>,
-            *mut uring_common::io_uring::types::statx,
-        >,
+        statxbuf: SubmittingBox<uring_common::libc::statx>,
     },
 }
 
@@ -28,28 +28,65 @@ where
     F: IoFd + Send,
 {
     // Do the equivalent of fstat.
-    pub fn new_fstat(file: F, statxbuf: Box<uring_common::io_uring::types::statx>) -> StatxOp<F> {
+    pub fn new_fstat(file: F, statxbuf: Box<uring_common::libc::statx>) -> StatxOp<F> {
         StatxOp::ByFileDescriptor {
             file,
-            statxbuf: Submitting::No(statxbuf),
+            statxbuf: SubmittingBox::NotSubmitting(statxbuf),
         }
     }
 }
 
+#[non_exhaustive]
 pub enum Resources<F>
 where
     F: IoFd + Send,
 {
     ByFileDescriptor {
         file: F,
-        statxbuf: Box<uring_common::io_uring::types::statx>,
+        statxbuf: Box<uring_common::libc::statx>,
     },
 }
 
-// TODO: refine the `Op` trait so we encode this state in the typesystem
-enum Submitting<A, B> {
-    No(A),
-    Yes(B),
+// TODO: refine the `Op` trait so we encode this state in the typesystem as a typestate
+pub enum SubmittingBox<A>
+where
+    A: 'static,
+{
+    NotSubmitting(Box<A>),
+    Submitting(*mut A),
+    Undefined,
+}
+
+impl<A> SubmittingBox<A> {
+    fn start_submitting(&mut self) -> &'static mut A {
+        match std::mem::replace(self, Self::Undefined) {
+            SubmittingBox::NotSubmitting(v) => {
+                let leaked = Box::leak(v);
+                *self = Self::Submitting(leaked as *mut _);
+                leaked
+            }
+            SubmittingBox::Submitting(_) => {
+                panic!("must not call this function more than once without ownership_back_in_userspace() inbetween")
+            }
+            Self::Undefined => {
+                panic!("implementation error; did we panic earlier in the ::Submitting case?")
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Callers must ensure that userspace, and in particular, _the caller_ has again exclusive ownership
+    /// over the memory.
+    unsafe fn ownership_back_in_userspace(mut self) -> Box<A> {
+        match std::mem::replace(&mut self, SubmittingBox::Undefined) {
+            SubmittingBox::NotSubmitting(_) => {
+                panic!("must not call this function without prior call to start_submitting()")
+            }
+            SubmittingBox::Submitting(leaked) => Box::from_raw(leaked),
+            SubmittingBox::Undefined => todo!(),
+        }
+    }
 }
 
 /// SAFETY: we only needs this because we store the pointer while Submitting::Yes
@@ -77,19 +114,19 @@ where
                         file.as_fd().as_raw_fd()
                     },
                 );
-                // SAFETY: by Box::into_raw'ing the statxbuf box, the memory won't be re-used
-                // until we Box::from_raw it in `on_failed_submission` or `on_op_completion`
-                let statxbuf: *mut uring_common::io_uring::types::statx = match statxbuf {
-                    Submitting::No(statxbuf_box) => Box::into_raw(statxbuf_box),
-                    Submitting::Yes(statxbuf_ptr) => {
-                        unreachable!("make_sqe is only called once")
-                    }
-                };
                 // This is equivalent to what rust std 1.75 does if statx is supported
-                io_uring::opcode::Statx::new(fd, b"\0" as *const _, statxbuf)
-                    .flags(libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT)
-                    .mask(uring_common::libc::STATX_ALL)
-                    .build()
+                io_uring::opcode::Statx::new(
+                    fd,
+                    b"\0" as *const _,
+                    // Yes, this cast is what the io_uring / tokio-uring crates currently do as well.
+                    // Don't understand why io_uring crate just doesn't take a `libc::statx` directly.
+                    // https://github.com/tokio-rs/tokio-uring/blob/c4320fa2e7b146b28ad921ae25b552a0894c9697/src/io/statx.rs#L47-L61
+                    statxbuf.start_submitting() as *mut uring_common::libc::statx
+                        as *mut uring_common::io_uring::types::statx,
+                )
+                .flags(libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT)
+                .mask(uring_common::libc::STATX_ALL)
+                .build()
             }
         }
     }
@@ -116,14 +153,9 @@ where
     fn on_ownership_back_with_userspace(self) -> Resources<F> {
         match self {
             StatxOp::ByFileDescriptor { file, statxbuf } => {
-                let statxbuf = match statxbuf {
-                    Submitting::No(_) => unreachable!("only called after make_sqe"),
-                    Submitting::Yes(statxbuf_ptr) => {
-                        // SAFETY: the `System` guarantees that when it calls us here,
-                        // ownership of the resources is with us.
-                        unsafe { Box::from_raw(statxbuf_ptr) }
-                    }
-                };
+                // SAFETY: the `System` guarantees that when it calls us here,
+                // ownership of the resources is with us.
+                let statxbuf = unsafe { statxbuf.ownership_back_in_userspace() };
                 Resources::ByFileDescriptor { file, statxbuf }
             }
         }
