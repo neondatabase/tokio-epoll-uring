@@ -117,7 +117,7 @@ where
                 // This is equivalent to what rust std 1.75 does if statx is supported
                 io_uring::opcode::Statx::new(
                     fd,
-                    b"\0" as *const _,
+                    b"\0" as *const libc::c_char,
                     // Yes, this cast is what the io_uring / tokio-uring crates currently do as well.
                     // Don't understand why io_uring crate just doesn't take a `libc::statx` directly.
                     // https://github.com/tokio-rs/tokio-uring/blob/c4320fa2e7b146b28ad921ae25b552a0894c9697/src/io/statx.rs#L47-L61
