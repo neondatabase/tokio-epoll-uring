@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[non_exhaustive]
 pub struct Metrics {
     pub systems_created: u64,
     pub systems_destroyed: u64,
