@@ -642,9 +642,13 @@ mod tests {
         let (read_task_jh, mut writer) = rt.block_on(async move {
             let (reader, writer) = os_pipe::pipe().unwrap();
             let jh = tokio::spawn(async move {
-                let system = System::launch_with_testing(Some(testing), None)
-                    .await
-                    .unwrap();
+                let system = System::launch_with_testing(
+                    Some(testing),
+                    None,
+                    &crate::metrics::GLOBAL_STORAGE,
+                )
+                .await
+                .unwrap();
                 let reader =
                     unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(reader.as_raw_fd()).unwrap()) };
                 let buf = vec![0; 1];
