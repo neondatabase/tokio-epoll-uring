@@ -7,5 +7,3 @@ pub mod io_fd;
 
 #[cfg(target_os = "linux")]
 pub use io_uring;
-
-pub mod ext;
