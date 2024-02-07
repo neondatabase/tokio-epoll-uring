@@ -13,7 +13,7 @@ pub use uring_common::libc::statx;
 
 // See `https://man.archlinux.org/man/statx.2.en#Invoking_%3Cb%3Estatx%3C/b%3E():`
 // to understand why there are different variants and why they're named the way they are.
-pub enum StatxOp<F>
+pub(crate) enum StatxOp<F>
 where
     F: IoFd + Send,
 {
@@ -21,19 +21,6 @@ where
         file: F,
         statxbuf: SubmittingBox<uring_common::libc::statx>,
     },
-}
-
-impl<F> StatxOp<F>
-where
-    F: IoFd + Send,
-{
-    // Do the equivalent of fstat.
-    pub fn new_fstat(file: F, statxbuf: Box<uring_common::libc::statx>) -> StatxOp<F> {
-        StatxOp::ByFileDescriptor {
-            file,
-            statxbuf: SubmittingBox::NotSubmitting(statxbuf),
-        }
-    }
 }
 
 #[non_exhaustive]
@@ -46,9 +33,6 @@ where
         statxbuf: Box<uring_common::libc::statx>,
     },
 }
-
-/// SAFETY: we only needs this because we store the pointer while Submitting::Yes
-unsafe impl<F> Send for StatxOp<F> where F: IoFd + Send {}
 
 impl<F> crate::sealed::Sealed for StatxOp<F> where F: IoFd + Send {}
 

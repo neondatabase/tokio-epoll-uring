@@ -182,7 +182,7 @@ impl crate::SystemHandle {
             crate::system::submission::op_fut::Error<std::io::Error>,
         >,
     ) {
-        // TODO: avoid the allocation? allow callers to provide their own buffer?
+        // TODO: avoid the allocation, or optimize using a slab cacke?
         let buf: Box<uring_common::libc::statx> = Box::new(
             // TODO replace with Box<MaybeUninit>, https://github.com/rust-lang/rust/issues/63291
             // SAFETY: we only use the memory if the fstat succeeds, should be using MaybeUninit here.
@@ -190,7 +190,7 @@ impl crate::SystemHandle {
         );
         let op = StatxOp::ByFileDescriptor {
             file,
-            statxbuf: crate::util::submitting_box::SubmittingBox::NotSubmitting(buf),
+            statxbuf: crate::util::submitting_box::SubmittingBox::new(buf),
         };
         let inner = self.inner.as_ref().unwrap();
         let (resources, result) = execute_op(op, inner.submit_side.weak(), None).await;
