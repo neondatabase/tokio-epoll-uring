@@ -1,6 +1,6 @@
 use std::{
     os::fd::AsRawFd,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 
 pub mod handle;
@@ -29,6 +29,19 @@ pub struct System {
     id: usize,
     split_uring: *mut io_uring::IoUring,
     // poller_heartbeat: (), // TODO
+}
+
+impl System {
+    pub(crate) fn new(id: usize, split_uring: *mut io_uring::IoUring) -> Self {
+        crate::metrics::SYSTEMS_CREATED.fetch_add(1, Ordering::Relaxed);
+        Self { id, split_uring }
+    }
+}
+
+impl Drop for System {
+    fn drop(&mut self) {
+        crate::metrics::SYSTEMS_DESTROYED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
@@ -165,10 +178,7 @@ impl System {
                 completion_side: Arc::clone(&completion_side),
                 shutdown_tx,
             });
-            let system = System {
-                id,
-                split_uring: uring,
-            };
+            let system = System::new(id, uring);
             let poller_ready_fut = Poller::launch(PollerNewArgs {
                 id,
                 uring_fd,
