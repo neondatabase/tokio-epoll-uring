@@ -2,10 +2,13 @@
 
 use futures::FutureExt;
 use std::{os::fd::OwnedFd, path::Path, task::ready};
-use uring_common::{buf::BoundedBufMut, io_fd::IoFd};
+use uring_common::{
+    buf::{BoundedBuf, BoundedBufMut},
+    io_fd::IoFd,
+};
 
 use crate::{
-    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx},
+    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx, write::WriteOp},
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -199,5 +202,21 @@ impl crate::SystemHandle {
             Ok(()) => (file, Ok(statxbuf)),
             Err(e) => (file, Err(e)),
         }
+    }
+
+    pub fn write<F: IoFd + Send, B: BoundedBuf + Send>(
+        &self,
+        file: F,
+        offset: u64,
+        buf: B,
+    ) -> impl std::future::Future<
+        Output = (
+            (F, B),
+            Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
+        ),
+    > {
+        let op = WriteOp { file, offset, buf };
+        let inner = self.inner.as_ref().unwrap();
+        execute_op(op, inner.submit_side.weak(), None)
     }
 }
