@@ -5,7 +5,7 @@ use std::{os::fd::OwnedFd, path::Path, task::ready};
 use uring_common::{buf::BoundedBufMut, io_fd::IoFd};
 
 use crate::{
-    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx::StatxOp},
+    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx},
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -188,10 +188,10 @@ impl crate::SystemHandle {
             // SAFETY: we only use the memory if the fstat succeeds, should be using MaybeUninit here.
             unsafe { std::mem::zeroed() },
         );
-        let op = StatxOp::ByFileDescriptor {
+        let op = statx::op(statx::Resources::ByFileDescriptor {
             file,
-            statxbuf: crate::util::submitting_box::SubmittingBox::new(buf),
-        };
+            statxbuf: buf,
+        });
         let inner = self.inner.as_ref().unwrap();
         let (resources, result) = execute_op(op, inner.submit_side.weak(), None).await;
         let crate::ops::statx::Resources::ByFileDescriptor { file, statxbuf } = resources;

@@ -1,29 +1,27 @@
+use crate::system::submission::op_fut::Op;
+use crate::util::submitting_box::SubmittingBox;
 use std::os::fd::AsRawFd;
 use uring_common::libc;
-
+pub use uring_common::libc::statx;
 use uring_common::{
     io_fd::IoFd,
     io_uring::{self},
 };
 
-use crate::system::submission::op_fut::Op;
-use crate::util::submitting_box::SubmittingBox;
-
-pub use uring_common::libc::statx;
-
-// See `https://man.archlinux.org/man/statx.2.en#Invoking_%3Cb%3Estatx%3C/b%3E():`
-// to understand why there are different variants and why they're named the way they are.
-pub(crate) enum StatxOp<F>
+pub(crate) fn op<F>(
+    resources: Resources<F>,
+) -> impl Op<Resources = Resources<F>, Success = (), Error = std::io::Error>
 where
     F: IoFd + Send,
 {
-    ByFileDescriptor {
-        file: F,
-        statxbuf: SubmittingBox<uring_common::libc::statx>,
-    },
+    match resources {
+        Resources::ByFileDescriptor { file, statxbuf } => StatxOp::ByFileDescriptor {
+            file,
+            statxbuf: SubmittingBox::new(statxbuf),
+        },
+    }
 }
 
-#[non_exhaustive]
 pub enum Resources<F>
 where
     F: IoFd + Send,
@@ -31,6 +29,18 @@ where
     ByFileDescriptor {
         file: F,
         statxbuf: Box<uring_common::libc::statx>,
+    },
+}
+
+// See `https://man.archlinux.org/man/statx.2.en#Invoking_%3Cb%3Estatx%3C/b%3E():`
+// to understand why there are different variants and why they're named the way they are.
+enum StatxOp<F>
+where
+    F: IoFd + Send,
+{
+    ByFileDescriptor {
+        file: F,
+        statxbuf: SubmittingBox<uring_common::libc::statx>,
     },
 }
 
