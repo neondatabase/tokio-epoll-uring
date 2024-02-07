@@ -5,12 +5,7 @@ use std::{os::fd::OwnedFd, path::Path, task::ready};
 use uring_common::{buf::BoundedBufMut, io_fd::IoFd};
 
 use crate::{
-    ops::{
-        fsync::FsyncOp,
-        open_at::OpenAtOp,
-        read::ReadOp,
-        statx::{StatxOp, SubmittingBox},
-    },
+    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx::StatxOp},
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -195,7 +190,7 @@ impl crate::SystemHandle {
         );
         let op = StatxOp::ByFileDescriptor {
             file,
-            statxbuf: SubmittingBox::NotSubmitting(buf),
+            statxbuf: crate::util::submitting_box::SubmittingBox::NotSubmitting(buf),
         };
         let inner = self.inner.as_ref().unwrap();
         let (resources, result) = execute_op(op, inner.submit_side.weak(), None).await;

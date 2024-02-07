@@ -1,4 +1,3 @@
-use core::panic;
 use std::os::fd::AsRawFd;
 use uring_common::libc;
 
@@ -8,6 +7,7 @@ use uring_common::{
 };
 
 use crate::system::submission::op_fut::Op;
+use crate::util::submitting_box::SubmittingBox;
 
 pub use uring_common::libc::statx;
 
@@ -45,48 +45,6 @@ where
         file: F,
         statxbuf: Box<uring_common::libc::statx>,
     },
-}
-
-// TODO: refine the `Op` trait so we encode this state in the typesystem as a typestate
-pub enum SubmittingBox<A>
-where
-    A: 'static,
-{
-    NotSubmitting(Box<A>),
-    Submitting(*mut A),
-    Undefined,
-}
-
-impl<A> SubmittingBox<A> {
-    fn start_submitting(&mut self) -> &'static mut A {
-        match std::mem::replace(self, Self::Undefined) {
-            SubmittingBox::NotSubmitting(v) => {
-                let leaked = Box::leak(v);
-                *self = Self::Submitting(leaked as *mut _);
-                leaked
-            }
-            SubmittingBox::Submitting(_) => {
-                panic!("must not call this function more than once without ownership_back_in_userspace() inbetween")
-            }
-            Self::Undefined => {
-                panic!("implementation error; did we panic earlier in the ::Submitting case?")
-            }
-        }
-    }
-
-    /// # Safety
-    ///
-    /// Callers must ensure that userspace, and in particular, _the caller_ has again exclusive ownership
-    /// over the memory.
-    unsafe fn ownership_back_in_userspace(mut self) -> Box<A> {
-        match std::mem::replace(&mut self, SubmittingBox::Undefined) {
-            SubmittingBox::NotSubmitting(_) => {
-                panic!("must not call this function without prior call to start_submitting()")
-            }
-            SubmittingBox::Submitting(leaked) => Box::from_raw(leaked),
-            SubmittingBox::Undefined => todo!(),
-        }
-    }
 }
 
 /// SAFETY: we only needs this because we store the pointer while Submitting::Yes
