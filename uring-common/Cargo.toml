@@ -7,6 +7,7 @@ license = "MIT" # the same as tokio-uring at the time we forked it
 
 [dependencies]
 libc = "0.2.80"
+bytes = { version = "1.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6.0"
