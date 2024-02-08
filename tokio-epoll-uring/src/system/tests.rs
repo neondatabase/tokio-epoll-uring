@@ -6,7 +6,9 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{system::test_util::shared_system_handle::SharedSystemHandle, System};
+use crate::{
+    metrics::MetricsStorage, system::test_util::shared_system_handle::SharedSystemHandle, System,
+};
 
 // TODO: turn into a does-not-compile test
 // #[tokio::test]
@@ -187,4 +189,78 @@ async fn hitting_memlock_limit_does_not_panic() {
             },
         }
     }
+}
+
+#[test]
+fn test_metrics() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let metrics = Box::leak(Box::new(MetricsStorage::new_const()));
+    let metrics_ptr = metrics as *mut _;
+    let system = rt
+        .block_on(System::launch_with_testing(None, None, metrics))
+        .unwrap();
+    assert_eq!(
+        1,
+        metrics
+            .systems_created
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        0,
+        metrics
+            .systems_destroyed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    rt.block_on(system.initiate_shutdown());
+
+    assert_eq!(
+        1,
+        metrics
+            .systems_created
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        1,
+        metrics
+            .systems_destroyed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    // SAFETY: we shut down the system, nothing references the `metrics`
+    drop(unsafe { Box::from_raw(metrics_ptr) });
+}
+
+#[tokio::test]
+async fn test_statx() {
+    let system = System::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let file_path = tempdir.path().join("some_file");
+    let content = b"some content";
+    std::fs::write(&file_path, content).unwrap();
+
+    let std_file = std::fs::File::open(&file_path).unwrap();
+    let fd = OwnedFd::from(std_file);
+
+    // happy path
+    let (fd, res) = system.statx(fd).await;
+    let stat = res.expect("we know it exists");
+    assert_eq!(content.len() as u64, stat.stx_size);
+
+    std::fs::remove_file(&file_path).unwrap();
+
+    // can do statx on unlinked file
+    let (fd, res) = system.statx(fd).await;
+    let stat = res.expect("we know it exists");
+    assert_eq!(content.len() as u64, stat.stx_size);
+
+    drop(fd);
+
+    // TODO: once we add statx with pathname instead of file descriptor,
+    // ensure we get NotFound back when the file doesn't exist.
 }

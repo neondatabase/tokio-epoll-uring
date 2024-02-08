@@ -1,6 +1,6 @@
 use std::{
     os::fd::AsRawFd,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 
 pub mod handle;
@@ -10,6 +10,7 @@ use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use uring_common::io_uring;
 
 use crate::{
+    metrics::MetricsStorage,
     system::{completion::ShutdownRequestImpl, RING_SIZE},
     util::oneshot_nonconsuming,
 };
@@ -29,6 +30,32 @@ pub struct System {
     id: usize,
     split_uring: *mut io_uring::IoUring,
     // poller_heartbeat: (), // TODO
+    metrics_storage: &'static MetricsStorage,
+}
+
+impl System {
+    pub(crate) fn new(
+        id: usize,
+        split_uring: *mut io_uring::IoUring,
+        metrics_storage: &'static MetricsStorage,
+    ) -> Self {
+        metrics_storage
+            .systems_created
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            id,
+            split_uring,
+            metrics_storage,
+        }
+    }
+}
+
+impl Drop for System {
+    fn drop(&mut self) {
+        self.metrics_storage
+            .systems_destroyed
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // SAFETY: we never use the raw IoUring pointer and it's not thread-local or anything like that.
@@ -72,12 +99,13 @@ impl System {
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
     pub async fn launch() -> Result<SystemHandle, LaunchResult> {
-        Self::launch_with_testing(None, None).await
+        Self::launch_with_testing(None, None, &crate::metrics::GLOBAL_STORAGE).await
     }
 
     pub(crate) async fn launch_with_testing(
         poller_testing: Option<PollerTesting>,
         slots_testing: Option<SlotsTesting>,
+        metrics_storage: &'static MetricsStorage,
     ) -> Result<SystemHandle, LaunchResult> {
         let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -165,10 +193,7 @@ impl System {
                 completion_side: Arc::clone(&completion_side),
                 shutdown_tx,
             });
-            let system = System {
-                id,
-                split_uring: uring,
-            };
+            let system = System::new(id, uring, metrics_storage);
             let poller_ready_fut = Poller::launch(PollerNewArgs {
                 id,
                 uring_fd,
@@ -202,7 +227,11 @@ pub(crate) fn poller_impl_finish_shutdown(
     scopeguard::defer_on_success! {tracing::info!("poller shutdown end")};
     scopeguard::defer_on_unwind! {tracing::error!("poller shutdown panic")};
 
-    let System { id: _, split_uring } = { system };
+    let System {
+        id: _,
+        split_uring,
+        metrics_storage: _,
+    } = { system };
 
     let ShutdownRequestImpl {
         mut done_tx,

@@ -91,6 +91,8 @@ pub use uring_common::io_fd::IoFd;
 
 pub(crate) mod util;
 
+pub mod metrics;
+
 #[doc(hidden)]
 pub mod env_tunables {
     pub(crate) static YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: once_cell::sync::Lazy<bool> =
