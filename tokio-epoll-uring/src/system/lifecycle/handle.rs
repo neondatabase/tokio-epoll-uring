@@ -5,7 +5,7 @@ use std::{os::fd::OwnedFd, path::Path, task::ready};
 use uring_common::{buf::BoundedBufMut, io_fd::IoFd};
 
 use crate::{
-    ops::{open_at::OpenAtOp, read::ReadOp},
+    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp},
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -140,5 +140,35 @@ impl crate::SystemHandle {
             let (_, res) = execute_op(op, weak, None).await;
             res
         })
+    }
+
+    pub async fn fsync<F: IoFd + Send>(
+        &self,
+        file: F,
+    ) -> (
+        F,
+        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+    ) {
+        let op = FsyncOp {
+            file,
+            flags: uring_common::io_uring::types::FsyncFlags::empty(),
+        };
+        let inner = self.inner.as_ref().unwrap();
+        execute_op(op, inner.submit_side.weak(), None).await
+    }
+
+    pub async fn fdatasync<F: IoFd + Send>(
+        &self,
+        file: F,
+    ) -> (
+        F,
+        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+    ) {
+        let op = FsyncOp {
+            file,
+            flags: uring_common::io_uring::types::FsyncFlags::DATASYNC,
+        };
+        let inner = self.inner.as_ref().unwrap();
+        execute_op(op, inner.submit_side.weak(), None).await
     }
 }
