@@ -233,3 +233,31 @@ fn test_metrics() {
     // SAFETY: we shut down the system, nothing references the `metrics`
     drop(unsafe { Box::from_raw(metrics_ptr) });
 }
+
+#[tokio::test]
+async fn test_statx() {
+    let system = System::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let file_path = tempdir.path().join("some_file");
+    let content = b"some content";
+    std::fs::write(&file_path, content).unwrap();
+
+    let std_file = std::fs::File::open(&file_path).unwrap();
+    let fd = OwnedFd::from(std_file);
+
+    // happy path
+    let (fd, res) = system.statx(fd).await;
+    let stat = res.expect("we know it exists");
+    assert_eq!(content.len() as u64, stat.stx_size);
+
+    std::fs::remove_file(&file_path).unwrap();
+
+    // can do statx on unlinked file
+    let (fd, res) = system.statx(fd).await;
+    let stat = res.expect("we know it exists");
+    assert_eq!(content.len() as u64, stat.stx_size);
+
+    drop(fd);
+}
