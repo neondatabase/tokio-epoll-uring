@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use tempfile::{tempdir, tempfile};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -296,4 +295,6 @@ async fn test_write() {
         },
         std::fs::read(&file_path).unwrap()
     );
+
+    drop(fd);
 }
