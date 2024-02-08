@@ -260,4 +260,7 @@ async fn test_statx() {
     assert_eq!(content.len() as u64, stat.stx_size);
 
     drop(fd);
+
+    // TODO: once we add statx with pathname instead of file descriptor,
+    // ensure we get NotFound back when the file doesn't exist.
 }
