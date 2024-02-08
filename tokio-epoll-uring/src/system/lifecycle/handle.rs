@@ -1,11 +1,11 @@
 //! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
 use futures::FutureExt;
-use std::{os::fd::OwnedFd, path::Path, task::ready};
+use std::{mem::MaybeUninit, os::fd::OwnedFd, path::Path, task::ready};
 use uring_common::{buf::BoundedBufMut, io_fd::IoFd};
 
 use crate::{
-    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp},
+    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx},
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -170,5 +170,43 @@ impl crate::SystemHandle {
         };
         let inner = self.inner.as_ref().unwrap();
         execute_op(op, inner.submit_side.weak(), None).await
+    }
+
+    pub async fn statx<F: IoFd + Send>(
+        &self,
+        file: F,
+    ) -> (
+        F,
+        Result<
+            Box<uring_common::libc::statx>,
+            crate::system::submission::op_fut::Error<std::io::Error>,
+        >,
+    ) {
+        // TODO: avoid the allocation, or optimize using a slab cache?
+        let buf: Box<MaybeUninit<uring_common::libc::statx>> = Box::new(MaybeUninit::uninit());
+        let op = statx::op(statx::Resources::ByFileDescriptor {
+            file,
+            statxbuf: buf,
+        });
+        let inner = self.inner.as_ref().unwrap();
+        let (resources, result) = execute_op(op, inner.submit_side.weak(), None).await;
+        let crate::ops::statx::Resources::ByFileDescriptor { file, statxbuf } = resources;
+        match result {
+            Ok(()) => (
+                file,
+                Ok({
+                    // TODO: replace this with Box::assume_init once it stabilizes
+                    // SAFETY: if the kernel tells us the call went ok, we know the statx has been initialized
+                    unsafe {
+                        // It seems weird that current rust 1.75 Box::assume_init doesn't do the assert_inhabited
+                        // that the regular MaybeUninit::assume_init does. Out of precaution, do that here.
+                        statxbuf.assume_init_ref();
+                        let raw = Box::into_raw(statxbuf);
+                        Box::from_raw(raw as *mut uring_common::libc::statx)
+                    }
+                }),
+            ),
+            Err(e) => (file, Err(e)),
+        }
     }
 }

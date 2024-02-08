@@ -7,3 +7,4 @@ pub mod fsync;
 pub mod nop;
 pub mod open_at;
 pub mod read;
+pub mod statx;
