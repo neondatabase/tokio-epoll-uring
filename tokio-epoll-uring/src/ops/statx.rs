@@ -74,8 +74,7 @@ where
                     // Yes, this cast is what the io_uring / tokio-uring crates currently do as well.
                     // Don't understand why io_uring crate just doesn't take a `libc::statx` directly.
                     // https://github.com/tokio-rs/tokio-uring/blob/c4320fa2e7b146b28ad921ae25b552a0894c9697/src/io/statx.rs#L47-L61
-                    statxbuf.start_submitting() as *mut uring_common::libc::statx
-                        as *mut uring_common::io_uring::types::statx,
+                    statxbuf.start_submitting() as *mut uring_common::io_uring::types::statx,
                 )
                 .flags(libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT)
                 .mask(uring_common::libc::STATX_ALL)

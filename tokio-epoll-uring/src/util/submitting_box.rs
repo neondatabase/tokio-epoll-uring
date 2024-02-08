@@ -24,11 +24,11 @@ impl<T> SubmittingBox<T> {
     ///
     /// Panics if this function has already been called on `self`
     /// before without a call to [`Self::ownership_back_in_userspace`] inbetween.
-    pub(crate) fn start_submitting(&mut self) -> &'static mut T {
+    pub(crate) fn start_submitting(&mut self) -> *mut T {
         match std::mem::replace(self, Self::Undefined) {
             SubmittingBox::NotSubmitting { inner } => {
-                let leaked = Box::leak(inner);
-                *self = Self::Submitting(leaked as *mut _);
+                let leaked = Box::into_raw(inner);
+                *self = Self::Submitting(leaked);
                 leaked
             }
             SubmittingBox::Submitting(_) => {
