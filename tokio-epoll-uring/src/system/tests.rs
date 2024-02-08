@@ -6,7 +6,9 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{system::test_util::shared_system_handle::SharedSystemHandle, System};
+use crate::{
+    metrics::MetricsStorage, system::test_util::shared_system_handle::SharedSystemHandle, System,
+};
 
 // TODO: turn into a does-not-compile test
 // #[tokio::test]
@@ -187,4 +189,47 @@ async fn hitting_memlock_limit_does_not_panic() {
             },
         }
     }
+}
+
+#[test]
+fn test_metrics() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let metrics = Box::leak(Box::new(MetricsStorage::new_const()));
+    let metrics_ptr = metrics as *mut _;
+    let system = rt
+        .block_on(System::launch_with_testing(None, None, metrics))
+        .unwrap();
+    assert_eq!(
+        1,
+        metrics
+            .systems_created
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        0,
+        metrics
+            .systems_destroyed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    rt.block_on(system.initiate_shutdown());
+
+    assert_eq!(
+        1,
+        metrics
+            .systems_created
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        1,
+        metrics
+            .systems_destroyed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    // SAFETY: we shut down the system, nothing references the `metrics`
+    drop(unsafe { Box::from_raw(metrics_ptr) });
 }

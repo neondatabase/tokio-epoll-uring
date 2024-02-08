@@ -661,6 +661,7 @@ mod tests {
                     )
                 }),
             }),
+            &crate::metrics::GLOBAL_STORAGE,
         )
         .await
         .unwrap();
