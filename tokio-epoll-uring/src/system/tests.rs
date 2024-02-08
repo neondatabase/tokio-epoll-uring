@@ -264,3 +264,37 @@ async fn test_statx() {
     // TODO: once we add statx with pathname instead of file descriptor,
     // ensure we get NotFound back when the file doesn't exist.
 }
+
+#[tokio::test]
+async fn test_write() {
+    let system = System::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let file_path = tempdir.path().join("some_file");
+    let std_file = std::fs::File::create(&file_path).unwrap();
+    let fd = OwnedFd::from(std_file);
+
+    let write1 = b"some";
+    let write2 = b"content";
+    let ((fd, _), res) = system.write(fd, 0, write1.to_vec()).await;
+    res.unwrap();
+
+    assert_eq!(&write1[..], &std::fs::read(&file_path).unwrap());
+
+    // make sure there's no hidden file cursor underneath, i.e., that it's really write_at
+    let ((fd, _), res) = system.write(fd, 2, write2.to_vec()).await;
+    res.unwrap();
+
+    assert_eq!(
+        {
+            let mut expect = vec![];
+            expect.extend_from_slice(&write1[0..2]);
+            expect.extend(write2);
+            expect
+        },
+        std::fs::read(&file_path).unwrap()
+    );
+
+    drop(fd);
+}
