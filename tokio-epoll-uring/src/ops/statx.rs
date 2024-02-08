@@ -1,6 +1,6 @@
 use crate::system::submission::op_fut::Op;
 use crate::util::submitting_box::SubmittingBox;
-use std::os::fd::AsRawFd;
+use std::{mem::MaybeUninit, os::fd::AsRawFd};
 use uring_common::libc;
 pub use uring_common::libc::statx;
 use uring_common::{
@@ -28,7 +28,7 @@ where
 {
     ByFileDescriptor {
         file: F,
-        statxbuf: Box<uring_common::libc::statx>,
+        statxbuf: Box<MaybeUninit<uring_common::libc::statx>>,
     },
 }
 
