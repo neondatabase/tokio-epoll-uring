@@ -82,8 +82,8 @@ pub use {
     crate::system::submission::op_fut::Error,
     system::lifecycle::handle::SystemHandle,
     system::lifecycle::thread_local::{thread_local_system, Handle},
-    system::lifecycle::System,
     system::lifecycle::LaunchResult,
+    system::lifecycle::System,
     system::submission::op_fut::Error as SystemError,
 };
 
