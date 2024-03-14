@@ -83,6 +83,7 @@ pub use {
     system::lifecycle::handle::SystemHandle,
     system::lifecycle::thread_local::{thread_local_system, Handle},
     system::lifecycle::System,
+    system::lifecycle::LaunchResult,
     system::submission::op_fut::Error as SystemError,
 };
 
