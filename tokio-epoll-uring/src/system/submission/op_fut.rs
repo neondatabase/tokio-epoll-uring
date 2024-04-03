@@ -68,6 +68,22 @@ where
     };
 
     fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
+        // If PROCESS_COMPLETIONS_ON_SUBMIT is enabled, acquire the completion queue
+        // guard before submission so that we, not the poller task, are guaranteed to
+        // observe an immediate completion. TODO: the poller task may still be woken
+        // up through the epoll of the io_uring fd, investigate whether that actually
+        // happens and whether there's a way around it.
+
+        #[allow(unused_assignments)]
+        let mut cq_owned = None;
+        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+            let cq = Arc::clone(&open_guard.completion_side);
+            cq_owned = Some(cq);
+            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
+        } else {
+            None
+        };
+
         if open_guard.submit_raw(sqe).is_err() {
             // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
             // So, we could just submit_and_wait here. But, that'd prevent the
@@ -80,24 +96,11 @@ where
             unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
         }
 
-        // this allows us to keep the possible guard in cq_guard because the arc lives on stack
-        #[allow(unused_assignments)]
-        let mut cq_owned = None;
-
-        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-            let cq = Arc::clone(&open_guard.completion_side);
-            cq_owned = Some(cq);
-            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
-        } else {
-            None
-        };
         drop(open_guard); // drop it asap to enable timely shutdown
 
         if let Some(mut cq) = cq_guard {
             // opportunistically process completion immediately
             // TODO do it during ::poll() as well?
-            //
-            // FIXME: why are we doing this while holding the SubmitSideOpen
             cq.process_completions(ProcessCompletionsCause::Regular);
         }
     }
