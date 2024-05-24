@@ -1123,6 +1123,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "statx-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69c325f46f705b7a66fb87f0ebb999524a7363f30f05d373277b4ef7f409fe87"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "strsim"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1371,6 +1380,7 @@ dependencies = [
  "bytes",
  "io-uring 0.6.0",
  "libc",
+ "statx-sys",
 ]
 
 [[package]]

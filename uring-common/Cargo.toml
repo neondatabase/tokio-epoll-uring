@@ -11,3 +11,4 @@ bytes = { version = "1.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6.0"
+statx-sys = "0.4.1"

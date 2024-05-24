@@ -2,7 +2,7 @@ use crate::system::submission::op_fut::Op;
 use crate::util::submitting_box::SubmittingBox;
 use std::{mem::MaybeUninit, os::fd::AsRawFd};
 use uring_common::libc;
-pub use uring_common::libc::statx;
+pub use uring_common::statx_sys::{self, statx};
 use uring_common::{
     io_fd::IoFd,
     io_uring::{self},
@@ -28,7 +28,7 @@ where
 {
     ByFileDescriptor {
         file: F,
-        statxbuf: Box<MaybeUninit<uring_common::libc::statx>>,
+        statxbuf: Box<MaybeUninit<statx>>,
     },
 }
 
@@ -40,7 +40,7 @@ where
 {
     ByFileDescriptor {
         file: F,
-        statxbuf: SubmittingBox<uring_common::libc::statx>,
+        statxbuf: SubmittingBox<statx>,
     },
 }
 
@@ -76,8 +76,8 @@ where
                     // https://github.com/tokio-rs/tokio-uring/blob/c4320fa2e7b146b28ad921ae25b552a0894c9697/src/io/statx.rs#L47-L61
                     statxbuf.start_submitting() as *mut uring_common::io_uring::types::statx,
                 )
-                .flags(libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT)
-                .mask(uring_common::libc::STATX_ALL)
+                .flags(libc::AT_EMPTY_PATH | statx_sys::AT_STATX_SYNC_AS_STAT)
+                .mask(uring_common::statx_sys::STATX_ALL)
                 .build()
             }
         }
