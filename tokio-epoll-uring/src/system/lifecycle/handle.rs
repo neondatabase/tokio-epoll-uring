@@ -181,12 +181,13 @@ impl crate::SystemHandle {
     ) -> (
         F,
         Result<
-            Box<uring_common::libc::statx>,
+            Box<uring_common::linux_raw_sys::general::statx>,
             crate::system::submission::op_fut::Error<std::io::Error>,
         >,
     ) {
         // TODO: avoid the allocation, or optimize using a slab cache?
-        let buf: Box<MaybeUninit<uring_common::libc::statx>> = Box::new(MaybeUninit::uninit());
+        let buf: Box<MaybeUninit<uring_common::linux_raw_sys::general::statx>> =
+            Box::new(MaybeUninit::uninit());
         let op = statx::op(statx::Resources::ByFileDescriptor {
             file,
             statxbuf: buf,
@@ -205,7 +206,7 @@ impl crate::SystemHandle {
                         // that the regular MaybeUninit::assume_init does. Out of precaution, do that here.
                         statxbuf.assume_init_ref();
                         let raw = Box::into_raw(statxbuf);
-                        Box::from_raw(raw as *mut uring_common::libc::statx)
+                        Box::from_raw(raw as *mut uring_common::linux_raw_sys::general::statx)
                     }
                 }),
             ),
