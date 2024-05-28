@@ -186,7 +186,8 @@ impl crate::SystemHandle {
         >,
     ) {
         // TODO: avoid the allocation, or optimize using a slab cache?
-        let buf: Box<MaybeUninit<uring_common::linux_raw_sys::general::statx>> = Box::new(MaybeUninit::uninit());
+        let buf: Box<MaybeUninit<uring_common::linux_raw_sys::general::statx>> =
+            Box::new(MaybeUninit::uninit());
         let op = statx::op(statx::Resources::ByFileDescriptor {
             file,
             statxbuf: buf,
