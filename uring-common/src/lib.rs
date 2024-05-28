@@ -9,3 +9,5 @@ pub mod io_fd;
 pub use io_uring;
 #[cfg(target_os = "linux")]
 pub use libc;
+#[cfg(target_os = "linux")]
+pub use linux_raw_sys;
