@@ -9,3 +9,4 @@ pub mod open_at;
 pub mod read;
 pub mod statx;
 pub mod write;
+pub mod rename;
