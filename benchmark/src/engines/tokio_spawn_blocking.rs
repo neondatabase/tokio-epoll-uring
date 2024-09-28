@@ -149,7 +149,7 @@ impl EngineTokioSpawnBlocking {
                             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), block_size) };
                         let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
                         file.read_at(buf, offset_in_file).unwrap();
-                        file.into_raw_fd(); // so that it's there for next iteration
+                        let _ = file.into_raw_fd(); // so that it's there for next iteration
                     }
                     ClientWorkFd::TimerFd(timerfd, duration) => {
                         let mut fd = unsafe { timerfd::TimerFd::from_raw_fd(timerfd) };
