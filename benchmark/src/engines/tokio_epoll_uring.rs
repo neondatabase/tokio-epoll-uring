@@ -213,10 +213,10 @@ impl EngineTokioEpollUring {
                         assert_eq!(nread, block_size);
                         assert_eq!(owned_buf, owned_validate_buf);
                         loop_validate_buf = Some(owned_validate_buf);
-                        std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
+                        let _ = std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
                     }
                     loop_buf = Some(owned_buf);
-                    file.into_raw_fd(); // so that it's there for next iteration
+                    let _ = file.into_raw_fd(); // so that it's there for next iteration
                 }
                 ClientWorkFd::TimerFd(_timerfd, _duration) => {
                     unimplemented!()
