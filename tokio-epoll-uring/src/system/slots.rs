@@ -34,7 +34,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, trace};
 use uring_common::io_uring;
 
-use crate::system::submission::op_fut::Error;
+use crate::{metrics::MetricsStorage, system::submission::op_fut::Error};
 
 use super::{
     submission::op_fut::{Op, SystemError},
@@ -69,6 +69,7 @@ struct SlotsInner {
     unused_indices: Vec<usize>,
     co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
     state: SlotsInnerState,
+    metrics_storage: &'static MetricsStorage,
     #[cfg(test)]
     testing: SlotsTesting,
 }
@@ -129,6 +130,7 @@ enum Slot {
 pub(super) fn new(
     id: usize,
     #[allow(unused_variables)] testing: SlotsTesting,
+    metrics_storage: &'static MetricsStorage,
 ) -> (
     Slots<{ co_owner::SUBMIT_SIDE }>,
     Slots<{ co_owner::COMPLETION_SIDE }>,
@@ -150,6 +152,7 @@ pub(super) fn new(
                     inner_weak: inner_weak.clone(),
                 },
             },
+            metrics_storage,
             #[cfg(test)]
             testing,
         })
@@ -219,6 +222,8 @@ impl SlotsInner {
             SlotsInnerState::Open { myself, waiters } => {
                 clear_slot(&mut self.storage[idx]);
                 while let Some(waiter) = waiters.pop_front() {
+                    self.metrics_storage
+                        .update_waiters_queue_depth(self.id, waiters.len() as u64);
                     match waiter.send(SlotHandle {
                         slots_weak: myself.clone(),
                         idx,
@@ -338,6 +343,9 @@ impl Slots<{ co_owner::COMPLETION_SIDE }> {
                 // this assignment here drops `waiters`,
                 // thereby making all of the op futures return with a shutdown error
                 inner_guard.state = SlotsInnerState::Draining;
+                inner_guard
+                    .metrics_storage
+                    .update_waiters_queue_depth(self.id, 0);
             }
             SlotsInnerState::Draining => {}
         }
@@ -412,6 +420,9 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                 None => {
                     let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
                     waiters.push_back(wake_up_tx);
+                    inner
+                        .metrics_storage
+                        .update_waiters_queue_depth(inner.id, waiters.len() as u64);
                     TryGetSlotResult::NoSlots(wake_up_rx)
                 }
             },
