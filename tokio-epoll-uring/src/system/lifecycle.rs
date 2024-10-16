@@ -1,6 +1,6 @@
 use std::{
     os::fd::AsRawFd,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{Arc, Mutex},
 };
 
 pub mod handle;
@@ -10,7 +10,7 @@ use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use uring_common::io_uring;
 
 use crate::{
-    metrics::MetricsStorage,
+    metrics::{MetricsStorage, GLOBAL_STORAGE},
     system::{completion::ShutdownRequestImpl, RING_SIZE},
     util::oneshot_nonconsuming,
 };
@@ -39,9 +39,7 @@ impl System {
         split_uring: *mut io_uring::IoUring,
         metrics_storage: &'static MetricsStorage,
     ) -> Self {
-        metrics_storage
-            .systems_created
-            .fetch_add(1, Ordering::Relaxed);
+        metrics_storage.new_system(id);
         Self {
             id,
             split_uring,
@@ -52,9 +50,7 @@ impl System {
 
 impl Drop for System {
     fn drop(&mut self) {
-        self.metrics_storage
-            .systems_destroyed
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics_storage.destroy_system(self.id);
     }
 }
 
@@ -107,12 +103,12 @@ impl System {
         slots_testing: Option<SlotsTesting>,
         metrics_storage: &'static MetricsStorage,
     ) -> Result<SystemHandle, LaunchResult> {
-        let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id: usize = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let (submit_side, poller_ready_fut) = {
             // TODO: should we mlock `slots`? io_uring mmap is mlocked, slots are equally important for the system to function;
             let (slots_submit_side, slots_completion_side, slots_poller) =
-                super::slots::new(id, slots_testing.unwrap_or_default());
+                super::slots::new(id, slots_testing.unwrap_or_default(), &GLOBAL_STORAGE);
 
             let uring = Box::new(
                 io_uring::IoUring::builder()

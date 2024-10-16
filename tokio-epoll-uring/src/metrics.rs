@@ -1,13 +1,25 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        RwLock,
+    },
+};
+
+use once_cell::sync::Lazy;
 
 pub struct Metrics {
     pub systems_created: u64,
     pub systems_destroyed: u64,
+    /// Slots waiters queue depth for all active systems.
+    pub slots_waiters_queue_depth: Vec<u64>,
 }
 
 pub(crate) struct MetricsStorage {
     pub(crate) systems_created: AtomicU64,
     pub(crate) systems_destroyed: AtomicU64,
+    /// Slots waiters queue depth for active system, indexed by system id.
+    pub(crate) slots_waiters_queue_depth: Lazy<RwLock<HashMap<usize, AtomicU64>>>,
 }
 
 impl MetricsStorage {
@@ -15,15 +27,43 @@ impl MetricsStorage {
         MetricsStorage {
             systems_created: AtomicU64::new(0),
             systems_destroyed: AtomicU64::new(0),
+            slots_waiters_queue_depth: Lazy::new(|| RwLock::new(HashMap::new())),
         }
     }
 }
 
 impl MetricsStorage {
+    /// Updates metrics at system creation.
+    pub(crate) fn new_system(&self, id: usize) {
+        self.systems_created.fetch_add(1, Ordering::Relaxed);
+        // write lock needed to insert a new waiters queue depth entry.
+        let mut g = self.slots_waiters_queue_depth.write().unwrap();
+        g.insert(id, AtomicU64::new(0));
+    }
+
+    /// Updates metrics at system destruction.
+    pub(crate) fn destroy_system(&self, id: usize) {
+        self.systems_destroyed.fetch_add(1, Ordering::Relaxed);
+        // write lock needed to remove a waiters queue depth entry.
+        let mut g = self.slots_waiters_queue_depth.write().unwrap();
+        g.remove(&id);
+    }
+
+    /// Updates slots waiters queue depth metric for system with `id`.
+    pub(crate) fn update_slots_waiters_queue_depth(&self, id: usize, depth: u64) {
+        // Since each slots waiters queue depth value is atomic, only take a read lock to reduce contention.
+        let g = self.slots_waiters_queue_depth.read().unwrap();
+        g.get(&id).unwrap().store(depth, Ordering::Relaxed);
+    }
+
     fn make_pub(&self) -> Metrics {
         Metrics {
             systems_created: GLOBAL_STORAGE.systems_created.load(Ordering::Relaxed),
             systems_destroyed: GLOBAL_STORAGE.systems_destroyed.load(Ordering::Relaxed),
+            slots_waiters_queue_depth: {
+                let g = GLOBAL_STORAGE.slots_waiters_queue_depth.read().unwrap();
+                g.values().map(|x| x.load(Ordering::Relaxed)).collect()
+            },
         }
     }
 }
