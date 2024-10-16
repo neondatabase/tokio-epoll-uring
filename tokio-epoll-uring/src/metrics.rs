@@ -35,23 +35,22 @@ impl MetricsStorage {
     /// Updates metrics at system creation.
     pub(crate) fn new_system(&self, id: usize) {
         self.systems_created.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut g = self.waiters_queue_depth.write().unwrap();
-            g.insert(id, AtomicU64::new(0));
-        }
+        // write lock needed to insert a new waiters queue depth entry.
+        let mut g = self.waiters_queue_depth.write().unwrap();
+        g.insert(id, AtomicU64::new(0));
     }
 
     /// Updates metrics at system destruction.
     pub(crate) fn destroy_system(&self, id: usize) {
         self.systems_destroyed.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut g = self.waiters_queue_depth.write().unwrap();
-            g.remove(&id);
-        }
+        // write lock needed to remove a waiters queue depth entry.
+        let mut g = self.waiters_queue_depth.write().unwrap();
+        g.remove(&id);
     }
 
     /// Updates waiters queue depth metric for system with `id`.
     pub(crate) fn update_waiters_queue_depth(&self, id: usize, depth: u64) {
+        // Since each waiters queue depth value is atomic, only take a read lock to reduce contention.
         let g = self.waiters_queue_depth.read().unwrap();
         g.get(&id).unwrap().store(depth, Ordering::Relaxed);
     }
