@@ -223,7 +223,7 @@ impl SlotsInner {
                 clear_slot(&mut self.storage[idx]);
                 while let Some(waiter) = waiters.pop_front() {
                     self.metrics_storage
-                        .update_waiters_queue_depth(self.id, waiters.len() as u64);
+                        .update_slots_waiters_queue_depth(self.id, waiters.len() as u64);
                     match waiter.send(SlotHandle {
                         slots_weak: myself.clone(),
                         idx,
@@ -345,7 +345,7 @@ impl Slots<{ co_owner::COMPLETION_SIDE }> {
                 inner_guard.state = SlotsInnerState::Draining;
                 inner_guard
                     .metrics_storage
-                    .update_waiters_queue_depth(self.id, 0);
+                    .update_slots_waiters_queue_depth(self.id, 0);
             }
             SlotsInnerState::Draining => {}
         }
@@ -422,7 +422,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                     waiters.push_back(wake_up_tx);
                     inner
                         .metrics_storage
-                        .update_waiters_queue_depth(inner.id, waiters.len() as u64);
+                        .update_slots_waiters_queue_depth(inner.id, waiters.len() as u64);
                     TryGetSlotResult::NoSlots(wake_up_rx)
                 }
             },
