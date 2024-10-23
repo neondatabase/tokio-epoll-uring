@@ -110,10 +110,14 @@ where
                     op.on_failed_submission(),
                     Err(Error::System(SystemError::SystemShuttingDown)),
                 ),
-                slots::TryGetSlotResult::GotSlot(slot) => {
-                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
-                }
-                slots::TryGetSlotResult::NoSlots(later) => {
+                slots::TryGetSlotResult::GotSlot {
+                    slot,
+                    queue_depth: _,
+                } => slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await,
+                slots::TryGetSlotResult::NoSlots {
+                    later,
+                    queue_depth: _,
+                } => {
                     // All slots are taken and we're waiting in line.
                     // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
                     // This is in the hope that we'll wake ourselves up.
