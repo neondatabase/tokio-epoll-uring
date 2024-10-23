@@ -7,7 +7,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    metrics::MetricsStorage, system::test_util::shared_system_handle::SharedSystemHandle, System,
+    metrics::GlobalMetricsStorage, system::test_util::shared_system_handle::SharedSystemHandle,
+    System,
 };
 
 // TODO: turn into a does-not-compile test
@@ -197,7 +198,7 @@ fn test_metrics() {
         .enable_all()
         .build()
         .unwrap();
-    let metrics = Box::leak(Box::new(MetricsStorage::new_const()));
+    let metrics = Box::leak(Box::new(GlobalMetricsStorage::new_const()));
     let metrics_ptr = metrics as *mut _;
     let system = rt
         .block_on(System::launch_with_testing(None, None, metrics))
