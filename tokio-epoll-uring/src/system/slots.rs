@@ -389,8 +389,14 @@ impl<const O: usize> Slots<O> {
 }
 
 pub(crate) enum TryGetSlotResult {
-    GotSlot(SlotHandle),
-    NoSlots(oneshot::Receiver<SlotHandle>),
+    GotSlot {
+        slot: SlotHandle,
+        queue_depth: u64,
+    },
+    NoSlots {
+        later: oneshot::Receiver<SlotHandle>,
+        queue_depth: u64,
+    },
     Draining,
 }
 
@@ -400,21 +406,29 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
         let inner = &mut *inner_guard;
         match &mut inner.state {
             SlotsInnerState::Draining => TryGetSlotResult::Draining,
-            SlotsInnerState::Open { myself, waiters } => match inner.unused_indices.pop() {
-                Some(idx) => TryGetSlotResult::GotSlot({
-                    SlotHandle {
-                        slots_weak: myself.clone(),
-                        idx,
-                        #[cfg(test)]
-                        test_on_wake: Mutex::new((inner.testing.test_on_wake)()),
+            SlotsInnerState::Open { myself, waiters } => {
+                let num_in_use_slots = RING_SIZE as u64 - inner.unused_indices.len() as u64;
+                match inner.unused_indices.pop() {
+                    Some(idx) => TryGetSlotResult::GotSlot {
+                        slot: SlotHandle {
+                            slots_weak: myself.clone(),
+                            idx,
+                            #[cfg(test)]
+                            test_on_wake: Mutex::new((inner.testing.test_on_wake)()),
+                        },
+                        queue_depth: num_in_use_slots,
+                    },
+                    None => {
+                        let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
+                        let num_waiters = waiters.len() as u64;
+                        waiters.push_back(wake_up_tx);
+                        TryGetSlotResult::NoSlots {
+                            later: wake_up_rx,
+                            queue_depth: num_in_use_slots + num_waiters,
+                        }
                     }
-                }),
-                None => {
-                    let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
-                    waiters.push_back(wake_up_tx);
-                    TryGetSlotResult::NoSlots(wake_up_rx)
                 }
-            },
+            }
         }
     }
 }
@@ -662,6 +676,7 @@ mod tests {
                 }),
             }),
             &crate::metrics::GLOBAL_STORAGE,
+            Arc::new(()),
         )
         .await
         .unwrap();

@@ -493,6 +493,7 @@ mod tests {
     use std::{
         io::Write,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        sync::Arc,
     };
 
     use tracing::info;
@@ -646,6 +647,7 @@ mod tests {
                     Some(testing),
                     None,
                     &crate::metrics::GLOBAL_STORAGE,
+                    Arc::new(()),
                 )
                 .await
                 .unwrap();
