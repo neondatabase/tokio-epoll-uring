@@ -676,6 +676,7 @@ mod tests {
                 }),
             }),
             &crate::metrics::GLOBAL_STORAGE,
+            Arc::new(()),
         )
         .await
         .unwrap();

@@ -1,6 +1,7 @@
 use std::{
     io::Write,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    sync::Arc,
     time::Duration,
 };
 
@@ -27,7 +28,7 @@ use crate::{
 
 #[tokio::test]
 async fn drop_system_handle() {
-    let system = System::launch().await;
+    let system = System::launch(Arc::new(())).await;
     drop(system);
 }
 
@@ -142,7 +143,7 @@ async fn hitting_memlock_limit_does_not_panic() {
     let mut systems = Vec::new();
     let mut vm_lck_observations = vec![];
     loop {
-        let res = System::launch().await;
+        let res = System::launch(Arc::new(())).await;
         vm_lck_observations.push(get_vm_lck());
         match res {
             Ok(system) => {
@@ -201,7 +202,12 @@ fn test_metrics() {
     let metrics = Box::leak(Box::new(GlobalMetricsStorage::new_const()));
     let metrics_ptr = metrics as *mut _;
     let system = rt
-        .block_on(System::launch_with_testing(None, None, metrics))
+        .block_on(System::launch_with_testing(
+            None,
+            None,
+            metrics,
+            Arc::new(()),
+        ))
         .unwrap();
     assert_eq!(
         1,
@@ -237,7 +243,7 @@ fn test_metrics() {
 
 #[tokio::test]
 async fn test_statx() {
-    let system = System::launch().await.unwrap();
+    let system = System::launch(Arc::new(())).await.unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
 
@@ -268,7 +274,7 @@ async fn test_statx() {
 
 #[tokio::test]
 async fn test_write() {
-    let system = System::launch().await.unwrap();
+    let system = System::launch(Arc::new(())).await.unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
 

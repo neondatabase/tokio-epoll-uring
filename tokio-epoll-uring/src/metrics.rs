@@ -1,4 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, Weak,
+    },
+};
 
 pub struct GlobalMetrics {
     pub systems_created: u64,
@@ -32,4 +38,31 @@ pub(crate) static GLOBAL_STORAGE: GlobalMetricsStorage = GlobalMetricsStorage::n
 
 pub fn global() -> GlobalMetrics {
     GLOBAL_STORAGE.make_pub()
+}
+
+pub struct PerSystemMetricsStorage<M: PerSystemMetrics>(Mutex<HashMap<usize, Weak<M>>>);
+
+impl<M: PerSystemMetrics> PerSystemMetricsStorage<M> {
+    pub fn new() -> Self {
+        PerSystemMetricsStorage(Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn insert(&self, id: usize, metrics: Weak<M>) {
+        let mut g = self.0.lock().unwrap();
+        g.insert(id, metrics);
+    }
+
+    pub(crate) fn remove(&self, id: usize) {
+        let mut g = self.0.lock().unwrap();
+        g.remove(&id);
+    }
+}
+
+/// A trait for recording per-system tokio-epoll-uring metrics.
+pub trait PerSystemMetrics {
+    fn record_slots_submission_queue_depth(&self, queue_depth: u64);
+}
+
+impl PerSystemMetrics for () {
+    fn record_slots_submission_queue_depth(&self, _queue_depth: u64) {}
 }

@@ -14,9 +14,12 @@ pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
 
 use uring_common::io_uring;
 
-use crate::system::{
-    completion::ProcessCompletionsCause,
-    slots::{self, SlotHandle},
+use crate::{
+    metrics::PerSystemMetrics,
+    system::{
+        completion::ProcessCompletionsCause,
+        slots::{self, SlotHandle},
+    },
 };
 
 use super::{SubmitSideOpenGuard, SubmitSideWeak};
@@ -48,14 +51,16 @@ impl<T: Display> Display for Error<T> {
     }
 }
 
-pub(crate) async fn execute_op<O>(
+pub(crate) async fn execute_op<O, M>(
     op: O,
     submit_side: SubmitSideWeak,
     slot: Option<SlotHandle>,
+    per_system_metrics: Arc<M>,
 ) -> (O::Resources, Result<O::Success, Error<O::Error>>)
 where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
+    M: PerSystemMetrics,
 {
     let open_guard = match submit_side.upgrade_to_open().await {
         Some(open) => open,
@@ -110,18 +115,20 @@ where
                     op.on_failed_submission(),
                     Err(Error::System(SystemError::SystemShuttingDown)),
                 ),
-                slots::TryGetSlotResult::GotSlot {
-                    slot,
-                    queue_depth: _,
-                } => slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await,
-                slots::TryGetSlotResult::NoSlots {
-                    later,
-                    queue_depth: _,
-                } => {
+                slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
+                    per_system_metrics
+                        .as_ref()
+                        .record_slots_submission_queue_depth(queue_depth);
+                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+                }
+                slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
                     // All slots are taken and we're waiting in line.
                     // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
                     // This is in the hope that we'll wake ourselves up.
 
+                    per_system_metrics
+                        .as_ref()
+                        .record_slots_submission_queue_depth(queue_depth);
                     if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
                         // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
                         open_guard.submitter.submit().unwrap();

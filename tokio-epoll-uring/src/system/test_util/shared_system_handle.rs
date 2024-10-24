@@ -13,14 +13,14 @@ use crate::{System, SystemHandle};
 /// it's up to the user to ensure that shutdown is initiated at the right time.
 /// If they fail, we currently panic.
 #[derive(Clone)]
-pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
+pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle<()>>>>);
 
 #[cfg(test)]
 use crate::system::completion::PollerTesting;
 
 impl SharedSystemHandle {
     pub async fn launch() -> Result<Self, LaunchResult> {
-        let handle = System::launch().await?;
+        let handle = System::launch(Arc::new(())).await?;
         Ok(Self(Arc::new(RwLock::new(Some(handle)))))
     }
 
@@ -28,9 +28,13 @@ impl SharedSystemHandle {
     pub(crate) async fn launch_with_testing(
         poller_testing: Option<PollerTesting>,
     ) -> Result<Self, LaunchResult> {
-        let handle =
-            System::launch_with_testing(poller_testing, None, &crate::metrics::GLOBAL_STORAGE)
-                .await?;
+        let handle = System::launch_with_testing(
+            poller_testing,
+            None,
+            &crate::metrics::GLOBAL_STORAGE,
+            Arc::new(()),
+        )
+        .await?;
         Ok(Self(Arc::new(RwLock::new(Some(handle)))))
     }
 
