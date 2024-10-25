@@ -10,7 +10,7 @@ use io_uring::{CompletionQueue, SubmissionQueue, Submitter};
 use uring_common::io_uring;
 
 use crate::{
-    metrics::MetricsStorage,
+    metrics::{GlobalMetricsStorage, PerSystemMetrics},
     system::{completion::ShutdownRequestImpl, RING_SIZE},
     util::oneshot_nonconsuming,
 };
@@ -30,29 +30,29 @@ pub struct System {
     id: usize,
     split_uring: *mut io_uring::IoUring,
     // poller_heartbeat: (), // TODO
-    metrics_storage: &'static MetricsStorage,
+    global_metrics_storage: &'static GlobalMetricsStorage,
 }
 
 impl System {
     pub(crate) fn new(
         id: usize,
         split_uring: *mut io_uring::IoUring,
-        metrics_storage: &'static MetricsStorage,
+        global_metrics_storage: &'static GlobalMetricsStorage,
     ) -> Self {
-        metrics_storage
+        global_metrics_storage
             .systems_created
             .fetch_add(1, Ordering::Relaxed);
         Self {
             id,
             split_uring,
-            metrics_storage,
+            global_metrics_storage,
         }
     }
 }
 
 impl Drop for System {
     fn drop(&mut self) {
-        self.metrics_storage
+        self.global_metrics_storage
             .systems_destroyed
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -99,14 +99,34 @@ impl System {
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
     pub async fn launch() -> Result<SystemHandle, LaunchResult> {
-        Self::launch_with_testing(None, None, &crate::metrics::GLOBAL_STORAGE).await
+        Self::launch_with_metrics(Arc::new(())).await
     }
 
-    pub(crate) async fn launch_with_testing(
+    /// Like [`Self::launch`], but allows to pass in a [`PerSystemMetrics`] implementation.
+    pub async fn launch_with_metrics<M>(
+        per_system_metrics: Arc<M>,
+    ) -> Result<SystemHandle<M>, LaunchResult>
+    where
+        M: PerSystemMetrics,
+    {
+        Self::launch_with_testing(
+            None,
+            None,
+            &crate::metrics::GLOBAL_STORAGE,
+            per_system_metrics,
+        )
+        .await
+    }
+
+    pub(crate) async fn launch_with_testing<M>(
         poller_testing: Option<PollerTesting>,
         slots_testing: Option<SlotsTesting>,
-        metrics_storage: &'static MetricsStorage,
-    ) -> Result<SystemHandle, LaunchResult> {
+        global_metrics_storage: &'static GlobalMetricsStorage,
+        per_system_metrics: Arc<M>,
+    ) -> Result<SystemHandle<M>, LaunchResult>
+    where
+        M: PerSystemMetrics,
+    {
         let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let (submit_side, poller_ready_fut) = {
@@ -193,7 +213,7 @@ impl System {
                 completion_side: Arc::clone(&completion_side),
                 shutdown_tx,
             });
-            let system = System::new(id, uring, metrics_storage);
+            let system = System::new(id, uring, global_metrics_storage);
             let poller_ready_fut = Poller::launch(PollerNewArgs {
                 id,
                 uring_fd,
@@ -208,7 +228,7 @@ impl System {
 
         poller_ready_fut.await;
 
-        Ok(SystemHandle::new(id, submit_side))
+        Ok(SystemHandle::new(id, submit_side, per_system_metrics))
     }
 }
 
@@ -230,7 +250,7 @@ pub(crate) fn poller_impl_finish_shutdown(
     let System {
         id: _,
         split_uring,
-        metrics_storage: _,
+        global_metrics_storage: _,
     } = { system };
 
     let ShutdownRequestImpl {
