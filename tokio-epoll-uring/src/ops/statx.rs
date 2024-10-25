@@ -70,7 +70,7 @@ where
                 io_uring::opcode::Statx::new(
                     fd,
                     // SAFETY: static byte string is zero-terminated.
-                    unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"\0").as_ptr() },
+                    c"".as_ptr(),
                     // Yes, this cast is what the io_uring / tokio-uring crates currently do as well.
                     // Don't understand why io_uring crate just doesn't take a `libc::statx` directly.
                     // https://github.com/tokio-rs/tokio-uring/blob/c4320fa2e7b146b28ad921ae25b552a0894c9697/src/io/statx.rs#L47-L61

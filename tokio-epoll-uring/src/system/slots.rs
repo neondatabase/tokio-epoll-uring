@@ -433,12 +433,17 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
     }
 }
 
+type UseForOpOutput<O> = (
+    <O as Op>::Resources,
+    Result<<O as Op>::Success, Error<<O as Op>::Error>>,
+);
+
 impl SlotHandle {
     pub(crate) fn use_for_op<O, S>(
         self,
         mut op: O,
         do_submit: S,
-    ) -> impl std::future::Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
+    ) -> impl std::future::Future<Output = UseForOpOutput<O>>
     where
         O: Op + Send + 'static,
         S: FnOnce(io_uring::squeue::Entry),
