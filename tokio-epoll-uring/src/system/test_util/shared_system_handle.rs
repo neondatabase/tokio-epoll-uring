@@ -13,7 +13,7 @@ use crate::{System, SystemHandle};
 /// it's up to the user to ensure that shutdown is initiated at the right time.
 /// If they fail, we currently panic.
 #[derive(Clone)]
-pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle<()>>>>);
+pub struct SharedSystemHandle(Arc<RwLock<Option<SystemHandle>>>);
 
 #[cfg(test)]
 use crate::system::completion::PollerTesting;

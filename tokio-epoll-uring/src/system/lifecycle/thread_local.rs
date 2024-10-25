@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{System, SystemHandle};
 
 thread_local! {
-    static THREAD_LOCAL: std::sync::Arc<tokio::sync::OnceCell<SystemHandle<()>>> = Arc::new(tokio::sync::OnceCell::const_new());
+    static THREAD_LOCAL: std::sync::Arc<tokio::sync::OnceCell<SystemHandle>> = Arc::new(tokio::sync::OnceCell::const_new());
 }
 
 /// Panics if we cannot [`System::launch`].
@@ -20,10 +20,10 @@ pub async fn thread_local_system() -> Handle {
 }
 
 #[derive(Clone)]
-pub struct Handle(Arc<tokio::sync::OnceCell<SystemHandle<()>>>);
+pub struct Handle(Arc<tokio::sync::OnceCell<SystemHandle>>);
 
 impl std::ops::Deref for Handle {
-    type Target = SystemHandle<()>;
+    type Target = SystemHandle;
 
     fn deref(&self) -> &Self::Target {
         self.0
