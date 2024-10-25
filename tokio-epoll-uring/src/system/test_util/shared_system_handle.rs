@@ -20,7 +20,7 @@ use crate::system::completion::PollerTesting;
 
 impl SharedSystemHandle {
     pub async fn launch() -> Result<Self, LaunchResult> {
-        let handle = System::launch(Arc::new(())).await?;
+        let handle = System::launch().await?;
         Ok(Self(Arc::new(RwLock::new(Some(handle)))))
     }
 

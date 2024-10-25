@@ -28,7 +28,7 @@ use crate::{
 
 #[tokio::test]
 async fn drop_system_handle() {
-    let system = System::launch(Arc::new(())).await;
+    let system = System::launch().await;
     drop(system);
 }
 
@@ -143,7 +143,7 @@ async fn hitting_memlock_limit_does_not_panic() {
     let mut systems = Vec::new();
     let mut vm_lck_observations = vec![];
     loop {
-        let res = System::launch(Arc::new(())).await;
+        let res = System::launch().await;
         vm_lck_observations.push(get_vm_lck());
         match res {
             Ok(system) => {
@@ -243,7 +243,7 @@ fn test_metrics() {
 
 #[tokio::test]
 async fn test_statx() {
-    let system = System::launch(Arc::new(())).await.unwrap();
+    let system = System::launch().await.unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
 
@@ -274,7 +274,7 @@ async fn test_statx() {
 
 #[tokio::test]
 async fn test_write() {
-    let system = System::launch(Arc::new(())).await.unwrap();
+    let system = System::launch().await.unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
 

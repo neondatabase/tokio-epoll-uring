@@ -98,7 +98,14 @@ impl System {
     /// interact with the system.
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
-    pub async fn launch<M>(per_system_metrics: Arc<M>) -> Result<SystemHandle<M>, LaunchResult>
+    pub async fn launch() -> Result<SystemHandle, LaunchResult> {
+        Self::launch_with_metrics(Arc::new(())).await
+    }
+
+    /// Like [`Self::launch`], but allows to pass in a [`PerSystemMetrics`] implementation.
+    pub async fn launch_with_metrics<M>(
+        per_system_metrics: Arc<M>,
+    ) -> Result<SystemHandle<M>, LaunchResult>
     where
         M: PerSystemMetrics,
     {

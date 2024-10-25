@@ -13,7 +13,7 @@ pub async fn thread_local_system() -> Handle {
     let arc = THREAD_LOCAL.with(|arc| arc.clone());
 
     let _ = arc
-        .get_or_init(|| async { System::launch(Arc::new(())).await.unwrap() })
+        .get_or_init(|| async { System::launch().await.unwrap() })
         .await;
 
     Handle(arc)

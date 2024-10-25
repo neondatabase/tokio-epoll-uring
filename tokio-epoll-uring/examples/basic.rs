@@ -1,4 +1,4 @@
-use std::{os::fd::OwnedFd, sync::Arc};
+use std::os::fd::OwnedFd;
 
 #[tokio::main]
 async fn main() {
@@ -18,9 +18,7 @@ async fn main() {
 
     let file: OwnedFd = file.into();
 
-    let system = tokio_epoll_uring::System::launch(Arc::new(()))
-        .await
-        .unwrap();
+    let system = tokio_epoll_uring::System::launch().await.unwrap();
 
     let buf = vec![0; 1024];
 
