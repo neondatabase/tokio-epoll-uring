@@ -118,7 +118,7 @@ where
                 slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
                     per_system_metrics
                         .as_ref()
-                        .record_slots_submission_queue_depth(queue_depth);
+                        .observe_slots_submission_queue_depth(queue_depth);
                     slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
                 }
                 slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
@@ -128,7 +128,7 @@ where
 
                     per_system_metrics
                         .as_ref()
-                        .record_slots_submission_queue_depth(queue_depth);
+                        .observe_slots_submission_queue_depth(queue_depth);
                     if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
                         // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
                         open_guard.submitter.submit().unwrap();
