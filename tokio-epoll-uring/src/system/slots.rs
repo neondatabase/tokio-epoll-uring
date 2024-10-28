@@ -253,9 +253,9 @@ impl<const O: usize> Slots<O> {
         // TODO: only do this if some env var is set?
         let (storage, unused_indices) = (&inner.storage, &inner.unused_indices);
         debug!(
-            "poller task got timeout: free slots = {} by state: {:?}",
+            "poller task got timeout: free slots = {} by state: {state:?}",
             unused_indices.len(),
-            {
+            state = {
                 // Note: This non-trivial piece of code is inside the debug! macro so that it
                 // doesn't get executed when tracing level is set to ignore debug events. If
                 // you want to move it out, use tracing::enabled to still avoid the overhead.
