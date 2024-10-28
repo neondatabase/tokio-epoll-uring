@@ -252,28 +252,33 @@ impl<const O: usize> Slots<O> {
         let inner = self.inner.lock().unwrap();
         // TODO: only do this if some env var is set?
         let (storage, unused_indices) = (&inner.storage, &inner.unused_indices);
-        let mut by_state_discr = HashMap::new();
-        for s in storage {
-            match s {
-                Some(slot) => {
-                    let discr = slot.discriminant_str();
-                    by_state_discr
-                        .entry(discr)
-                        .and_modify(|v| *v += 1)
-                        .or_insert(1);
-                }
-                None => {
-                    by_state_discr
-                        .entry("None")
-                        .and_modify(|v| *v += 1)
-                        .or_insert(1);
-                }
-            }
-        }
         debug!(
-            "poller task got timeout: free slots = {} by state: {:?}",
+            "poller task got timeout: free slots = {} by state: {state:?}",
             unused_indices.len(),
-            by_state_discr
+            state = {
+                // Note: This non-trivial piece of code is inside the debug! macro so that it
+                // doesn't get executed when tracing level is set to ignore debug events. If
+                // you want to move it out, use tracing::enabled to still avoid the overhead.
+                let mut by_state_discr = HashMap::new();
+                for s in storage {
+                    match s {
+                        Some(slot) => {
+                            let discr = slot.discriminant_str();
+                            by_state_discr
+                                .entry(discr)
+                                .and_modify(|v| *v += 1)
+                                .or_insert(1);
+                        }
+                        None => {
+                            by_state_discr
+                                .entry("None")
+                                .and_modify(|v| *v += 1)
+                                .or_insert(1);
+                        }
+                    }
+                }
+                by_state_discr
+            }
         );
     }
 }
