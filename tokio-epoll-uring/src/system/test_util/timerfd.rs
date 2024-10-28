@@ -51,9 +51,12 @@ impl IoFd for TimerFd {
     }
 }
 
-pub async fn read(fd: impl IoFd + Send, system: &SystemHandle) {
+pub async fn read<T>(fd: impl IoFd + Send, system: T)
+where
+    T: AsRef<SystemHandle>,
+{
     let value = vec![0u8; 8];
-    let ((_, value), res) = system.read(fd, 0, value).await;
+    let ((_, value), res) = system.as_ref().read(fd, 0, value).await;
     let n: usize = res.unwrap();
     assert_eq!(n, 8);
     let mut value = bytes::Bytes::from(value);
