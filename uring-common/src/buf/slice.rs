@@ -51,7 +51,6 @@ impl<T> Slice<T> {
     }
 
     /// Offset in the underlying buffer at which this slice starts.
-
     pub fn begin(&self) -> usize {
         self.begin
     }
