@@ -313,7 +313,7 @@ impl SlotsInner {
                 *slot = Slot::Ready {
                     result: cqe.result(),
                 };
-                // self.return_slot(idx);
+                self.return_slot(idx);
             }
             Slot::Ready { .. } => {
                 unreachable!(
