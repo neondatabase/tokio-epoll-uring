@@ -5,7 +5,8 @@ use std::{
     time::Duration,
 };
 
-use tokio::task::JoinSet;
+use futures::{stream::FuturesUnordered, StreamExt};
+use tokio::task::{unconstrained, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -311,6 +312,7 @@ async fn test_write() {
     drop(fd);
 }
 
+/// Scenario: More tasks than slots; each tasks `.await`s one operation at a time.
 #[tokio::test]
 async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
     let system = System::launch().await.unwrap();
@@ -387,50 +389,66 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
     Arc::into_inner(system).unwrap().initiate_shutdown().await;
 }
 
+/// Scenario: a single tasks creates many futures that get submitted
+/// and hence occupy a slot, but the future never gets polled to completion,
+/// even though the io_uring-level operation has long completed.
+///
+/// The current behavior is that the operation waits for a slot to
+/// become available, i.e., it never completes.
 #[tokio::test]
 async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get_polled() {
     let system = Arc::new(System::launch().await.unwrap());
 
     // Use up all slots.
-    let mut futs = Vec::new();
+    let mut reads = FuturesUnordered::new();
     let mut timerfds = Vec::new();
     for _ in 0..RING_SIZE {
-        let oneshot = Arc::new(timerfd::oneshot(FOREVER));
-        let system = Arc::clone(&system);
-        futs.push(timerfd::read(Arc::clone(&oneshot), system.clone()));
+        let oneshot = timerfd::oneshot(FOREVER);
+        let oneshot = Arc::new(oneshot);
+        let mut fut = Box::pin(tokio::task::unconstrained(timerfd::read(
+            oneshot.clone(),
+            system.clone(),
+        )));
+        let res = futures::poll!(&mut fut);
+        assert!(res.is_pending());
+        reads.push(fut);
         timerfds.push(oneshot);
-    }
-    let mut futs_polled = futures::future::join_all(futs);
-    tokio::select! {
-        biased; // so that futs_polled
-        _ = &mut futs_polled => { unreachable!() }
-        _ = futures::future::ready(()) => { }
     }
 
     // An additional op will now wait forever for a free slot.
-    // TODO: use start_paused=true to de-flake this test
-    let fire_in = Duration::from_secs(1);
-    let fd = timerfd::oneshot(fire_in);
-    tokio::time::sleep(2 * fire_in).await;
-    let mut fut = timerfd::read(fd, system.clone());
-    let mut fut = std::pin::pin!(fut);
+    let mut nop = Box::pin(unconstrained(system.nop()));
     tokio::select! {
         biased; // ensure future gets queued first
-        _ = &mut fut => {
-            panic!("future shouldn't be ready because all slots are still used")
+        res = &mut nop => {
+            panic!("nop shouldn't be able to get a slot because all slots are already used: {res:?}")
         }
-        _ = futures::future::ready(()) => { }
+        // TODO: use start_paused=true to de-flake this test
+        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
     }
 
-    // unblock the tasks by firing their timerfds sooner, otherwise shutdown hangs forever
+    // make the io_uring operations complete
     for timerfd in timerfds {
         timerfd.set(Duration::from_millis(1));
     }
 
-    // ensure our future can complete now
-    let _: () = fut.await;
+    // despite the completed io_uring operations, our nop future is still waiting for a slot
+    tokio::select! {
+        biased; // ensure future gets queued first
+        res = &mut nop => {
+            panic!("nop shouldn't be able to get a slot because all slots are still used: {res:?}")
+        }
+        // TODO: use start_paused=true to de-flake this test
+        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
+    }
 
-    drop(futs_polled);
+    //
+    // Cleanup
+    //
+    while let Some(()) = reads.next().await {}
+
+    // nop can now get a slot because the read futs have been polled to completion
+    let ((), res) = nop.await;
+    res.unwrap();
 
     Arc::into_inner(system).unwrap().initiate_shutdown().await;
 }
