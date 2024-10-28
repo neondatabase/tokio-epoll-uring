@@ -1250,6 +1250,7 @@ name = "tokio-epoll-uring"
 version = "0.1.0"
 dependencies = [
  "assert-panic",
+ "bytes",
  "futures",
  "nix",
  "once_cell",

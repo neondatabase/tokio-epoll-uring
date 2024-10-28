@@ -214,7 +214,6 @@ impl SlotsInner {
                 },
             }
         }
-
         match &mut self.state {
             SlotsInnerState::Open { myself, waiters } => {
                 clear_slot(&mut self.storage[idx]);
@@ -235,7 +234,6 @@ impl SlotsInner {
                         }
                     }
                 }
-                trace!("no waiters, returning idx to unused_indices");
                 self.unused_indices.push(idx);
             }
             SlotsInnerState::Draining => {

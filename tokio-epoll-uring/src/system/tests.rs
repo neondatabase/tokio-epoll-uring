@@ -5,10 +5,11 @@ use std::{
     time::Duration,
 };
 
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    metrics::GlobalMetricsStorage, system::test_util::shared_system_handle::SharedSystemHandle,
+    metrics::GlobalMetricsStorage, system::{test_util::{shared_system_handle::SharedSystemHandle, timerfd}, RING_SIZE},
     System,
 };
 
@@ -304,4 +305,80 @@ async fn test_write() {
     );
 
     drop(fd);
+}
+
+#[tokio::test]
+async fn test_slot_exhaustion() {
+    let system = System::launch().await.unwrap();
+    let system = Arc::new(system);
+
+    const LONGER_THAN_TEST_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(24 * 60 * 60);
+
+    // rack up 3*RING_SIZE tasks that wait forever
+    let mut submitted_or_enqueued = Vec::new();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut tasks = JoinSet::new();
+    for _ in 0..3 * RING_SIZE {
+        let system = system.clone();
+        let fd = Arc::new(timerfd::oneshot(LONGER_THAN_TEST_TIMEOUT));
+        let cancel = cancel.child_token();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        submitted_or_enqueued.push(rx);
+        tasks.spawn(async move {
+            let fut = timerfd::read(Arc::clone(&fd), &system);
+            let mut fut = std::pin::pin!(fut);
+            tokio::select! {
+                biased; // to ensure we poll system.read() before notifying the test task
+                _ = &mut fut => {
+                    unreachable!()
+                }
+                _ = futures::future::ready(()) => { }
+            }
+            tx.send(()).expect("test bug");
+            tokio::select! {
+                _ = &mut fut => {
+                    unreachable!()
+                }
+                _ = cancel.cancelled() => { drop(fut); fd }
+            }
+        });
+    }
+
+    for rx in submitted_or_enqueued {
+        rx.await.expect("test bug");
+    }
+
+    // all the futures have been submitted, drop them
+    cancel.cancel();
+    let mut timerfds = Vec::new();
+    while let Some(res) = tasks.join_next().await {
+        let timerfd = res.unwrap();
+        timerfds.push(timerfd);
+    }
+
+    // the slots are still blocked on the timerfd
+    // TODO: assert that directly
+    // assert it by starting a new read, it will enqueue
+    // TODO: use start_paused=true for this test, requires tokio upgrade
+    let fire_in = Duration::from_millis(10);
+    let fd = timerfd::oneshot(fire_in);
+    tokio::time::sleep(2 * fire_in).await;
+    let fut = timerfd::read(fd, &system);
+    let mut fut = std::pin::pin!(fut);
+    tokio::select! {
+        biased; // ensure future gets queued first
+        _ = &mut fut => {
+            panic!("future shouldn't be ready because all slots are still used")
+        }
+        _ = futures::future::ready(()) => { }
+    }
+
+    // unblock them by firing their timerfds sooner
+    for timerfd in timerfds {
+        timerfd.set(Duration::from_millis(1));
+    }
+
+    // ensure the slots were freed by issuing a new read
+    let _: () = fut.await;
 }
