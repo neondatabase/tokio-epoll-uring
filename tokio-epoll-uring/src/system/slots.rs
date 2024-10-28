@@ -306,6 +306,7 @@ impl SlotsInner {
                     trace!("waking up future");
                     waker.wake();
                 }
+                // The slot will be returned by `wait_for_completion`.
             }
             Slot::PendingButFutureDropped {
                 _resources_owned_by_kernel,
