@@ -313,6 +313,11 @@ async fn test_write() {
 }
 
 /// Scenario: More tasks than slots; each tasks `.await`s one operation at a time.
+///
+/// NB: In this test, we use the pattern of `select! { ..., sleep(2 seconds) }` to drive op futures
+/// to the point where they are enqueued and occupy a slot. This will become flaky if that takes
+/// more than 2 seconds. A more deterministic way to do it would be to use
+/// #[tokio::test(start_paused=true)].
 #[tokio::test]
 async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
     let system = System::launch().await.unwrap();
@@ -334,9 +339,9 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
             tokio::select! {
                 biased; // to ensure we poll system.read() before notifying the test task
                 _ = &mut fut => {
-                    unreachable!()
+                    unreachable!("timerfd only fires in far future")
                 }
-                _ = futures::future::ready(()) => { }
+                _ = tokio::time::sleep(Duration::from_secs(2)) => { }
             }
             tx.send(()).expect("test bug");
             tokio::select! {
@@ -362,8 +367,7 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
 
     // the slots are still blocked on the timerfd
     // TODO: assert that directly
-    // assert it by starting a new read, it will enqueue
-    // TODO: use start_paused=true for this test, requires tokio upgrade
+    // assert it by starting a new read and check that that read will be Pending forever
     let fire_in = Duration::from_secs(1);
     let fd = timerfd::oneshot(fire_in);
     tokio::time::sleep(2 * fire_in).await;
@@ -374,7 +378,7 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
         _ = &mut fut => {
             panic!("future shouldn't be ready because all slots are still used")
         }
-        _ = futures::future::ready(()) => { }
+        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
     }
 
     // unblock the tasks by firing their timerfds sooner, otherwise shutdown hangs forever
@@ -395,6 +399,11 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
 ///
 /// The current behavior is that the operation waits for a slot to
 /// become available, i.e., it never completes.
+///
+/// NB: In this test, we use the pattern of `select! { ..., sleep(2 seconds) }` to drive op futures
+/// to the point where they are enqueued and occupy a slot. This will become flaky if that takes
+/// more than 2 seconds. A more deterministic way to do it would be to use
+/// #[tokio::test(start_paused=true)].
 #[tokio::test]
 async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get_polled() {
     let system = Arc::new(System::launch().await.unwrap());
@@ -422,7 +431,6 @@ async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get
         res = &mut nop => {
             panic!("nop shouldn't be able to get a slot because all slots are already used: {res:?}")
         }
-        // TODO: use start_paused=true to de-flake this test
         _ = tokio::time::sleep(Duration::from_secs(2)) => { }
     }
 
@@ -437,7 +445,6 @@ async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get
         res = &mut nop => {
             panic!("nop shouldn't be able to get a slot because all slots are still used: {res:?}")
         }
-        // TODO: use start_paused=true to de-flake this test
         _ = tokio::time::sleep(Duration::from_secs(2)) => { }
     }
 
