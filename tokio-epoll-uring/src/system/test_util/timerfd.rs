@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use crate::SystemHandle;
 
-/// Read helper [`self::read`]
+/// Abstraction for creating a timerfd.
+///
+/// See [`oneshot`] for creating it, and [`read`] for using `tokio-epoll-uring` to read from it.
 pub struct TimerFd {
     pub(crate) timerfd: timerfd::TimerFd,
 }
