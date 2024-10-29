@@ -5,10 +5,16 @@ use std::{
     time::Duration,
 };
 
+use futures::{stream::FuturesUnordered, StreamExt};
+use tokio::task::{unconstrained, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    metrics::GlobalMetricsStorage, system::test_util::shared_system_handle::SharedSystemHandle,
+    metrics::GlobalMetricsStorage,
+    system::{
+        test_util::{shared_system_handle::SharedSystemHandle, timerfd, FOREVER},
+        RING_SIZE,
+    },
     System,
 };
 
@@ -304,4 +310,152 @@ async fn test_write() {
     );
 
     drop(fd);
+}
+
+/// Scenario: More tasks than slots; each tasks `.await`s one operation at a time.
+///
+/// NB: In this test, we use the pattern of `select! { ..., sleep(2 seconds) }` to drive op futures
+/// to the point where they are enqueued and occupy a slot. This will become flaky if that takes
+/// more than 2 seconds. A more deterministic way to do it would be to use
+/// #[tokio::test(start_paused=true)].
+#[tokio::test]
+async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
+    let system = System::launch().await.unwrap();
+    let system = Arc::new(system);
+
+    // rack up 3*RING_SIZE tasks that wait forever
+    let mut submitted_or_enqueued = Vec::new();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut tasks = JoinSet::new();
+    for _ in 0..3 * RING_SIZE {
+        let system = system.clone();
+        let fd = Arc::new(timerfd::oneshot(FOREVER));
+        let cancel = cancel.child_token();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        submitted_or_enqueued.push(rx);
+        tasks.spawn(async move {
+            let fut = timerfd::read(Arc::clone(&fd), &system);
+            let mut fut = std::pin::pin!(fut);
+            tokio::select! {
+                biased; // to ensure we poll system.read() before notifying the test task
+                _ = &mut fut => {
+                    unreachable!("timerfd only fires in far future")
+                }
+                _ = tokio::time::sleep(Duration::from_secs(2)) => { }
+            }
+            tx.send(()).expect("test bug");
+            tokio::select! {
+                _ = &mut fut => {
+                    unreachable!()
+                }
+                _ = cancel.cancelled() => { drop(fut); fd }
+            }
+        });
+    }
+
+    for rx in submitted_or_enqueued {
+        rx.await.expect("test bug");
+    }
+
+    // all the futures have been submitted, drop them
+    cancel.cancel();
+    let mut timerfds = Vec::new();
+    while let Some(res) = tasks.join_next().await {
+        let timerfd = res.unwrap();
+        timerfds.push(timerfd);
+    }
+
+    // the slots are still blocked on the timerfd
+    // TODO: assert that directly
+    // assert it by starting a new read and check that that read will be Pending forever
+    let fire_in = Duration::from_secs(1);
+    let fd = timerfd::oneshot(fire_in);
+    tokio::time::sleep(2 * fire_in).await;
+    let fut = timerfd::read(fd, system.clone());
+    let mut fut = std::pin::pin!(fut);
+    tokio::select! {
+        biased; // ensure future gets queued first
+        _ = &mut fut => {
+            panic!("future shouldn't be ready because all slots are still used")
+        }
+        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
+    }
+
+    // unblock the tasks by firing their timerfds sooner, otherwise shutdown hangs forever
+    for timerfd in timerfds {
+        timerfd.set(Duration::from_millis(1));
+    }
+
+    // our read should complete because unblocking of the tasks
+    // frees up slots
+    let _: () = fut.await;
+
+    Arc::into_inner(system).unwrap().initiate_shutdown().await;
+}
+
+/// Scenario: a single tasks creates many futures that get submitted
+/// and hence occupy a slot, but the future never gets polled to completion,
+/// even though the io_uring-level operation has long completed.
+///
+/// The current behavior is that the operation waits for a slot to
+/// become available, i.e., it never completes.
+///
+/// NB: In this test, we use the pattern of `select! { ..., sleep(2 seconds) }` to drive op futures
+/// to the point where they are enqueued and occupy a slot. This will become flaky if that takes
+/// more than 2 seconds. A more deterministic way to do it would be to use
+/// #[tokio::test(start_paused=true)].
+#[tokio::test]
+async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get_polled() {
+    let system = Arc::new(System::launch().await.unwrap());
+
+    // Use up all slots.
+    let mut reads = FuturesUnordered::new();
+    let mut timerfds = Vec::new();
+    for _ in 0..RING_SIZE {
+        let oneshot = timerfd::oneshot(FOREVER);
+        let oneshot = Arc::new(oneshot);
+        let mut fut = Box::pin(tokio::task::unconstrained(timerfd::read(
+            oneshot.clone(),
+            system.clone(),
+        )));
+        let res = futures::poll!(&mut fut);
+        assert!(res.is_pending());
+        reads.push(fut);
+        timerfds.push(oneshot);
+    }
+
+    // An additional op will now wait forever for a free slot.
+    let mut nop = Box::pin(unconstrained(system.nop()));
+    tokio::select! {
+        biased; // ensure future gets queued first
+        res = &mut nop => {
+            panic!("nop shouldn't be able to get a slot because all slots are already used: {res:?}")
+        }
+        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
+    }
+
+    // make the io_uring operations complete
+    for timerfd in timerfds {
+        timerfd.set(Duration::from_millis(1));
+    }
+
+    // despite the completed io_uring operations, our nop future is still waiting for a slot
+    tokio::select! {
+        biased; // ensure future gets queued first
+        res = &mut nop => {
+            panic!("nop shouldn't be able to get a slot because all slots are still used: {res:?}")
+        }
+        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
+    }
+
+    //
+    // Cleanup
+    //
+    while let Some(()) = reads.next().await {}
+
+    // nop can now get a slot because the read futs have been polled to completion
+    let ((), res) = nop.await;
+    res.unwrap();
+
+    Arc::into_inner(system).unwrap().initiate_shutdown().await;
 }

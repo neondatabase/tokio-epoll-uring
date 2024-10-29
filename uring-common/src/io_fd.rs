@@ -1,4 +1,7 @@
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::{
+    os::fd::{AsRawFd, OwnedFd, RawFd},
+    sync::Arc,
+};
 
 /// An `io-uring` compatible file descriptor, or wrapper thereof.
 ///
@@ -64,5 +67,17 @@ impl IoFdMut for std::fs::File {
     unsafe fn as_fd_mut(&mut self) -> RawFd {
         // Safety: If we have a `&mut` ref to an `std::fs::File`, Rust type system guarantees this is the only reference.
         self.as_raw_fd()
+    }
+}
+
+impl<T> IoFd for Arc<T>
+where
+    T: IoFd,
+{
+    unsafe fn as_fd(&self) -> RawFd
+    where
+        T: IoFd,
+    {
+        self.as_ref().as_fd()
     }
 }
