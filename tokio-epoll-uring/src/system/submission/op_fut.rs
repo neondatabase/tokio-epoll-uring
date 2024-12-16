@@ -99,6 +99,6 @@ where
         }
     }
 
-    let slot = open_guard.slots.submit_prepare();
+    let slot = open_guard.slots.submit_prepare(per_system_metrics);
     Slots::submit_and_wait(slot, op, |sqe| do_submit(open_guard, sqe)).await
 }

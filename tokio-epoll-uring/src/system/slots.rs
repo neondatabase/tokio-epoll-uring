@@ -35,7 +35,7 @@ use std::{
 use tracing::trace;
 use uring_common::io_uring;
 
-use crate::system::submission::op_fut::Error;
+use crate::{metrics::PerSystemMetrics, system::submission::op_fut::Error};
 
 use super::submission::op_fut::Op;
 
@@ -264,7 +264,10 @@ type UseForOpOutput<O> = (
 );
 
 impl Slots<{ co_owner::SUBMIT_SIDE }> {
-    pub(crate) fn submit_prepare(&self) -> SlotHandle {
+    pub(crate) fn submit_prepare<M>(&self, per_system_metrics: Arc<M>) -> SlotHandle
+    where
+        M: PerSystemMetrics,
+    {
         let slot = Arc::new(Mutex::new({
             Slot {
                 state: SlotState::NotSubmitted {
@@ -273,8 +276,9 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                             let inner_guard = self.inner.lock().unwrap();
                             Arc::clone(&inner_guard.inuse_slot_count)
                         };
-                        inuse_slot_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // todo!("submission queue depth stats");
+                        let queue_depth =
+                            inuse_slot_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        per_system_metrics.observe_slots_submission_queue_depth(queue_depth);
                         inuse_slot_count
                     },
                 },
