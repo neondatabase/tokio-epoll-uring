@@ -74,16 +74,7 @@ where
 
     fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
         if open_guard.submit_raw(sqe).is_err() {
-            
-            // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
-            // So, we could just submit_and_wait here. But, that'd prevent the
-            // current executor thread from making progress on other tasks.
-            //
-            // So, for now, keep SQ size == inflight ops size == Slots size.
-            // This potentially limits throughput if SQ size is chosen too small.
-            //
-            // FIXME: why not just async mutex?
-            unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
+            todo!("1. can this even happen? doesn't io_uring_enter ever not make room?")
         }
 
         // this allows us to keep the possible guard in cq_guard because the arc lives on stack
