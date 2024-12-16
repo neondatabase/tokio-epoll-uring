@@ -6,5 +6,3 @@ pub(super) mod submission;
 pub(crate) mod test_util;
 #[cfg(test)]
 pub(crate) mod tests;
-
-pub(crate) const RING_SIZE: u32 = 128;

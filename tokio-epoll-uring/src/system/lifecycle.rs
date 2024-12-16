@@ -11,7 +11,7 @@ use uring_common::io_uring;
 
 use crate::{
     metrics::{GlobalMetricsStorage, PerSystemMetrics},
-    system::{completion::ShutdownRequestImpl, RING_SIZE},
+    system::{completion::ShutdownRequestImpl},
     util::oneshot_nonconsuming,
 };
 
