@@ -87,7 +87,11 @@ pub(crate) struct SlotHandle {
     slot: Arc<Mutex<Slot>>,
 }
 
-enum Slot {
+struct Slot {
+    state: SlotState,
+}
+
+enum SlotState {
     NotSubmitted {
         inuse_slot_count: Arc<AtomicU64>,
     },
@@ -172,19 +176,19 @@ impl SlotsInner {
         let slot: Arc<std::sync::Mutex<Slot>> = unsafe { Arc::from_raw(slot_arc_ptr as *const _) };
         let mut slot_lock_guard = slot.lock().unwrap();
         let slot = &mut *slot_lock_guard;
-        match slot {
-            Slot::NotSubmitted { inuse_slot_count } => {
+        match &mut slot.state {
+            SlotState::NotSubmitted { inuse_slot_count } => {
                 panic!("implementation error: completion received for unsubmitted slot")
             }
-            Slot::Pending {
+            SlotState::Pending {
                 inuse_slot_count,
                 waker,
             } => {
                 let res = inuse_slot_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                assert!(res > 0);
+                assert!(res > 0, "{res}");
 
                 let waker = waker.take();
-                *slot = Slot::Ready {
+                slot.state = SlotState::Ready {
                     result: cqe.result(),
                 };
                 if let Some(waker) = waker {
@@ -193,21 +197,21 @@ impl SlotsInner {
                 }
                 // The slot will be returned by `wait_for_completion`.
             }
-            Slot::PendingButFutureDropped {
+            SlotState::PendingButFutureDropped {
                 inuse_slot_count,
                 _resources_owned_by_kernel,
             } => {
                 let res = inuse_slot_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 assert!(res > 0);
 
-                *slot = Slot::Ready {
+                slot.state = SlotState::Ready {
                     result: cqe.result(),
                 };
             }
-            Slot::Ready { .. } => {
+            SlotState::Ready { .. } => {
                 unreachable!(
                     "completions only come in once: {:?}",
-                    slot.discriminant_str()
+                    slot.state.discriminant_str()
                 )
             }
         }
@@ -263,16 +267,20 @@ type UseForOpOutput<O> = (
 
 impl Slots<{ co_owner::SUBMIT_SIDE }> {
     pub(crate) fn submit_prepare(&self) -> SlotHandle {
-        let slot = Arc::new(Mutex::new(Slot::NotSubmitted {
-            inuse_slot_count: {
-                let inuse_slot_count = {
-                    let mut inner_guard = self.inner.lock().unwrap();
-                    Arc::clone(&inner_guard.inuse_slot_count)
-                };
-                inuse_slot_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                todo!("submission queue depth stats");
-                inuse_slot_count
-            },
+        let slot = Arc::new(Mutex::new({
+            Slot {
+                state: SlotState::NotSubmitted {
+                    inuse_slot_count: {
+                        let inuse_slot_count = {
+                            let mut inner_guard = self.inner.lock().unwrap();
+                            Arc::clone(&inner_guard.inuse_slot_count)
+                        };
+                        inuse_slot_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // todo!("submission queue depth stats");
+                        inuse_slot_count
+                    },
+                },
+            }
         }));
         SlotHandle { slot }
     }
@@ -289,20 +297,20 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
         let SlotHandle { slot } = slot_handle;
         let mut slot_lock_guard = slot.lock().unwrap();
         let slot_mut = &mut *slot_lock_guard;
-        match slot_mut {
-            Slot::NotSubmitted { inuse_slot_count } => {
-                *slot_mut = Slot::Pending {
+        match &slot_mut.state {
+            SlotState::NotSubmitted { inuse_slot_count } => {
+                slot_mut.state = SlotState::Pending {
                     inuse_slot_count: Arc::clone(inuse_slot_count),
                     waker: None,
                 };
             }
-            Slot::Pending { .. } => {
+            SlotState::Pending { .. } => {
                 unreachable!()
             }
-            Slot::PendingButFutureDropped { .. } => {
+            SlotState::PendingButFutureDropped { .. } => {
                 unreachable!()
             }
-            Slot::Ready { .. } => {
+            SlotState::Ready { .. } => {
                 unreachable!()
             }
         }
@@ -337,23 +345,23 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             let mut slot_lock_guard = slot.lock().unwrap();
             let slot_mut = &mut *slot_lock_guard;
 
-            match slot_mut {
-                Slot::NotSubmitted { inuse_slot_count } => unreachable!("we call this function only after transitioning the slot out of this state"),
-                Slot::Pending { inuse_slot_count, waker: _ } => {
+            match &slot_mut.state {
+                SlotState::NotSubmitted { inuse_slot_count } => unreachable!("we call this function only after transitioning the slot out of this state"),
+                SlotState::Pending { inuse_slot_count, waker: _ } => {
                     // The resource needs to be kept alive until the op completes.
                     // So, move it into the Slot.
                     // `process_completion` will drop the box and return the slot
                     // once it observes the completion.
-                    *slot_mut = Slot::PendingButFutureDropped {
+                    slot_mut.state = SlotState::PendingButFutureDropped {
                         inuse_slot_count: Arc::clone(inuse_slot_count),
                         _resources_owned_by_kernel: Box::new(op),
                     };
                 }
-                Slot::Ready { result } => {
+                SlotState::Ready { result } => {
                     // The op completed and called the waker that would eventually cause this future to be polled
                     // and transition from Inflight to one of the Done states. But this future got dropped first.
                     // So, it's our job to drop the slot.
-                    *slot_mut = Slot::Ready { result: *result };
+                    slot_mut.state = SlotState::Ready { result: *result };
                     // SAFETY:
                     // The op is ready, hence the resources aren't onwed by the kernel anymore.
                     #[allow(unused_unsafe)]
@@ -361,7 +369,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                         drop(op);
                     }
                 }
-                Slot::PendingButFutureDropped { .. } => {
+                SlotState::PendingButFutureDropped { .. } => {
                     unreachable!("above is the only transition into this state, and this function only runs once")
                 }
             }
@@ -371,7 +379,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
         // Inspect the slot to check whether the poller task already processed the completion.
         // If it has, good for us.
         // If not, store a waker in the slot so the poller task will wake us up to poll again
-        // and observe the Slot::Ready then.
+        // and observe the SlotState::Ready then.
         //
         // If we get cancelled in the meantime (i.e., this future gets dropped), the scopeguard
         // will make sure the resources stay alive until the op is complete.
@@ -381,13 +389,13 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             let mut slot_lock_guard = slot.lock().unwrap();
             let slot_mut = &mut *slot_lock_guard;
 
-            match &mut *slot_mut {
-                Slot::NotSubmitted { .. } => {
+            match &mut slot_mut.state {
+                SlotState::NotSubmitted { .. } => {
                     unreachable!(
                         "we call this function only after transitioning the slot out of this state"
                     )
                 }
-                Slot::Pending {
+                SlotState::Pending {
                     inuse_slot_count,
                     waker,
                 } => {
@@ -398,10 +406,10 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                     }
                     Poll::Pending
                 }
-                Slot::PendingButFutureDropped { .. } => {
+                SlotState::PendingButFutureDropped { .. } => {
                     unreachable!("if it's dropped, it's not pollable")
                 }
-                Slot::Ready { result: res } => {
+                SlotState::Ready { result: res } => {
                     trace!("op is ready, returning resources to user");
                     let res = *res;
                     // SAFETY: the slot is ready, so, ownership is back with userspace.
@@ -423,39 +431,39 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
     }
 }
 
-impl Slot {
+impl SlotState {
     pub(super) fn discriminant_str(&self) -> &'static str {
         match self {
-            Slot::NotSubmitted { .. } => "NotSubmitted",
-            Slot::Pending { .. } => "Pending",
-            Slot::PendingButFutureDropped { .. } => "PendingButFutureDropped",
-            Slot::Ready { .. } => "Ready",
+            SlotState::NotSubmitted { .. } => "NotSubmitted",
+            SlotState::Pending { .. } => "Pending",
+            SlotState::PendingButFutureDropped { .. } => "PendingButFutureDropped",
+            SlotState::Ready { .. } => "Ready",
         }
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        match self {
-            Slot::NotSubmitted { inuse_slot_count } => {
+        match &self.state {
+            SlotState::NotSubmitted { inuse_slot_count } => {
                 // If it hasn't been submitted, e.g. because we gave up while
                 // waiting for the SQ to unclog, it's the drop handler's job
                 // to decrement the inuse_slot_count.
                 let prev = inuse_slot_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 assert!(prev > 0);
             }
-            Slot::Pending {
+            SlotState::Pending {
                 inuse_slot_count, ..
             } => {
                 unreachable!("we only drop a Slot after it's been processed by the poller task")
             }
-            Slot::PendingButFutureDropped {
+            SlotState::PendingButFutureDropped {
                 inuse_slot_count,
                 _resources_owned_by_kernel,
             } => {
                 unreachable!("we only drop a Slot after it's been processed by the poller task")
             }
-            Slot::Ready { .. } => {
+            SlotState::Ready { .. } => {
                 trace!("dropping a Slot that's already Ready");
             }
         }
