@@ -12,6 +12,7 @@ use nix::sys::timerfd::TimerFlags;
 
 use std::time::Duration;
 
+use crate::metrics::PerSystemMetrics;
 use crate::SystemHandle;
 
 /// Abstraction for creating a timerfd.
@@ -53,9 +54,10 @@ impl IoFd for TimerFd {
     }
 }
 
-pub async fn read<T>(fd: impl IoFd + Send, system: T)
+pub async fn read<T, M>(fd: impl IoFd + Send, system: T)
 where
-    T: AsRef<SystemHandle>,
+    T: AsRef<SystemHandle<M>>,
+    M: PerSystemMetrics,
 {
     let value = vec![0u8; 8];
     let ((_, value), res) = system.as_ref().read(fd, 0, value).await;

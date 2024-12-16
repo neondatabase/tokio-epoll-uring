@@ -465,3 +465,69 @@ impl Drop for Slot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use metrics::PerSystemMetrics;
+    use system::test_util::{self, FOREVER};
+
+    use crate::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_submission_queue_depth_metric() {
+        struct Metrics {
+            observations: std::sync::Mutex<Vec<u64>>,
+        }
+        impl PerSystemMetrics for Metrics {
+            fn observe_slots_submission_queue_depth(&self, queue_depth: u64) {
+                self.observations.lock().unwrap().push(queue_depth);
+            }
+        }
+
+        let metrics = Metrics {
+            observations: std::sync::Mutex::new(Vec::new()),
+        };
+        let metrics = Arc::new(metrics);
+        let system = Arc::new(
+            System::launch_with_metrics(Arc::clone(&metrics))
+                .await
+                .unwrap(),
+        );
+
+        // basics
+        let (_, res) = system.nop().await;
+        res.unwrap();
+        let (_, res) = system.nop().await;
+        res.unwrap();
+        {
+            let mut observations = metrics.observations.lock().unwrap();
+            assert_eq!(observations.len(), 2);
+            assert_eq!(&observations[..], &[0, 0]);
+            observations.clear();
+        }
+
+        // Build some queue depth.
+        let timerfd = test_util::timerfd::oneshot(FOREVER);
+        let timerfd = Arc::new(timerfd);
+
+        let read1 = test_util::timerfd::read(Arc::clone(&timerfd), Arc::clone(&system));
+        let read2 = test_util::timerfd::read(Arc::clone(&timerfd), Arc::clone(&system));
+        let read3 = test_util::timerfd::read(Arc::clone(&timerfd), Arc::clone(&system));
+
+        tokio::select! {
+            _ = read1 => { panic!("timer should not be firing") }
+            _ = read2 => { panic!("timer should not be firing") }
+            _ = read3 => { panic!("timer should not be firing") }
+            _ = tokio::time::sleep(FOREVER) => {}
+        }
+
+        {
+            let mut observations = metrics.observations.lock().unwrap();
+            assert_eq!(observations.len(), 3);
+            assert_eq!(&observations[..], &[0, 1, 2]);
+            observations.clear();
+        }
+    }
+}
