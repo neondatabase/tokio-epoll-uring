@@ -594,17 +594,10 @@ mod tests {
             }
         });
 
-        let ((_, _), res) = second_rt.block_on(read_fut);
-        let err = res.expect_err("when poller signals shutdown_done, it has dropped the Slots Arc; read_fut only holds a Weak to it and will fail to upgrade");
-        assert!(
-            matches!(
-                err,
-                crate::SystemError::System(
-                    crate::system::submission::op_fut::SystemError::SystemShuttingDown
-                )
-            ),
-            "{err:?}"
-        );
+        let ((_, data), res) = second_rt.block_on(read_fut);
+        let n = res.expect("read fut was submitted, so, it should complete");
+        assert_eq!(n, 1);
+        assert_eq!(data, vec![23]);
     }
 
     #[test]

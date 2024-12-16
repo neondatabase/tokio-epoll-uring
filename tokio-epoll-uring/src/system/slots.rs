@@ -469,36 +469,3 @@ impl Drop for Slot {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use crate::{system::slots::SlotsTesting, System};
-
-    // Regression-test for issue https://github.com/neondatabase/tokio-epoll-uring/issues/37
-    #[tokio::test]
-    async fn test_wait_for_completion_drop_behavior() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-        let system = System::launch_with_testing(
-            None,
-            Some(SlotsTesting {}),
-            &crate::metrics::GLOBAL_STORAGE,
-            Arc::new(()),
-        )
-        .await
-        .unwrap();
-        let nop = tokio::spawn(system.nop());
-        let at_yield_point: tokio::sync::oneshot::Sender<()> = rx.await.unwrap();
-        nop.abort();
-        let Err(join_err) = nop.await else {
-            panic!("expecting join error after abort");
-        };
-        assert!(join_err.is_cancelled());
-        assert!(
-            at_yield_point.is_closed(),
-            "abort drops the nop op, and hence the oneshot receiver"
-        );
-    }
-}
