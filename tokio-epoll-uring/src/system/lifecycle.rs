@@ -11,7 +11,7 @@ use uring_common::io_uring;
 
 use crate::{
     metrics::{GlobalMetricsStorage, PerSystemMetrics},
-    system::{completion::ShutdownRequestImpl},
+    system::completion::ShutdownRequestImpl,
     util::oneshot_nonconsuming,
 };
 
@@ -144,7 +144,7 @@ impl System {
                     // A child process would have its cloned `Arc<Mutex<>>` but operate on the same MAP_SHARED memory mapping.
                     // Disaster would ensure.
                     .dontfork()
-                    .build(RING_SIZE)
+                    .build(128) // TODO: make configurable
                     .map_err(LaunchResult::IoUringBuild)?,
             );
             let flags_set_by_kernel = nix::fcntl::FdFlag::from_bits_truncate(

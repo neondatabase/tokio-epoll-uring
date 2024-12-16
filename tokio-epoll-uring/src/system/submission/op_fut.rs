@@ -18,7 +18,7 @@ use crate::{
     metrics::PerSystemMetrics,
     system::{
         completion::ProcessCompletionsCause,
-        slots::{self, SlotHandle},
+        slots::{self, SlotHandle, Slots},
     },
 };
 
@@ -74,6 +74,7 @@ where
 
     fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
         if open_guard.submit_raw(sqe).is_err() {
+            
             // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
             // So, we could just submit_and_wait here. But, that'd prevent the
             // current executor thread from making progress on other tasks.
@@ -107,8 +108,6 @@ where
         }
     }
 
-    let completion = open_guard
-        .slots
-        .submit(op, |sqe| do_submit(open_guard, sqe));
-    completion.await
+    let slot = open_guard.slots.submit_prepare();
+    Slots::submit_and_wait(slot, op, |sqe| do_submit(open_guard, sqe)).await
 }

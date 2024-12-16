@@ -65,13 +65,7 @@ struct SlotsInner {
 }
 
 #[cfg(test)]
-pub(crate) struct SlotsTesting {
-    pub(crate) test_on_wake: Box<
-        dyn Send
-            + Sync
-            + Fn() -> Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
-    >,
-}
+pub(crate) struct SlotsTesting {}
 
 #[cfg(not(test))]
 #[derive(Default)]
@@ -80,9 +74,7 @@ pub(crate) struct SlotsTesting;
 #[cfg(test)]
 impl Default for SlotsTesting {
     fn default() -> Self {
-        Self {
-            test_on_wake: Box::new(|| None),
-        }
+        Self {}
     }
 }
 
@@ -93,12 +85,12 @@ enum SlotsInnerState {
 
 pub(crate) struct SlotHandle {
     slot: Arc<Mutex<Slot>>,
-    #[cfg(test)]
-    test_on_wake:
-        std::sync::Mutex<Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 enum Slot {
+    NotSubmitted {
+        inuse_slot_count: Arc<AtomicU64>,
+    },
     Pending {
         inuse_slot_count: Arc<AtomicU64>,
         waker: Option<std::task::Waker>, // None if it hasn't been polled yet
@@ -181,6 +173,9 @@ impl SlotsInner {
         let mut slot_lock_guard = slot.lock().unwrap();
         let slot = &mut *slot_lock_guard;
         match slot {
+            Slot::NotSubmitted { inuse_slot_count } => {
+                panic!("implementation error: completion received for unsubmitted slot")
+            }
             Slot::Pending {
                 inuse_slot_count,
                 waker,
@@ -267,17 +262,8 @@ type UseForOpOutput<O> = (
 );
 
 impl Slots<{ co_owner::SUBMIT_SIDE }> {
-    pub(crate) fn submit<O, S>(
-        &self,
-        mut op: O,
-        do_submit: S,
-    ) -> impl Future<Output = UseForOpOutput<O>>
-    where
-        O: Op + Send + 'static,
-        S: FnOnce(io_uring::squeue::Entry),
-    {
-        // BEGIN: no await points between bumping inuse_slot_count and submitting the op
-        let slot = Arc::new(Mutex::new(Slot::Pending {
+    pub(crate) fn submit_prepare(&self) -> SlotHandle {
+        let slot = Arc::new(Mutex::new(Slot::NotSubmitted {
             inuse_slot_count: {
                 let inuse_slot_count = {
                     let mut inner_guard = self.inner.lock().unwrap();
@@ -287,13 +273,44 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                 todo!("submission queue depth stats");
                 inuse_slot_count
             },
-            waker: None,
         }));
-        let slot_arc_ptr = Arc::into_raw(slot);
+        SlotHandle { slot }
+    }
+
+    pub(crate) fn submit_and_wait<O, S>(
+        slot_handle: SlotHandle,
+        mut op: O,
+        do_submit: S,
+    ) -> impl Future<Output = UseForOpOutput<O>>
+    where
+        O: Op + Send + 'static,
+        S: FnOnce(io_uring::squeue::Entry),
+    {
+        let SlotHandle { slot } = slot_handle;
+        let mut slot_lock_guard = slot.lock().unwrap();
+        let slot_mut = &mut *slot_lock_guard;
+        match slot_mut {
+            Slot::NotSubmitted { inuse_slot_count } => {
+                *slot_mut = Slot::Pending {
+                    inuse_slot_count: Arc::clone(inuse_slot_count),
+                    waker: None,
+                };
+            }
+            Slot::Pending { .. } => {
+                unreachable!()
+            }
+            Slot::PendingButFutureDropped { .. } => {
+                unreachable!()
+            }
+            Slot::Ready { .. } => {
+                unreachable!()
+            }
+        }
+        drop(slot_lock_guard);
+        let slot_arc_ptr = Arc::into_raw(Arc::clone(&slot));
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(slot_arc_ptr as *const _ as u64);
         do_submit(sqe);
-        // END: no await points
         Self::wait_for_completion(slot, op)
     }
 
@@ -321,6 +338,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             let slot_mut = &mut *slot_lock_guard;
 
             match slot_mut {
+                Slot::NotSubmitted { inuse_slot_count } => unreachable!("we call this function only after transitioning the slot out of this state"),
                 Slot::Pending { inuse_slot_count, waker: _ } => {
                     // The resource needs to be kept alive until the op completes.
                     // So, move it into the Slot.
@@ -364,6 +382,11 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             let slot_mut = &mut *slot_lock_guard;
 
             match &mut *slot_mut {
+                Slot::NotSubmitted { .. } => {
+                    unreachable!(
+                        "we call this function only after transitioning the slot out of this state"
+                    )
+                }
                 Slot::Pending {
                     inuse_slot_count,
                     waker,
@@ -393,15 +416,6 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
         })
         .await;
         assert!(poll_count >= 1);
-        #[cfg(test)]
-        {
-            let on_wake = { slot.test_on_wake.lock().unwrap().take() };
-            if let Some(on_wake) = on_wake {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                on_wake.send(tx).unwrap();
-                rx.await.unwrap();
-            }
-        }
         if poll_count == 1 && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
             tokio::task::yield_now().await;
         }
@@ -412,9 +426,38 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
 impl Slot {
     pub(super) fn discriminant_str(&self) -> &'static str {
         match self {
+            Slot::NotSubmitted { .. } => "NotSubmitted",
             Slot::Pending { .. } => "Pending",
             Slot::PendingButFutureDropped { .. } => "PendingButFutureDropped",
             Slot::Ready { .. } => "Ready",
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        match self {
+            Slot::NotSubmitted { inuse_slot_count } => {
+                // If it hasn't been submitted, e.g. because we gave up while
+                // waiting for the SQ to unclog, it's the drop handler's job
+                // to decrement the inuse_slot_count.
+                let prev = inuse_slot_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(prev > 0);
+            }
+            Slot::Pending {
+                inuse_slot_count, ..
+            } => {
+                unreachable!("we only drop a Slot after it's been processed by the poller task")
+            }
+            Slot::PendingButFutureDropped {
+                inuse_slot_count,
+                _resources_owned_by_kernel,
+            } => {
+                unreachable!("we only drop a Slot after it's been processed by the poller task")
+            }
+            Slot::Ready { .. } => {
+                trace!("dropping a Slot that's already Ready");
+            }
         }
     }
 }
@@ -432,16 +475,7 @@ mod tests {
         let tx = Arc::new(Mutex::new(Some(tx)));
         let system = System::launch_with_testing(
             None,
-            Some(SlotsTesting {
-                test_on_wake: Box::new(move || {
-                    Some(
-                        tx.lock()
-                            .unwrap()
-                            .take()
-                            .expect("should only be called once, we only submit one nop here"),
-                    )
-                }),
-            }),
+            Some(SlotsTesting {}),
             &crate::metrics::GLOBAL_STORAGE,
             Arc::new(()),
         )
