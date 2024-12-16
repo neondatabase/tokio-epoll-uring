@@ -24,22 +24,20 @@
 //! io_uring operation operates on.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
     future::{poll_fn, Future},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
     task::Poll,
 };
 
-use tokio::sync::oneshot;
-use tracing::{debug, trace};
+use tracing::trace;
 use uring_common::io_uring;
 
 use crate::system::submission::op_fut::Error;
 
-use super::submission::op_fut::{Op, SystemError};
+use super::submission::op_fut::Op;
 
 pub(super) mod co_owner {
     pub const SUBMIT_SIDE: usize = 0;
@@ -272,7 +270,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                 state: SlotState::NotSubmitted {
                     inuse_slot_count: {
                         let inuse_slot_count = {
-                            let mut inner_guard = self.inner.lock().unwrap();
+                            let inner_guard = self.inner.lock().unwrap();
                             Arc::clone(&inner_guard.inuse_slot_count)
                         };
                         inuse_slot_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -452,9 +450,7 @@ impl Drop for Slot {
                 let prev = inuse_slot_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 assert!(prev > 0);
             }
-            SlotState::Pending {
-                inuse_slot_count, ..
-            } => {
+            SlotState::Pending { .. } => {
                 unreachable!("we only drop a Slot after it's been processed by the poller task")
             }
             SlotState::PendingButFutureDropped {

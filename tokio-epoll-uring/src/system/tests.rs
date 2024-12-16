@@ -5,15 +5,11 @@ use std::{
     time::Duration,
 };
 
-use futures::{stream::FuturesUnordered, StreamExt};
-use tokio::task::{unconstrained, JoinSet};
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    metrics::GlobalMetricsStorage,
-    system::{
-        test_util::{shared_system_handle::SharedSystemHandle, timerfd, FOREVER},
-    },
+    metrics::GlobalMetricsStorage, system::test_util::shared_system_handle::SharedSystemHandle,
     System,
 };
 

@@ -18,7 +18,7 @@ use crate::{
     metrics::PerSystemMetrics,
     system::{
         completion::ProcessCompletionsCause,
-        slots::{self, SlotHandle, Slots},
+        slots::{SlotHandle, Slots},
     },
 };
 
