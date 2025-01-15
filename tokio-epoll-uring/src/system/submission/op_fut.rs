@@ -18,7 +18,7 @@ use crate::{
     metrics::PerSystemMetrics,
     system::{
         completion::ProcessCompletionsCause,
-        slots::{self, SlotHandle},
+        slots::{SlotHandle, Slots},
     },
 };
 
@@ -74,15 +74,7 @@ where
 
     fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
         if open_guard.submit_raw(sqe).is_err() {
-            // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
-            // So, we could just submit_and_wait here. But, that'd prevent the
-            // current executor thread from making progress on other tasks.
-            //
-            // So, for now, keep SQ size == inflight ops size == Slots size.
-            // This potentially limits throughput if SQ size is chosen too small.
-            //
-            // FIXME: why not just async mutex?
-            unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
+            todo!("1. can this even happen? doesn't io_uring_enter ever not make room?")
         }
 
         // this allows us to keep the possible guard in cq_guard because the arc lives on stack
@@ -107,49 +99,6 @@ where
         }
     }
 
-    match slot {
-        Some(slot) => slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await,
-        None => {
-            match open_guard.slots.try_get_slot() {
-                slots::TryGetSlotResult::Draining => (
-                    op.on_failed_submission(),
-                    Err(Error::System(SystemError::SystemShuttingDown)),
-                ),
-                slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
-                    per_system_metrics
-                        .as_ref()
-                        .observe_slots_submission_queue_depth(queue_depth);
-                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
-                }
-                slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
-                    // All slots are taken and we're waiting in line.
-                    // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
-                    // This is in the hope that we'll wake ourselves up.
-
-                    per_system_metrics
-                        .as_ref()
-                        .observe_slots_submission_queue_depth(queue_depth);
-                    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
-                        // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
-                        open_guard.submitter.submit().unwrap();
-                        open_guard
-                            .completion_side
-                            .lock()
-                            .unwrap()
-                            .process_completions(ProcessCompletionsCause::Regular);
-                    }
-                    let slot = match later.await {
-                        Ok(slot) => slot,
-                        Err(_dropped) => {
-                            return (
-                                op.on_failed_submission(),
-                                Err(Error::System(SystemError::SystemShuttingDown)),
-                            )
-                        }
-                    };
-                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
-                }
-            }
-        }
-    }
+    let slot = open_guard.slots.submit_prepare(per_system_metrics);
+    Slots::submit_and_wait(slot, op, |sqe| do_submit(open_guard, sqe)).await
 }

@@ -333,9 +333,9 @@ async fn poller_impl(
             let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
             completion_side_guard.slots.transition_to_draining();
-            let pending_count = completion_side_guard.slots.pending_slot_count();
-            debug!(pending_count, "waiting for pending operations to complete");
-            if pending_count == 0 {
+            let inflight = completion_side_guard.slots.inuse_slot_count();
+            debug!(inflight, "waiting for operations to complete");
+            if inflight == 0 {
                 break;
             }
             completion_side_guard.process_completions(ProcessCompletionsCause::Shutdown);
@@ -424,10 +424,8 @@ async fn poller_impl_impl(
 
     let fd = tokio::io::unix::AsyncFd::new(uring_fd).unwrap();
     loop {
-        let mut is_timeout_wakeup;
         // See fd.read() API docs for recipe for this code block.
         loop {
-            is_timeout_wakeup = false;
             let mut guard = tokio::select! {
                 ready_res = fd.ready(tokio::io::Interest::READABLE) => {
                     ready_res.unwrap()
@@ -466,10 +464,6 @@ async fn poller_impl_impl(
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    is_timeout_wakeup = true;
-                    break;
-                }
             };
             if !guard.ready().is_readable() {
                 trace!("spurious wakeup");
@@ -481,9 +475,6 @@ async fn poller_impl_impl(
 
         let mut completion_side_guard = completion_side.lock().unwrap();
         completion_side_guard.process_completions(ProcessCompletionsCause::Regular); // todo: catch_unwind to enable orderly shutdown? or at least abort if it panics?
-        if is_timeout_wakeup {
-            completion_side_guard.slots.poller_timeout_debug_dump();
-        }
         drop(completion_side_guard);
     }
 }
@@ -603,17 +594,10 @@ mod tests {
             }
         });
 
-        let ((_, _), res) = second_rt.block_on(read_fut);
-        let err = res.expect_err("when poller signals shutdown_done, it has dropped the Slots Arc; read_fut only holds a Weak to it and will fail to upgrade");
-        assert!(
-            matches!(
-                err,
-                crate::SystemError::System(
-                    crate::system::submission::op_fut::SystemError::SystemShuttingDown
-                )
-            ),
-            "{err:?}"
-        );
+        let ((_, data), res) = second_rt.block_on(read_fut);
+        let n = res.expect("read fut was submitted, so, it should complete");
+        assert_eq!(n, 1);
+        assert_eq!(data, vec![23]);
     }
 
     #[test]
