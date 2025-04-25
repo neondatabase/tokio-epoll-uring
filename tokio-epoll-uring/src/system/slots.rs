@@ -686,6 +686,7 @@ mod tests {
             }),
             &crate::metrics::GLOBAL_STORAGE,
             Arc::new(()),
+            None,
         )
         .await
         .unwrap();
