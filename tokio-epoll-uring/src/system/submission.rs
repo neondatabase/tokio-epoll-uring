@@ -2,6 +2,7 @@ pub(crate) mod op_fut;
 
 use std::{
     ops::{Deref, DerefMut},
+    os::fd::RawFd,
     sync::{Arc, Mutex, Weak},
 };
 
@@ -16,6 +17,7 @@ use super::{
 
 pub(crate) struct SubmitSideNewArgs {
     pub(crate) id: usize,
+    pub(crate) fd: RawFd,
     pub(crate) submitter: Submitter<'static>,
     pub(crate) sq: SubmissionQueue<'static>,
     pub(crate) slots: Slots<{ slots::co_owner::SUBMIT_SIDE }>,
@@ -34,6 +36,7 @@ impl SubmitSide {
     pub(crate) fn new(args: SubmitSideNewArgs) -> SubmitSide {
         let SubmitSideNewArgs {
             id,
+            fd,
             submitter,
             sq,
             slots: ops,
@@ -44,6 +47,7 @@ impl SubmitSide {
             inner: Arc::new(tokio::sync::Mutex::new(SubmitSideInner::Open(
                 SubmitSideOpen {
                     id,
+                    fd,
                     submitter,
                     sq,
                     slots: ops,
@@ -57,6 +61,14 @@ impl SubmitSide {
 }
 
 impl SubmitSide {
+    /// SAFETY: caller must ensure that `self` remains Open while the `RawFd` lives.
+    pub(crate) async fn ring_fd(&self) -> RawFd {
+        let inner = self.inner.lock().await;
+        match &*inner {
+            SubmitSideInner::Open(open) => open.fd,
+            SubmitSideInner::ShutDownInitiated => panic!("SubmitSide is shutting down"),
+        }
+    }
     pub fn shutdown(mut self) -> impl std::future::Future<Output = ()> + Send {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let prev = self.shutdown_done_tx.replace(done_tx);
@@ -150,6 +162,7 @@ pub(crate) enum SubmitSideInner {
 pub(crate) struct SubmitSideOpen {
     #[allow(dead_code)]
     id: usize,
+    fd: RawFd,
     submitter: Submitter<'static>,
     sq: SubmissionQueue<'static>,
     slots: Slots<{ slots::co_owner::SUBMIT_SIDE }>,
