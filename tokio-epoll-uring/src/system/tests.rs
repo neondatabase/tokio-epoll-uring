@@ -638,8 +638,15 @@ fn repro_ecancelled1() {
 
             browing around a bit, timerfd_poll is called first sycnhoronusly as part of io_arm_poll_handler;
 
-            .... too deep of a rabbit hole, doesn't pay off to dig deeper; bottom line is that basically there is some kernel task that does a poll for us for file descriptors that are pollable but don't support nonblocking reads (like F_NONBLOCK)
+            anyway, this is timerfd, we don't use it in Pageserver; I assume the ECANCELLED we saw in pageserver was an ext4 write because it's a `ephemral_file_buffered_writer`
 
+           reading the kernel code for those, these also get punted, esp if
+           1. they need to allocate and to make the allocation we need to do IO to load allcoator state
+           2. we're not O_DIRECT and need to evict some other page first
+
+           If we're using O_DIRECT, then it's mostly about fallocate blocking or not. We're not doing that in pageserver (we should though)
+
+           So, it can reasonably happen.
 
          */
 }
