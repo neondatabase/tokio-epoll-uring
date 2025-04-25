@@ -334,7 +334,7 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         submitted_or_enqueued.push(rx);
         tasks.spawn(async move {
-            let fut = timerfd::read(Arc::clone(&fd), &system);
+            let fut = timerfd::must_read(Arc::clone(&fd), &system);
             let mut fut = std::pin::pin!(fut);
             tokio::select! {
                 biased; // to ensure we poll system.read() before notifying the test task
@@ -371,7 +371,7 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
     let fire_in = Duration::from_secs(1);
     let fd = timerfd::oneshot(fire_in);
     tokio::time::sleep(2 * fire_in).await;
-    let fut = timerfd::read(fd, system.clone());
+    let fut = timerfd::must_read(fd, system.clone());
     let mut fut = std::pin::pin!(fut);
     tokio::select! {
         biased; // ensure future gets queued first
@@ -414,7 +414,7 @@ async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get
     for _ in 0..RING_SIZE {
         let oneshot = timerfd::oneshot(FOREVER);
         let oneshot = Arc::new(oneshot);
-        let mut fut = Box::pin(tokio::task::unconstrained(timerfd::read(
+        let mut fut = Box::pin(tokio::task::unconstrained(timerfd::must_read(
             oneshot.clone(),
             system.clone(),
         )));
@@ -463,164 +463,183 @@ async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get
 #[test]
 fn repro_ecancelled1() {
     let timerfd_timeout = Duration::from_secs(10);
-    let timerfd_timeout = FOREVER;
     let fd = Arc::new(timerfd::oneshot(timerfd_timeout));
     let started_at = std::time::Instant::now();
     let timerfd_fires_at = started_at + timerfd_timeout;
 
-    let t1 = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(1)
-        .build()
-        .unwrap();
-
-    // Create a system on t1
-    let system = Arc::new(t1.block_on(t1.spawn(System::launch())).unwrap().unwrap());
+    let system = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Create a system on t1
+        let system = Arc::new(rt.block_on(rt.spawn(System::launch())).unwrap().unwrap());
+        // this moves the poller task to a dedicated thread
+        // That itself is not the point of this test, but, I want to isolate the reason for the ECANCELLED
+        // to the fact that the _submitting_ thread died, not some polling thread changed.
+        drop(rt);
+        system
+    })
+    .join()
+    .unwrap();
     println!("launched system");
 
-    let submission = t1.spawn({
+    let fut = std::thread::spawn({
         let system = Arc::clone(&system);
         let fd = Arc::clone(&fd);
-        async move {
-            let mut fut = Box::pin(timerfd::read(fd, system));
-            tokio::select! {
-                biased; // to ensure we poll system.read() before notifying the test task
-                _ = &mut fut => {
-                    unreachable!("timerfd only fires in far future")
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let submission = rt.spawn({
+                async move {
+                    let mut fut = Box::pin(timerfd::read(fd, system));
+                    tokio::select! {
+                        biased; // to ensure we poll system.read() before notifying the test task
+                        _ = &mut fut => {
+                            unreachable!("timerfd only fires in far future")
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
+                    }
+                    fut
                 }
-                _ = tokio::time::sleep(Duration::from_secs(2)) => { }
-            }
-            fut
+            });
+            println!("waiting for submission");
+            let fut = rt.block_on(submission).unwrap();
+            println!("submitted future");
+            // now the io_uring op is submitted from this thread
+            // kill this thread by exiting
+            return fut;
         }
-    });
+    })
+    .join()
+    .unwrap();
 
-    println!("waiting for submission");
-    let fut = t1.block_on(submission).unwrap();
-    println!("submitted future");
-    // now the io_uring op is submitted from worker thread t1
-
-    drop(t1); // this moves the poller task to a dedicated thread but that's not the point of this test
-    println!("dropped t1");
-
+    // Wait for the completion to arrive.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    println!("poll fut to completion, expecting it to return ECANCELLED");
+
+    println!("poll fut to completion from another thread, expecting it to return ECANCELLED");
     assert!(
         // Ensure that there's plenty of time left before the timerfd fires
         std::time::Instant::now() + Duration::from_secs(5) < timerfd_fires_at,
         "self-check: test is timing dependent"
     );
     let res = rt.block_on(fut);
-    dbg!(res);
-    panic!("test panicked");
+    let Err(crate::Error::Op(err)) = res else {
+        panic!("expected ECANCELLED, got {res:?}");
+    };
+    assert_eq!(err.raw_os_error(), Some(nix::libc::ECANCELED));
 
+    // explicit drop to prove that it's not happening because these here get dropped too early
     drop(system);
     drop(fd);
 
     /*
 
-    christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); }'
+        christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); }'
 
 
-    christian@neon-hetzner-dev-christian:[~/src/tokio-epoll-uring]: RUSTFLAGS="-C force-frame-pointers=yes" cargo nextest run repro_ecancelled1 --nocapture
+        christian@neon-hetzner-dev-christian:[~/src/tokio-epoll-uring]: RUSTFLAGS="-C force-frame-pointers=yes" cargo nextest run repro_ecancelled1 --nocapture
 
 
-    prints
+        prints
 
-    christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); }'
-Attaching 1 probe...
-punting
+        christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); }'
+    Attaching 1 probe...
+    punting
 
-        bpf_prog_2a8ff7a400fd9d3f_kfunc_vmlinux_io_setup_async_rw_1+581
-        bpf_prog_2a8ff7a400fd9d3f_kfunc_vmlinux_io_setup_async_rw_1+581
-        bpf_trampoline_6442501231+76
-        io_setup_async_rw+5
-        __io_read+1228
-        io_read+17
-        io_issue_sqe+102
-        io_submit_sqes+508
-        __do_sys_io_uring_enter+961
-        do_syscall_64+85
-        entry_SYSCALL_64_after_hwframe+110
-
-
-
-        7f3a094967d9 syscall+25 (/usr/lib/x86_64-linux-gnu/libc.so.6)
-        55ff5245761a io_uring::submit::Submitter::enter::h8e7418076f4e3daf+154 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff524576f9 io_uring::submit::Submitter::submit_and_wait::h0cb10fdfcf74ff57+153 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff521b4119 io_uring::submit::Submitter::submit::h174293a4e995fe83+25 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff521e300b tokio_epoll_uring::system::submission::SubmitSideOpen::submit_raw::hdbf53b2ccdf4dae0+91 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff52324a4a tokio_epoll_uring::system::submission::op_fut::execute_op::_$u7b$$u7b$closure$u7d$$u7d$::do_submit::h460469a4f26fddf9+106 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff52202131 tokio_epoll_uring::system::submission::op_fut::execute_op::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h790ec3a893ee4969+17 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff522c6908 tokio_epoll_uring::system::slots::SlotHandle::use_for_op::he96fb03d0d4dd92f+472 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff52201358 tokio_epoll_uring::system::submission::op_fut::execute_op::_$u7b$$u7b$closure$u7d$$u7d$::hf941b7df7b031edd+2056 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff521c3063 tokio_epoll_uring::system::test_util::timerfd::read::_$u7b$$u7b$closure$u7d$$u7d$::hae598cd02f16dd4c+611 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff52204e4d _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::hffd177561cdb0d6d+45 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff52204458 _$LT$$RF$mut$u20$F$u20$as$u20$core..future..future..Future$GT$::poll::h819b0895bf6d8d70+56 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff5230c171 tokio_epoll_uring::system::tests::repro_ecancelled1::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h7239074173d05ef1+433 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff5232470d _$LT$tokio..future..poll_fn..PollFn$LT$F$GT$$u20$as$u20$core..future..future..Future$GT$::poll::hc2f7b658bf8b95c1+29 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff5230be7c tokio_epoll_uring::system::tests::repro_ecancelled1::_$u7b$$u7b$closure$u7d$$u7d$::h19d2bd1bc6aca8c0+860 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff52234901 tokio::runtime::task::core::Core$LT$T$C$S$GT$::poll::_$u7b$$u7b$closure$u7d$$u7d$::h3dcc966053b03442+129 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff5224c659 tokio::loom::std::unsafe_cell::UnsafeCell$LT$T$GT$::with_mut::hf6adee37fa99ff16+89 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
-        55ff52233832 tokio::runtime::task::core::Core$LT$T$C$S$GT$::poll::hcec0f2b32d3bbda4+34 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            bpf_prog_2a8ff7a400fd9d3f_kfunc_vmlinux_io_setup_async_rw_1+581
+            bpf_prog_2a8ff7a400fd9d3f_kfunc_vmlinux_io_setup_async_rw_1+581
+            bpf_trampoline_6442501231+76
+            io_setup_async_rw+5
+            __io_read+1228
+            io_read+17
+            io_issue_sqe+102
+            io_submit_sqes+508
+            __do_sys_io_uring_enter+961
+            do_syscall_64+85
+            entry_SYSCALL_64_after_hwframe+110
 
 
-        The kernel code that is punting to an async worker is
 
-        	if (force_nonblock) {
-		/* If the file doesn't support async, just async punt */
-		if (unlikely(!io_file_supports_nowait(req))) {
-			ret = io_setup_async_rw(req, iovec, s, true);
-			return ret ?: -EAGAIN;
-		}
+            7f3a094967d9 syscall+25 (/usr/lib/x86_64-linux-gnu/libc.so.6)
+            55ff5245761a io_uring::submit::Submitter::enter::h8e7418076f4e3daf+154 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff524576f9 io_uring::submit::Submitter::submit_and_wait::h0cb10fdfcf74ff57+153 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff521b4119 io_uring::submit::Submitter::submit::h174293a4e995fe83+25 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff521e300b tokio_epoll_uring::system::submission::SubmitSideOpen::submit_raw::hdbf53b2ccdf4dae0+91 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff52324a4a tokio_epoll_uring::system::submission::op_fut::execute_op::_$u7b$$u7b$closure$u7d$$u7d$::do_submit::h460469a4f26fddf9+106 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff52202131 tokio_epoll_uring::system::submission::op_fut::execute_op::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h790ec3a893ee4969+17 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff522c6908 tokio_epoll_uring::system::slots::SlotHandle::use_for_op::he96fb03d0d4dd92f+472 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff52201358 tokio_epoll_uring::system::submission::op_fut::execute_op::_$u7b$$u7b$closure$u7d$$u7d$::hf941b7df7b031edd+2056 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff521c3063 tokio_epoll_uring::system::test_util::timerfd::read::_$u7b$$u7b$closure$u7d$$u7d$::hae598cd02f16dd4c+611 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff52204e4d _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::hffd177561cdb0d6d+45 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff52204458 _$LT$$RF$mut$u20$F$u20$as$u20$core..future..future..Future$GT$::poll::h819b0895bf6d8d70+56 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff5230c171 tokio_epoll_uring::system::tests::repro_ecancelled1::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h7239074173d05ef1+433 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff5232470d _$LT$tokio..future..poll_fn..PollFn$LT$F$GT$$u20$as$u20$core..future..future..Future$GT$::poll::hc2f7b658bf8b95c1+29 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff5230be7c tokio_epoll_uring::system::tests::repro_ecancelled1::_$u7b$$u7b$closure$u7d$$u7d$::h19d2bd1bc6aca8c0+860 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff52234901 tokio::runtime::task::core::Core$LT$T$C$S$GT$::poll::_$u7b$$u7b$closure$u7d$$u7d$::h3dcc966053b03442+129 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff5224c659 tokio::loom::std::unsafe_cell::UnsafeCell$LT$T$GT$::with_mut::hf6adee37fa99ff16+89 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
+            55ff52233832 tokio::runtime::task::core::Core$LT$T$C$S$GT$::poll::hcec0f2b32d3bbda4+34 (/home/christian/src/tokio-epoll-uring/target/debug/deps/tokio_epoll_uring-2bef0c28c90241cb)
 
-        the io_setup_async_rw is then dispatching to
-        		.prep_async		= io_readv_prep_async,
 
-        that function returns ... TODO
+            The kernel code that is punting to an async worker is
 
-        we come back, return from thi; io_read is just one of many psosible .issue functions; this is where we end up in io_issue_sqe
+                if (force_nonblock) {
+            /* If the file doesn't support async, just async punt */
+            if (unlikely(!io_file_supports_nowait(req))) {
+                ret = io_setup_async_rw(req, iovec, s, true);
+                return ret ?: -EAGAIN;
+            }
 
-        	ret = def->issue(req, issue_flags);
+            the io_setup_async_rw is then dispatching to
+                    .prep_async		= io_readv_prep_async,
 
-        I think the commen case is that io_setup_async_rw returns 0 and so we return -EAGAIN
+            that function returns ... TODO
 
-        christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); } kretfunc:io_read { printf("returning from io_read value %d\n", retval); }'
+            we come back, return from thi; io_read is just one of many psosible .issue functions; this is where we end up in io_issue_sqe
 
-        Yep, it prints
-        returning from io_read value -11
+                ret = def->issue(req, issue_flags);
 
-        ok, but -EAGAIN isn't handled specially by io_issue_sqe, (it's not IOU_OK) and so we return 0 fro io_issue_sqe
+            I think the commen case is that io_setup_async_rw returns 0 and so we return -EAGAIN
 
-        go one step up to io_queue_sqe, and I think we call io_queue_async
+            christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); } kretfunc:io_read { printf("returning from io_read value %d\n", retval); }'
 
-        christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); } kretfunc:io_read { printf("returning from io_read value %d\n", retval); } kfunc:io_queue_async { printf("%s\n", probe); }'
+            Yep, it prints
+            returning from io_read value -11
 
-        yep, prints
+            ok, but -EAGAIN isn't handled specially by io_issue_sqe, (it's not IOU_OK) and so we return 0 fro io_issue_sqe
+
+            go one step up to io_queue_sqe, and I think we call io_queue_async
+
+            christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); } kretfunc:io_read { printf("returning from io_read value %d\n", retval); } kfunc:io_queue_async { printf("%s\n", probe); }'
+
+            yep, prints
+                returning from io_read value -11
+                kfunc:vmlinux:io_queue_async
+
+            we can ignore the linking stuff; what does io_arm_poll_handler return?
+
+            christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); } kretfunc:io_read { printf("returning from io_read value %d\n", retval); } kfunc:io_queue_async { printf("%s\n", probe); } kretprobe:io_arm_poll_handler{ printf("%s returns %d\n", probe, retval); }'
+
             returning from io_read value -11
             kfunc:vmlinux:io_queue_async
+            kretprobe:io_arm_poll_handler returns 0
 
-        we can ignore the linking stuff; what does io_arm_poll_handler return?
+            that is  IO_APOLL_OK, ok, when does it return that? on the happy path only great
 
-        christian@neon-hetzner-dev-christian:[~/ext/linux]: sudo bpftrace -e 'kfunc:io_setup_async_rw { printf("punting\n%s\n\n%s\n\n", kstack(),ustack(perf)); } kretfunc:io_read { printf("returning from io_read value %d\n", retval); } kfunc:io_queue_async { printf("%s\n", probe); } kretprobe:io_arm_poll_handler{ printf("%s returns %d\n", probe, retval); }'
+            my gist of that function is that the file_operations->pol function will be used somehow
 
-        returning from io_read value -11
-        kfunc:vmlinux:io_queue_async
-        kretprobe:io_arm_poll_handler returns 0
+                .poll		= timerfd_poll,
 
-        that is  IO_APOLL_OK, ok, when does it return that? on the happy path only great
+            browing around a bit, timerfd_poll is called first sycnhoronusly as part of io_arm_poll_handler;
 
-        my gist of that function is that the file_operations->pol function will be used somehow
-
-        	.poll		= timerfd_poll,
-
-        browing around a bit, timerfd_poll is called first sycnhoronusly as part of io_arm_poll_handler;
-
-        .... too deep of a rabbit hole, doesn't pay off to dig deeper; bottom line is that basically there is some kernel task that does a poll for us for file descriptors that are pollable but don't support nonblocking reads (like F_NONBLOCK)
+            .... too deep of a rabbit hole, doesn't pay off to dig deeper; bottom line is that basically there is some kernel task that does a poll for us for file descriptors that are pollable but don't support nonblocking reads (like F_NONBLOCK)
 
 
-     */
-
+         */
 }
