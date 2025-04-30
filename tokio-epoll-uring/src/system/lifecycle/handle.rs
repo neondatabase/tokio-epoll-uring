@@ -260,7 +260,14 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
         ),
     > {
-        let op = WriteOp { file, offset, buf };
+        let op = WriteOp {
+            file,
+            offset,
+            buf,
+            system_id: self.inner.as_ref().unwrap().id,
+            thread_id: std::thread::current().id(),
+            thread_name: std::thread::current().name().map(|n| n.to_owned()),
+        };
         let inner = self.inner.as_ref().unwrap();
         execute_op(
             op,

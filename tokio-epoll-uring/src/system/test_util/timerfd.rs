@@ -10,6 +10,7 @@ use nix::sys::timerfd::Expiration;
 
 use nix::sys::timerfd::TimerFlags;
 
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use crate::SystemHandle;
@@ -49,6 +50,12 @@ impl IoFd for TimerFd {
     // Safety: we own the timerfd, so, as per the trait definition, we're allowed to return the fd.
     unsafe fn as_fd(&self) -> i32 {
         use std::os::fd::AsRawFd;
+        self.timerfd.as_raw_fd()
+    }
+}
+
+impl AsRawFd for TimerFd {
+    fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
         self.timerfd.as_raw_fd()
     }
 }

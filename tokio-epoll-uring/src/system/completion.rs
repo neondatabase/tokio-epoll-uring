@@ -1,8 +1,11 @@
 use std::{
+    future::{poll_fn, Future},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use futures::FutureExt;
 use io_uring::CompletionQueue;
 use tokio::sync::{self, broadcast, mpsc, oneshot};
 use tracing::{debug, info, info_span, trace, Instrument};
@@ -263,6 +266,22 @@ async fn poller_task(
 }
 
 async fn poller_impl(
+    poller: Arc<Mutex<Poller>>,
+    preempt_in_epoll: Option<sync::broadcast::Receiver<mpsc::UnboundedSender<()>>>,
+    shutdown_loop_reached: Option<tokio::sync::mpsc::UnboundedSender<Arc<Mutex<Poller>>>>,
+) {
+    let mut fut = Box::pin(poller_impl0(
+        Arc::clone(&poller),
+        preempt_in_epoll,
+        shutdown_loop_reached,
+    ));
+    poll_fn(|cx| {
+        info!(thread_id=?std::thread::current().id(), name=?std::thread::current().name(), "poller_impl future being polled");
+        fut.as_mut().poll(cx)
+    }).await
+}
+
+async fn poller_impl0(
     poller: Arc<Mutex<Poller>>,
     preempt_in_epoll: Option<sync::broadcast::Receiver<mpsc::UnboundedSender<()>>>,
     shutdown_loop_reached: Option<tokio::sync::mpsc::UnboundedSender<Arc<Mutex<Poller>>>>,

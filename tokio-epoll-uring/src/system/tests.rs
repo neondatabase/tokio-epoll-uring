@@ -1,13 +1,20 @@
 use std::{
     io::Write,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::fs::OpenOptionsExt,
+    },
     sync::Arc,
     time::Duration,
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
+use nix::libc::O_DIRECT;
+use rand::Rng;
+use tempfile::NamedTempFile;
 use tokio::task::{unconstrained, JoinSet};
 use tokio_util::sync::CancellationToken;
+use uring_common::io_fd::IoFd;
 
 use crate::{
     metrics::GlobalMetricsStorage,
@@ -649,4 +656,134 @@ fn repro_ecancelled1() {
            So, it can reasonably happen.
 
          */
+}
+
+// Close fd after io_uring op is in flight.
+// This test fails, i.e., no ECANCELED, but Ok(())
+#[tokio::test]
+async fn repro_ecancelled2() {
+    let system = Arc::new(System::launch().await.unwrap());
+
+    let fd = Arc::new(timerfd::oneshot(Duration::from_secs(5)));
+
+    let task = tokio::spawn({
+        let fd = Arc::clone(&fd);
+        let system = Arc::clone(&system);
+        async move { timerfd::read(fd, system).await }
+    });
+
+    // Make sure the operation is submitted
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Prevent the fd from getting double-closed on drop.
+    let leaked = Arc::into_raw(fd);
+    // SAFETY: double-close won't happen because of the leak in the previous line.
+    nix::unistd::close(unsafe { &*leaked }.as_raw_fd()).unwrap();
+
+    let res = task.await.unwrap();
+    let Err(crate::Error::Op(err)) = res else {
+        panic!("expected ECANCELLED, got {res:?}");
+    };
+    assert_eq!(err.raw_os_error(), Some(nix::libc::ECANCELED));
+
+    // explicit drop to make sure the ECANCELED is not due to early system shutdown or whatever
+    drop(system);
+}
+
+// Already closed fd submitted to io_uring.
+// This test fails, i.e., no ECANCELLED, but "Bad file descriptor" error.
+#[tokio::test]
+async fn repro_ecancelled3() {
+    let system = Arc::new(System::launch().await.unwrap());
+
+    struct ClosedFd(RawFd);
+    impl IoFd for ClosedFd {
+        unsafe fn as_fd(&self) -> RawFd {
+            self.0
+        }
+    }
+    let closed_fd = {
+        let fd = timerfd::oneshot(Duration::from_secs(5));
+        let raw = fd.as_raw_fd();
+        drop(fd);
+        ClosedFd(raw)
+    };
+    let (_, res) = system.fsync(closed_fd).await;
+    let Err(crate::Error::Op(err)) = res else {
+        panic!("expected ECANCELLED, got {res:?}");
+    };
+    println!("err: {err:?}");
+    assert_eq!(err.raw_os_error(), Some(nix::libc::ECANCELED));
+
+    // explicit drop to make sure the ECANCELED is not due to early system shutdown or whatever
+    drop(system);
+}
+
+// Close fd while io_uring after we punted before op starts executing.
+// This needs to run a lot of times to hit the condition.
+// Use O_DIRECT to force punting (extending a file without previously fallocat'ing guarantees punting)
+//
+// Never hit it.
+#[test]
+fn repro_ecancelled4() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let system = Arc::new(System::launch().await.unwrap());
+
+        loop {
+            let path = tempfile::NamedTempFile::new_in(std::env::current_dir().unwrap())
+                .unwrap()
+                .into_temp_path();
+
+            let fd: Arc<OwnedFd> = Arc::new(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(O_DIRECT)
+                    .open(path)
+                    .unwrap()
+                    .into(),
+            );
+
+            let task = tokio::spawn({
+                let fd = Arc::clone(&fd);
+                let system = Arc::clone(&system);
+                let buf = unsafe {
+                    std::alloc::alloc(std::alloc::Layout::from_size_align(4096, 4096).unwrap())
+                };
+                if buf.is_null() {
+                    panic!("failed to allocate buffer");
+                }
+                let mut buf = unsafe { Vec::from_raw_parts(buf, 4096, 4096) };
+                buf.fill(1);
+                async move { system.write(fd, 0, buf).await }
+            });
+
+            for i in 0..rand::rng().random_range(0..10_000) {
+                tokio::task::yield_now().await;
+            }
+
+            // Prevent the fd from getting double-closed on drop.
+            let leaked = Arc::into_raw(fd);
+            // SAFETY: double-close won't happen because of the leak in the previous line.
+            nix::unistd::close(unsafe { &*leaked }.as_raw_fd()).unwrap();
+
+            let (_, res) = task.await.unwrap();
+            let Err(crate::Error::Op(err)) = res else {
+                continue;
+            };
+            // println!("err: {err:?}");
+            if err.raw_os_error().unwrap() == nix::libc::EBADF {
+                continue;
+            }
+            assert_eq!(err.raw_os_error().unwrap(), nix::libc::ECANCELED);
+        }
+
+        // explicit drop to make sure the ECANCELED is not due to early system shutdown or whatever
+        drop(system);
+    });
 }
