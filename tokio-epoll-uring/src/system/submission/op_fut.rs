@@ -10,6 +10,7 @@ pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
     fn on_failed_submission(self) -> Self::Resources;
     fn on_op_completion(self, res: i32) -> (Self::Resources, Result<Self::Success, Self::Error>);
     fn make_sqe(&mut self) -> io_uring::squeue::Entry;
+    fn record_submission(&mut self) {} 
 }
 
 use uring_common::io_uring;

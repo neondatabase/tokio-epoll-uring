@@ -10,6 +10,7 @@ use nix::sys::timerfd::Expiration;
 
 use nix::sys::timerfd::TimerFlags;
 
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use crate::SystemHandle;
@@ -53,15 +54,31 @@ impl IoFd for TimerFd {
     }
 }
 
-pub async fn read<T>(fd: impl IoFd + Send, system: T)
+impl AsRawFd for TimerFd {
+    fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
+        self.timerfd.as_raw_fd()
+    }
+}
+
+pub async fn must_read<T>(fd: impl IoFd + Send, system: T)
+where
+    T: AsRef<SystemHandle>,
+{
+    read(fd, system).await.unwrap()
+}
+
+pub async fn read<T>(fd: impl IoFd + Send, system: T) -> Result<(), crate::Error<std::io::Error>>
 where
     T: AsRef<SystemHandle>,
 {
     let value = vec![0u8; 8];
     let ((_, value), res) = system.as_ref().read(fd, 0, value).await;
-    let n: usize = res.unwrap();
+    let n = res?;
+
     assert_eq!(n, 8);
     let mut value = bytes::Bytes::from(value);
     assert_ne!(value.get_u64_ne(), 0);
     assert!(value.is_empty());
+
+    Ok(())
 }

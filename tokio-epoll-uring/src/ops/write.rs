@@ -12,6 +12,9 @@ where
     pub(crate) file: F,
     pub(crate) offset: u64,
     pub(crate) buf: B,
+    pub(crate) system_id: usize,
+    pub(crate) thread_id: std::thread::ThreadId,
+    pub(crate) thread_name: Option<String>,
 }
 
 impl<F, B> crate::sealed::Sealed for WriteOp<F, B>
@@ -54,10 +57,20 @@ where
     fn on_op_completion(self, res: i32) -> (Self::Resources, Result<Self::Success, Self::Error>) {
         // https://man.archlinux.org/man/extra/liburing/io_uring_prep_write.3.en
         let res = if res < 0 {
+            if -res == nix::libc::ECANCELED {
+                tracing::warn!(%self.system_id, sub_thread_id=?self.thread_id, sub_thread_name=?self.thread_name, cur_thread_id=?std::thread::current().id(), cur_thread_name=?std::thread::current().name(), "ECANCELED returned, this is unexpected")
+            }
             Err(std::io::Error::from_raw_os_error(-res))
         } else {
             Ok(res as usize)
         };
         ((self.file, self.buf), res)
+    }
+
+    fn record_submission(&mut self) {
+        let cur = std::thread::current();
+        if self.thread_id != cur.id() {
+            tracing::warn!(%self.system_id, sub_thread_id=?self.thread_id, sub_thread_name=?self.thread_name, cur_thread_id=?cur.id(), cur_thread_name=?cur.name(), "thread id changed during submission");
+        }
     }
 }

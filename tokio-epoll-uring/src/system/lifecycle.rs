@@ -99,17 +99,19 @@ impl System {
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
     pub async fn launch() -> Result<SystemHandle, LaunchResult> {
-        Self::launch_with_metrics(Arc::new(())).await
+        Self::launch_with_metrics(Arc::new(()), SYSTEM_ID.fetch_add(1, Ordering::Relaxed)).await
     }
 
     /// Like [`Self::launch`], but allows to pass in a [`PerSystemMetrics`] implementation.
     pub async fn launch_with_metrics<M>(
         per_system_metrics: Arc<M>,
+        id: usize,
     ) -> Result<SystemHandle<M>, LaunchResult>
     where
         M: PerSystemMetrics,
     {
         Self::launch_with_testing(
+            id,
             None,
             None,
             &crate::metrics::GLOBAL_STORAGE,
@@ -119,6 +121,7 @@ impl System {
     }
 
     pub(crate) async fn launch_with_testing<M>(
+        id: usize,
         poller_testing: Option<PollerTesting>,
         slots_testing: Option<SlotsTesting>,
         global_metrics_storage: &'static GlobalMetricsStorage,
@@ -127,8 +130,6 @@ impl System {
     where
         M: PerSystemMetrics,
     {
-        let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         let (submit_side, poller_ready_fut) = {
             // TODO: should we mlock `slots`? io_uring mmap is mlocked, slots are equally important for the system to function;
             let (slots_submit_side, slots_completion_side, slots_poller) =

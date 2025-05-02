@@ -473,6 +473,7 @@ impl SlotHandle {
             });
         };
 
+        op.record_submission();
         do_submit(sqe);
 
         futures::future::Either::Right(self.wait_for_completion(op))
