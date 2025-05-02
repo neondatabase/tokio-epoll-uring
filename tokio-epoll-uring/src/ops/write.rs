@@ -66,4 +66,11 @@ where
         };
         ((self.file, self.buf), res)
     }
+
+    fn record_submission(&mut self) {
+        let cur = std::thread::current();
+        if self.thread_id != cur.id() {
+            tracing::warn!(%self.system_id, sub_thread_id=?self.thread_id, sub_thread_name=?self.thread_name, cur_thread_id=?cur.id(), cur_thread_name=?cur.name(), "thread id changed during submission");
+        }
+    }
 }
