@@ -273,16 +273,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         )
     }
 
-    pub async fn ftruncate<F: IoFd + Send>(
-        &self,
-        file: F,
-        len: u64,
-    ) -> (
-        F,
-        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
-    ) {
-        self.fallocate(file, 0, len, 0).await
-    }
     pub async fn fallocate<F: IoFd + Send>(
         &self,
         file: F,
