@@ -312,6 +312,52 @@ async fn test_write() {
     drop(fd);
 }
 
+#[tokio::test]
+async fn test_fallocate() {
+    use nix::fcntl::FallocateFlags;
+
+    let system = System::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let file_path = tempdir.path().join("fallocate_file");
+    let std_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&file_path)
+        .unwrap();
+    let fd = OwnedFd::from(std_file);
+
+    let ((fd, _), res) = system.fallocate(fd, 0, 1024, FallocateFlags::empty()).await;
+    res.unwrap();
+
+    let metadata = std::fs::metadata(&file_path).unwrap();
+    assert_eq!(metadata.len(), 1024);
+
+    let file_path = tempdir.path().join("fallocate_keep_size");
+    let std_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&file_path)
+        .unwrap();
+    let fd = OwnedFd::from(std_file);
+
+    std::fs::write(&file_path, "test").unwrap();
+    let initial_size = std::fs::metadata(&file_path).unwrap().len();
+
+    let ((fd, _), res) = system
+        .fallocate(fd, 0, 1024, FallocateFlags::KEEP_SIZE)
+        .await;
+    res.unwrap();
+
+    let metadata = std::fs::metadata(&file_path).unwrap();
+    assert_eq!(metadata.len(), initial_size);
+
+    drop(fd);
+}
+
 /// Scenario: More tasks than slots; each tasks `.await`s one operation at a time.
 ///
 /// NB: In this test, we use the pattern of `select! { ..., sleep(2 seconds) }` to drive op futures

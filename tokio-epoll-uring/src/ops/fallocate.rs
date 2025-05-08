@@ -1,21 +1,12 @@
 use std::os::fd::AsRawFd;
 
+use nix::fcntl::FallocateFlags;
 use uring_common::{
     io_fd::IoFd,
     io_uring::{self},
 };
 
 use crate::system::submission::op_fut::Op;
-
-pub mod mode {
-    pub const ALLOCATE: i32 = 0x00;
-    pub const KEEP_SIZE: i32 = 0x01;
-    pub const PUNCH_HOLE: i32 = 0x02;
-    pub const COLLAPSE_RANGE: i32 = 0x08;
-    pub const ZERO_RANGE: i32 = 0x10;
-    pub const INSERT_RANGE: i32 = 0x20;
-    pub const UNSHARE_RANGE: i32 = 0x40;
-}
 
 pub struct FallocateOp<F>
 where
@@ -24,7 +15,7 @@ where
     pub(crate) file: F,
     pub(crate) offset: u64,
     pub(crate) len: u64,
-    pub(crate) mode: i32,
+    pub(crate) mode: FallocateFlags,
 }
 
 impl<F> crate::sealed::Sealed for FallocateOp<F> where F: IoFd + Send {}
@@ -50,7 +41,7 @@ where
             self.len,
         )
         .offset(self.offset)
-        .mode(self.mode)
+        .mode(self.mode.bits())
         .build()
     }
 

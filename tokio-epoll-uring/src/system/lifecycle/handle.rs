@@ -278,7 +278,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         file: F,
         offset: u64,
         len: u64,
-        mode: i32,
+        mode: nix::fcntl::FallocateFlags,
     ) -> (
         F,
         Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,

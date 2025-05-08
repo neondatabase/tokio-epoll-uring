@@ -78,7 +78,7 @@ pub mod ops;
 mod system;
 
 #[cfg(target_os = "linux")]
-pub use ops::fallocate::{mode as fallocate_mode, FallocateOp};
+pub use ops::fallocate::FallocateOp;
 
 #[cfg(target_os = "linux")]
 pub use {
