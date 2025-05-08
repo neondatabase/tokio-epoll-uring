@@ -50,6 +50,7 @@ where
     }
 
     fn on_op_completion(self, res: i32) -> (Self::Resources, Result<Self::Success, Self::Error>) {
+        // https://man.archlinux.org/man/extra/liburing/io_uring_prep_fallocate.3.en
         let res = if res < 0 {
             Err(std::io::Error::from_raw_os_error(-res))
         } else {
