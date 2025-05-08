@@ -78,6 +78,9 @@ pub mod ops;
 mod system;
 
 #[cfg(target_os = "linux")]
+pub use ops::ftruncate::FtruncateOp;
+
+#[cfg(target_os = "linux")]
 pub use {
     crate::system::submission::op_fut::Error,
     system::lifecycle::handle::SystemHandle,

@@ -9,7 +9,7 @@ use uring_common::{
 
 use crate::{
     metrics::PerSystemMetrics,
-    ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx, write::WriteOp},
+    ops::{fsync::FsyncOp, ftruncate::FtruncateOp, open_at::OpenAtOp, read::ReadOp, statx, write::WriteOp},
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -268,5 +268,24 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             None,
             Arc::clone(&inner.per_system_metrics),
         )
+    }
+
+    pub async fn ftruncate<F: IoFd + Send>(
+        &self,
+        file: F,
+        len: u64,
+    ) -> (
+        F,
+        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+    ) {
+        let op = FtruncateOp { file, len };
+        let inner = self.inner.as_ref().unwrap();
+        execute_op(
+            op,
+            inner.submit_side.weak(),
+            None,
+            Arc::clone(&inner.per_system_metrics),
+        )
+        .await
     }
 }
