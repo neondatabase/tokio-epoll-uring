@@ -9,7 +9,10 @@ use uring_common::{
 
 use crate::{
     metrics::PerSystemMetrics,
-    ops::{fsync::FsyncOp, ftruncate::FtruncateOp, open_at::OpenAtOp, read::ReadOp, statx, write::WriteOp},
+    ops::{
+        fallocate::FallocateOp, fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx,
+        write::WriteOp,
+    },
     system::submission::{op_fut::execute_op, SubmitSide},
 };
 
@@ -278,7 +281,24 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         F,
         Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
     ) {
-        let op = FtruncateOp { file, len };
+        self.fallocate(file, 0, len, 0).await
+    }
+    pub async fn fallocate<F: IoFd + Send>(
+        &self,
+        file: F,
+        offset: u64,
+        len: u64,
+        mode: i32,
+    ) -> (
+        F,
+        Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
+    ) {
+        let op = FallocateOp {
+            file,
+            offset,
+            len,
+            mode,
+        };
         let inner = self.inner.as_ref().unwrap();
         execute_op(
             op,

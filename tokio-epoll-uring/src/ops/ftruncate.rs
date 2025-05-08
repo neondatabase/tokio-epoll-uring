@@ -1,11 +1,6 @@
-use std::os::fd::AsRawFd;
+use uring_common::io_fd::IoFd;
 
-use uring_common::{
-    io_fd::IoFd,
-    io_uring::{self},
-};
-
-use crate::system::submission::op_fut::Op;
+use crate::{ops::fallocate::FallocateOp, system::submission::op_fut::Op};
 
 pub struct FtruncateOp<F>
 where
@@ -17,6 +12,20 @@ where
 
 impl<F> crate::sealed::Sealed for FtruncateOp<F> where F: IoFd + Send {}
 
+impl<F> From<FtruncateOp<F>> for FallocateOp<F>
+where
+    F: IoFd + Send,
+{
+    fn from(op: FtruncateOp<F>) -> Self {
+        FallocateOp {
+            file: op.file,
+            offset: 0,
+            len: op.len,
+            mode: 0, // 0 means regular fallocate, which is equivalent to ftruncate
+        }
+    }
+}
+
 impl<F> Op for FtruncateOp<F>
 where
     F: IoFd + Send,
@@ -25,20 +34,17 @@ where
     type Success = ();
     type Error = std::io::Error;
 
-    fn make_sqe(&mut self) -> io_uring::squeue::Entry {
-        io_uring::opcode::Fallocate::new(
-            io_uring::types::Fd(
-                // SAFETY: we hold `F` in self, and if `self` is dropped, we hand the fd to the
-                // `System` to keep it live until the operation completes.
-                #[allow(unused_unsafe)]
-                unsafe {
-                    self.file.as_fd().as_raw_fd()
-                },
-            ),
-            self.len,
-        )
-        .mode(0) // 0 means regular fallocate, which is equivalent to ftruncate
-        .build()
+    fn make_sqe(&mut self) -> uring_common::io_uring::squeue::Entry {
+        let mut fallocate_op = FallocateOp {
+            file: unsafe { std::ptr::read(&self.file) }, // Read without dropping
+            offset: 0,
+            len: self.len,
+            mode: 0,
+        };
+
+        std::mem::forget(unsafe { std::ptr::read(&self.file) });
+
+        fallocate_op.make_sqe()
     }
 
     fn on_failed_submission(self) -> Self::Resources {

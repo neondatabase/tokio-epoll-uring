@@ -78,6 +78,8 @@ pub mod ops;
 mod system;
 
 #[cfg(target_os = "linux")]
+pub use ops::fallocate::{mode as fallocate_mode, FallocateOp};
+#[cfg(target_os = "linux")]
 pub use ops::ftruncate::FtruncateOp;
 
 #[cfg(target_os = "linux")]
