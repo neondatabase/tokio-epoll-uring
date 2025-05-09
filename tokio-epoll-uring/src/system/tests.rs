@@ -279,6 +279,56 @@ async fn test_statx() {
 }
 
 #[tokio::test]
+async fn test_ftruncate() {
+    let system = System::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let file_path = tempdir.path().join("some_file");
+    let content = b"some content that will be truncated";
+    std::fs::write(&file_path, content).unwrap();
+
+    let std_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+    let fd = OwnedFd::from(std_file);
+
+    let (fd, res) = system.statx(fd).await;
+    let stat = res.expect("we know it exists");
+    assert_eq!(content.len() as u64, stat.stx_size);
+
+    let truncate_size = 4;
+    let (fd, res) = system.ftruncate(fd, truncate_size).await;
+    res.unwrap();
+
+    let md = file_path.metadata().unwrap();
+    assert_eq!(truncate_size, md.len());
+
+    let truncated_content = std::fs::read(&file_path).unwrap();
+    assert_eq!(&content[0..truncate_size as usize], &truncated_content[..]);
+
+    let expand_size = content.len() as u64 + 10;
+    let (fd, res) = system.ftruncate(fd, expand_size).await;
+    res.unwrap();
+
+    let md = file_path.metadata().unwrap();
+    assert_eq!(expand_size, md.len());
+
+    let expanded_content = std::fs::read(&file_path).unwrap();
+    assert_eq!(
+        &content[0..truncate_size as usize],
+        &expanded_content[0..truncate_size as usize]
+    );
+    assert!(expanded_content[truncate_size as usize..]
+        .iter()
+        .all(|&b| b == 0));
+
+    drop(fd);
+}
+
+#[tokio::test]
 async fn test_write() {
     let system = System::launch().await.unwrap();
 
