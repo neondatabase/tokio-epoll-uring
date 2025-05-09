@@ -78,9 +78,6 @@ pub mod ops;
 mod system;
 
 #[cfg(target_os = "linux")]
-pub use ops::fallocate::FallocateOp;
-
-#[cfg(target_os = "linux")]
 pub use {
     crate::system::submission::op_fut::Error,
     system::lifecycle::handle::SystemHandle,
@@ -92,6 +89,7 @@ pub use {
 
 pub use uring_common::buf::{BoundedBuf, BoundedBufMut, IoBuf, IoBufMut, Slice};
 pub use uring_common::io_fd::IoFd;
+pub use nix::fcntl::FallocateFlags;
 
 pub(crate) mod util;
 
