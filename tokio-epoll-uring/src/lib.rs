@@ -89,6 +89,7 @@ pub use {
 
 pub use uring_common::buf::{BoundedBuf, BoundedBufMut, IoBuf, IoBufMut, Slice};
 pub use uring_common::io_fd::IoFd;
+pub use nix::fcntl::FallocateFlags;
 
 pub(crate) mod util;
 

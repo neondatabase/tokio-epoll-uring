@@ -1,6 +1,9 @@
 use std::{
     io::Write,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::MetadataExt,
+    },
     sync::Arc,
     time::Duration,
 };
@@ -307,6 +310,58 @@ async fn test_write() {
             expect
         },
         std::fs::read(&file_path).unwrap()
+    );
+
+    drop(fd);
+}
+
+#[tokio::test]
+async fn test_fallocate() {
+    use nix::fcntl::FallocateFlags;
+
+    let system = System::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let file_path = tempdir.path().join("fallocate_file");
+    let std_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&file_path)
+        .unwrap();
+    let fd = OwnedFd::from(std_file);
+
+    let md = file_path.metadata().unwrap();
+    assert_eq!(md.len(), 0);
+    assert_eq!(md.blksize() * md.blocks(), 0);
+
+    let (fd, res) = system.fallocate(fd, FallocateFlags::empty(), 0, 4096).await;
+    res.unwrap();
+
+    let md = file_path.metadata().unwrap();
+    assert_eq!(md.len(), 4096);
+
+    let (fd, res) = system
+        .fallocate(
+            fd,
+            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            0,
+            4096,
+        )
+        .await;
+    res.unwrap();
+
+    let md = file_path.metadata().unwrap();
+    assert_eq!(
+        md.len(),
+        4096,
+        "punching hole should does not change file size"
+    );
+    assert_eq!(
+        md.blksize() * md.blocks(),
+        0,
+        "we punched out all blocks, so no blocks should be allocated"
     );
 
     drop(fd);
