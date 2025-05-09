@@ -1,6 +1,9 @@
 use std::{
     io::Write,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::MetadataExt,
+    },
     sync::Arc,
     time::Duration,
 };
@@ -329,31 +332,37 @@ async fn test_fallocate() {
         .unwrap();
     let fd = OwnedFd::from(std_file);
 
-    let ((fd, _), res) = system.fallocate(fd, 0, 1024, FallocateFlags::empty()).await;
+    let md = file_path.metadata().unwrap();
+    assert_eq!(md.len(), 0);
+    assert_eq!(md.blksize() * md.blocks(), 0);
+
+    let (fd, res) = system.fallocate(fd, FallocateFlags::empty(), 0, 4096).await;
     res.unwrap();
 
-    let metadata = std::fs::metadata(&file_path).unwrap();
-    assert_eq!(metadata.len(), 1024);
+    let md = file_path.metadata().unwrap();
+    assert_eq!(md.len(), 4096);
 
-    let file_path = tempdir.path().join("fallocate_keep_size");
-    let std_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&file_path)
-        .unwrap();
-    let fd = OwnedFd::from(std_file);
-
-    std::fs::write(&file_path, "test").unwrap();
-    let initial_size = std::fs::metadata(&file_path).unwrap().len();
-
-    let ((fd, _), res) = system
-        .fallocate(fd, 0, 1024, FallocateFlags::KEEP_SIZE)
+    let (fd, res) = system
+        .fallocate(
+            fd,
+            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            0,
+            4096,
+        )
         .await;
     res.unwrap();
 
-    let metadata = std::fs::metadata(&file_path).unwrap();
-    assert_eq!(metadata.len(), initial_size);
+    let md = file_path.metadata().unwrap();
+    assert_eq!(
+        md.len(),
+        4096,
+        "punching hole should does not change file size"
+    );
+    assert_eq!(
+        md.blksize() * md.blocks(),
+        0,
+        "we punched out all blocks, so no blocks should be allocated"
+    );
 
     drop(fd);
 }

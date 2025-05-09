@@ -13,9 +13,9 @@ where
     F: IoFd + Send,
 {
     pub(crate) file: F,
+    pub(crate) mode: FallocateFlags,
     pub(crate) offset: u64,
     pub(crate) len: u64,
-    pub(crate) mode: FallocateFlags,
 }
 
 impl<F> crate::sealed::Sealed for FallocateOp<F> where F: IoFd + Send {}

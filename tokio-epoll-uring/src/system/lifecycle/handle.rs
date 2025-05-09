@@ -276,18 +276,18 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
     pub async fn fallocate<F: IoFd + Send>(
         &self,
         file: F,
+        mode: nix::fcntl::FallocateFlags,
         offset: u64,
         len: u64,
-        mode: nix::fcntl::FallocateFlags,
     ) -> (
         F,
         Result<(), crate::system::submission::op_fut::Error<std::io::Error>>,
     ) {
         let op = FallocateOp {
             file,
+            mode,
             offset,
             len,
-            mode,
         };
         let inner = self.inner.as_ref().unwrap();
         execute_op(
