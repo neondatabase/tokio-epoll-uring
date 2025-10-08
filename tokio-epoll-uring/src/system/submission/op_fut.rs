@@ -58,11 +58,10 @@ pub(crate) async fn execute_op<O, M>(
 where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
+    O::Error: std::fmt::Debug,
     M: PerSystemMetrics,
 {
-    let results = 
-	execute_ops(std::iter::once(op), submit_side, per_system_metrics)
-	.await;
+    let results = execute_ops(std::iter::once(op), submit_side, per_system_metrics).await;
     results.into_iter().next().unwrap()
 }
 
@@ -74,22 +73,23 @@ pub(crate) async fn execute_ops<O, M>(
 where
     // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
+    O::Error: std::fmt::Debug,
     M: PerSystemMetrics,
 {
     let mut open_guard = match submit_side.upgrade_to_open().await {
         Some(open) => open,
         None => {
-	    let mut futs = Vec::new();
-	    for op in ops_iter {
-		let err = Error::System(SystemError::SystemShuttingDown);
+            let mut futs = Vec::new();
+            for op in ops_iter {
+                let err = Error::System(SystemError::SystemShuttingDown);
                 futs.push(wait_or_immediate_result(op, Err(err)).await);
-            };
-	    return futs;
+            }
+            return futs;
         }
     };
 
     fn do_submit(open_guard: &mut SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
-        if open_guard.submit_raw(sqe).is_err() {
+        if open_guard.push_raw(sqe).is_err() {
             // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
             // So, we could just submit_and_wait here. But, that'd prevent the
             // current executor thread from making progress on other tasks.
@@ -99,26 +99,6 @@ where
             //
             // FIXME: why not just async mutex?
             unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
-        }
-
-        // this allows us to keep the possible guard in cq_guard because the arc lives on stack
-        #[allow(unused_assignments)]
-        let mut cq_owned = None;
-
-        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-            let cq = Arc::clone(&open_guard.completion_side);
-            cq_owned = Some(cq);
-            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
-        } else {
-            None
-        };
-
-        if let Some(mut cq) = cq_guard {
-            // opportunistically process completion immediately
-            // TODO do it during ::poll() as well?
-            //
-            // FIXME: why are we doing this while holding the SubmitSideOpen
-            cq.process_completions(ProcessCompletionsCause::Regular);
         }
     }
 
@@ -171,10 +151,38 @@ where
         };
 
         let fut = match slot.use_for_op(&mut op, |sqe| do_submit(&mut open_guard, sqe)) {
-	    Ok(()) => wait_or_immediate_result(op, Ok(slot)),
-	    Err(err) => wait_or_immediate_result(op, Err(Error::System(err))),
-	};
+            Ok(()) => wait_or_immediate_result(op, Ok(slot)),
+            Err(err) => wait_or_immediate_result(op, Err(Error::System(err))),
+        };
         result_futs.push_back(fut);
+    }
+
+    let submit_res = open_guard.submit_whats_already_pushed();
+    if let Err(_err) = submit_res {
+        // todo
+        panic!("queue is full");
+    }
+
+    {
+        // this allows us to keep the possible guard in cq_guard because the arc lives on stack
+        #[allow(unused_assignments)]
+        let mut cq_owned = None;
+
+        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+            let cq = Arc::clone(&open_guard.completion_side);
+            cq_owned = Some(cq);
+            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
+        } else {
+            None
+        };
+
+        if let Some(mut cq) = cq_guard {
+            // opportunistically process completion immediately
+            // TODO do it during ::poll() as well?
+            //
+            // FIXME: why are we doing this while holding the SubmitSideOpen
+            cq.process_completions(ProcessCompletionsCause::Regular);
+        }
     }
 
     // drop it to enable timely shutdown
@@ -183,7 +191,7 @@ where
     let mut results = Vec::new();
     use futures::StreamExt;
     while let Some(res) = result_futs.next().await {
-	results.push(res);
+        results.push(res);
     }
     results
 }
@@ -194,9 +202,13 @@ async fn wait_or_immediate_result<O>(
 ) -> (O::Resources, Result<O::Success, Error<O::Error>>)
 where
     O: Op + Send + 'static,
+    O::Error: std::fmt::Debug,
 {
     match submit_result {
-        Ok(mut slot) => slot.wait_for_completion(op).await,
+        Ok(mut slot) => {
+            let res = slot.wait_for_completion(op).await;
+            res
+        }
         Err(err) => (op.on_failed_submission(), Err(err)),
     }
 }

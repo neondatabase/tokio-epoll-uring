@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 clap = { version = "4.3.9", features = ["help", "usage", "error-context", "derive"] }
 ctrlc = "3.4.0"
+futures = "0.3.28"
 libc = "0.2.147"
 rand = "0.8.5"
 timerfd = "1.5.0"

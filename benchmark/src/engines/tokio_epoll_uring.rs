@@ -150,12 +150,16 @@ impl EngineTokioEpollUring {
         };
 
         // alloc aligned to make O_DIRECT work
-        let buf = unsafe {
-            let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
-            assert!(!ptr.is_null());
-            Vec::from_raw_parts(ptr, 0, block_size)
-        };
-        let mut loop_buf = Some(buf);
+        let mut loop_bufs = Vec::new();
+        for _ in 0..args.batch_size {
+            let buf = unsafe {
+                let ptr =
+                    std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
+                assert!(!ptr.is_null());
+                Vec::from_raw_parts(ptr, 0, block_size)
+            };
+            loop_bufs.push(buf);
+        }
 
         let validate_buf = unsafe {
             let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
@@ -175,9 +179,14 @@ impl EngineTokioEpollUring {
 
             // find a random aligned 8k offset inside the file
             debug_assert!(1024 * 1024 % block_size == 0);
-            let offset_in_file = rand::thread_rng()
-                .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
-                * block_size_u64;
+
+            let mut offsets = Vec::new();
+            for _ in 0..args.batch_size {
+                let offset_in_file = rand::thread_rng()
+                    .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
+                    * block_size_u64;
+                offsets.push(offset_in_file);
+            }
 
             let start = std::time::Instant::now();
             match fd {
@@ -185,8 +194,6 @@ impl EngineTokioEpollUring {
                     raw_fd: file_fd,
                     validate,
                 } => {
-                    let owned_buf = loop_buf.take().unwrap();
-                    let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
                     // We use it to get one io_uring submission & completion ring per core / executor thread.
                     // The thread-local rings are not great if there's block_in_place in the codebase. It's fine here.
                     // Ideally we'd have one submission ring per core and a single completion ring, because, completion
@@ -195,28 +202,61 @@ impl EngineTokioEpollUring {
                     //  affine to a completion queue somehow... The design space is big.)
 
                     let handle = tokio_epoll_uring::thread_local_system().await;
+                    let results = if args.batched {
+                        let mut v = Vec::with_capacity(args.batch_size);
+                        for i in 0..args.batch_size {
+                            let owned_buf = loop_bufs.pop().unwrap();
+                            let offset_in_file = offsets[i];
+                            let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
+                            v.push((file, offset_in_file, owned_buf));
+                        }
 
-                    let ((file, owned_buf), res) =
-                        handle.read(file, offset_in_file, owned_buf).await;
+                        let results = handle.read_batch(v).await;
+                        assert_eq!(results.len(), args.batch_size);
+                        results
+                    } else {
+                        use futures::StreamExt;
+                        let mut reads = futures::stream::FuturesOrdered::new();
+                        for idx in 0..args.batch_size {
+                            let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
+                            let owned_buf = loop_bufs.pop().unwrap();
+                            let offset_in_file: u64 = offsets[idx];
+                            let handle = &handle;
+                            let read_fut = async move {
+                                let ((file, owned_buf), res) =
+                                    handle.read(file, offset_in_file, owned_buf).await;
+                                ((file, owned_buf), res)
+                            };
+                            reads.push_back(read_fut);
+                        }
+                        let mut results = Vec::new();
+                        while let Some(result) = reads.next().await {
+                            results.push(result)
+                        }
+                        results
+                    };
 
-                    let count = res.unwrap();
-                    assert_eq!(count, owned_buf.len());
-                    assert_eq!(count, block_size);
+                    for (idx, ((file, owned_buf), res)) in results.into_iter().enumerate() {
+                        let offset_in_file = offsets[idx];
+                        let count = res.unwrap();
+                        assert_eq!(count, owned_buf.len());
+                        assert_eq!(count, block_size);
 
-                    if validate {
-                        let mut owned_validate_buf = loop_validate_buf.take().unwrap();
-                        owned_validate_buf.resize(block_size, 0);
-                        let std_file = unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) };
-                        let nread = std_file
-                            .read_at(&mut owned_validate_buf, offset_in_file)
-                            .unwrap();
-                        assert_eq!(nread, block_size);
-                        assert_eq!(owned_buf, owned_validate_buf);
-                        loop_validate_buf = Some(owned_validate_buf);
-                        let _ = std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
+                        if validate {
+                            let mut owned_validate_buf = loop_validate_buf.take().unwrap();
+                            owned_validate_buf.resize(block_size, 0);
+                            let std_file = unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) };
+                            let nread = std_file
+                                .read_at(&mut owned_validate_buf, offset_in_file)
+                                .unwrap();
+                            assert_eq!(nread, block_size);
+                            assert_eq!(owned_buf, owned_validate_buf);
+                            loop_validate_buf = Some(owned_validate_buf);
+                            let _ = std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
+                        }
+                        loop_bufs.push(owned_buf);
+                        let _ = file.into_raw_fd(); // so that it's there for next iteration
                     }
-                    loop_buf = Some(owned_buf);
-                    let _ = file.into_raw_fd(); // so that it's there for next iteration
                 }
                 ClientWorkFd::TimerFd(_timerfd, _duration) => {
                     unimplemented!()

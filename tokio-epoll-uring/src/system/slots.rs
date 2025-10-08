@@ -604,15 +604,17 @@ impl SlotHandle {
         })
         .await;
         assert!(poll_count >= 1);
-        #[cfg(test)]
-        {
-            let on_wake = { slot.test_on_wake.lock().unwrap().take() };
-            if let Some(on_wake) = on_wake {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                on_wake.send(tx).unwrap();
-                rx.await.unwrap();
-            }
+        /*
+            #[cfg(test)]
+            {
+                let on_wake = { slot.test_on_wake.lock().unwrap().take() };
+                if let Some(on_wake) = on_wake {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    on_wake.send(tx).unwrap();
+                    rx.await.unwrap();
+                }
         }
+        */
         if poll_count == 1 && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
             tokio::task::yield_now().await;
         }

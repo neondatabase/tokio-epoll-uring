@@ -120,18 +120,21 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
     // v is vector of (File, offset, buf)
     pub fn read_batch<F: IoFd + Send, B: BoundedBufMut + Send>(
         &self,
-	v: Vec<(F, u64, B)>,
+        v: Vec<(F, u64, B)>,
     ) -> impl std::future::Future<
-        Output = Vec<((F, B), Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>)>,
+        Output = Vec<(
+            (F, B),
+            Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
+        )>,
     > {
         let inner = self.inner.as_ref().unwrap();
-	let ops = v.into_iter().map(|(file, offset, buf)| {
-            ReadOp { file, offset, buf }
-	});
+        let ops = v
+            .into_iter()
+            .map(|(file, offset, buf)| ReadOp { file, offset, buf });
         execute_ops(
-	    ops,
-	    inner.submit_side.weak(),
-	    Arc::clone(&inner.per_system_metrics),
+            ops,
+            inner.submit_side.weak(),
+            Arc::clone(&inner.per_system_metrics),
         )
     }
 

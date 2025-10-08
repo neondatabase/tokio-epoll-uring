@@ -87,6 +87,27 @@ impl Drop for SubmitSide {
 }
 
 impl SubmitSideOpen {
+    pub(crate) fn push_raw(
+        &mut self,
+        sqe: io_uring::squeue::Entry,
+    ) -> std::result::Result<(), SubmitError> {
+        match unsafe { self.sq.push(&sqe) } {
+            Ok(()) => {}
+            Err(_queue_full) => {
+                return Err(SubmitError::QueueFull);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn submit_whats_already_pushed(&mut self) -> std::result::Result<(), SubmitError> {
+        self.sq.sync();
+        self.submitter.submit().unwrap();
+        self.sq.sync();
+        Ok(())
+    }
+
+    #[allow(unused)]
     pub(crate) fn submit_raw(
         &mut self,
         sqe: io_uring::squeue::Entry,

@@ -106,31 +106,36 @@ async fn read_batch() {
 
     let tempdir = tempfile::tempdir().unwrap();
     let file_path = tempdir.path().join("some_file");
-    let content = b"some content";
-    std::fs::write(&file_path, content).unwrap();
+
+    {
+        let mut std_file = std::fs::File::create(&file_path).unwrap();
+        for _ in 0..1000 {
+            let content = b"some content";
+            std_file.write(content).unwrap();
+        }
+    }
 
     let std_file = std::fs::File::open(&file_path).unwrap();
     let fd = Arc::new(OwnedFd::from(std_file));
 
-    // batched read
-    let ios = vec![
-	(fd.clone(), 0, vec![0; 4]),
-	(fd.clone(), 5, vec![0; 7]),
-    ];
-    let results = system.read_batch(ios).await;
+    for _ in 0..100000 {
+        let ios = vec![
+            (fd.clone(), 0, vec![0; 4096]),
+            (fd.clone(), 5, vec![0; 4096]),
+        ];
+        let results = system.read_batch(ios).await;
 
-    let ((_fd, buf), result) = &results[0];
-    assert_eq!(*result.as_ref().unwrap(), 4);
-    assert_eq!(buf, b"some");
+        let ((_fd, buf), result) = &results[0];
+        assert_eq!(*result.as_ref().unwrap(), 4096);
+        assert_eq!(&buf[0..4], b"some");
 
-    let ((_fd, buf), result) = &results[1];
-    assert_eq!(*result.as_ref().unwrap(), 7);
-    assert_eq!(buf, b"content");
-    
+        let ((_fd, buf), result) = &results[1];
+        assert_eq!(*result.as_ref().unwrap(), 4096);
+        assert_eq!(&buf[0..7], b"content");
+    }
+
     system.initiate_shutdown().await;
 }
-    
-    
 
 // This test changes & observes process-wide state.
 // To avoid requiring cargo nextest / --test-threads 1, we do some trickery.
