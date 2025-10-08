@@ -4,7 +4,7 @@
 //!
 //! - Have a place to which we can transfer ownership of the resources (FD, buffer)
 //!   if the future gets dropped while op is still in flight.
-//! - Heep track of what ops are in flight so during system shutdown we know when we're done.
+//! - Keep track of what ops are in flight so during system shutdown we know when we're done.
 //! - Limit queue depth & provide means for a task to wait until it's the task's turn.
 //!   The queue depth limit is currently hard-coded to [`crate::system::RING_SIZE`].
 //!   The wait-until-it's-our-turn is implemented by the `tokio::sync::oneshot` returned by
@@ -437,17 +437,8 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
     }
 }
 
-type UseForOpOutput<O> = (
-    <O as Op>::Resources,
-    Result<<O as Op>::Success, Error<<O as Op>::Error>>,
-);
-
 impl SlotHandle {
-    pub(crate) fn use_for_op<O, S>(
-        self,
-        mut op: O,
-        do_submit: S,
-    ) -> impl std::future::Future<Output = UseForOpOutput<O>>
+    pub(crate) fn use_for_op<O, S>(&mut self, op: &mut O, do_submit: S) -> Result<(), SystemError>
     where
         O: Op + Send + 'static,
         S: FnOnce(io_uring::squeue::Entry),
@@ -465,21 +456,15 @@ impl SlotHandle {
             }
         });
         let Ok(()) = res else {
-            return futures::future::Either::Left(async move {
-                (
-                    op.on_failed_submission(),
-                    Err(Error::<O::Error>::System(SystemError::SystemShuttingDown)),
-                )
-            });
+            return Err(SystemError::SystemShuttingDown);
         };
 
         do_submit(sqe);
-
-        futures::future::Either::Right(self.wait_for_completion(op))
+        Ok(())
     }
 
-    async fn wait_for_completion<O: Op + Send + 'static>(
-        self,
+    pub(crate) async fn wait_for_completion<O: Op + Send + 'static>(
+        &mut self,
         op: O,
     ) -> (O::Resources, Result<O::Success, Error<O::Error>>) {
         let slot = self;
