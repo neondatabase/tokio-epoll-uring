@@ -69,4 +69,18 @@ impl SharedSystemHandle {
             .expect("SharedSystemHandle is shut down, cannot submit new operations");
         guard.read(file, offset, buf)
     }
+
+    pub fn read_batch<B: IoBufMut + Send>(
+        &self,
+        v: Vec<(Arc<std::os::fd::OwnedFd>, u64, B)>
+    ) -> impl std::future::Future<
+        Output =
+            Vec<((Arc<std::os::fd::OwnedFd>, B), Result<usize, SystemError<std::io::Error>>)>,
+    > {
+        let guard = self.0.read().unwrap();
+        let guard = guard
+            .as_ref()
+            .expect("SharedSystemHandle is shut down, cannot submit new operations");
+        guard.read_batch(v)
+    }
 }

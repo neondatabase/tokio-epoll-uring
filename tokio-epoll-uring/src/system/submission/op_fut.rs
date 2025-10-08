@@ -1,5 +1,7 @@
 use std::{fmt::Display, sync::Arc};
 
+use futures::stream::FuturesOrdered;
+
 /// An io_uring operation and the resources it operates on.
 ///
 /// For each io_uring operation, there is a struct that implements this trait.
@@ -16,10 +18,7 @@ use uring_common::io_uring;
 
 use crate::{
     metrics::PerSystemMetrics,
-    system::{
-        completion::ProcessCompletionsCause,
-        slots::self,
-    },
+    system::{completion::ProcessCompletionsCause, slots, slots::SlotHandle},
 };
 
 use super::{SubmitSideOpenGuard, SubmitSideWeak};
@@ -52,7 +51,7 @@ impl<T: Display> Display for Error<T> {
 }
 
 pub(crate) async fn execute_op<O, M>(
-    mut op: O,
+    op: O,
     submit_side: SubmitSideWeak,
     per_system_metrics: Arc<M>,
 ) -> (O::Resources, Result<O::Success, Error<O::Error>>)
@@ -61,17 +60,35 @@ where
     O: Op + Send + 'static + Unpin,
     M: PerSystemMetrics,
 {
-    let open_guard = match submit_side.upgrade_to_open().await {
+    let results = 
+	execute_ops(std::iter::once(op), submit_side, per_system_metrics)
+	.await;
+    results.into_iter().next().unwrap()
+}
+
+pub(crate) async fn execute_ops<O, M>(
+    ops_iter: impl Iterator<Item = O>,
+    submit_side: SubmitSideWeak,
+    per_system_metrics: Arc<M>,
+) -> Vec<(O::Resources, Result<O::Success, Error<O::Error>>)>
+where
+    // FIXME: probably dont need the unpin
+    O: Op + Send + 'static + Unpin,
+    M: PerSystemMetrics,
+{
+    let mut open_guard = match submit_side.upgrade_to_open().await {
         Some(open) => open,
         None => {
-            return (
-                op.on_failed_submission(),
-                Err(Error::System(SystemError::SystemShuttingDown)),
-            );
+	    let mut futs = Vec::new();
+	    for op in ops_iter {
+		let err = Error::System(SystemError::SystemShuttingDown);
+                futs.push(wait_or_immediate_result(op, Err(err)).await);
+            };
+	    return futs;
         }
     };
 
-    fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
+    fn do_submit(open_guard: &mut SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
         if open_guard.submit_raw(sqe).is_err() {
             // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
             // So, we could just submit_and_wait here. But, that'd prevent the
@@ -95,7 +112,6 @@ where
         } else {
             None
         };
-        drop(open_guard); // drop it asap to enable timely shutdown
 
         if let Some(mut cq) = cq_guard {
             // opportunistically process completion immediately
@@ -106,52 +122,81 @@ where
         }
     }
 
-    let mut slot = match open_guard.slots.try_get_slot() {
-        slots::TryGetSlotResult::Draining => {
-            return (
-                op.on_failed_submission(),
-                Err(Error::System(SystemError::SystemShuttingDown)),
-            )
-        }
-        slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
-            per_system_metrics
-                .as_ref()
-                .observe_slots_submission_queue_depth(queue_depth);
-            slot
-        }
-        slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
-            // All slots are taken and we're waiting in line.
-            // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
-            // This is in the hope that we'll wake ourselves up.
+    let mut result_futs = FuturesOrdered::new();
 
-            per_system_metrics
-                .as_ref()
-                .observe_slots_submission_queue_depth(queue_depth);
-            if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
-                // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
-                open_guard.submitter.submit().unwrap();
-                open_guard
-                    .completion_side
-                    .lock()
-                    .unwrap()
-                    .process_completions(ProcessCompletionsCause::Regular);
+    for mut op in ops_iter {
+        let mut slot = match open_guard.slots.try_get_slot() {
+            slots::TryGetSlotResult::Draining => {
+                result_futs.push_back(wait_or_immediate_result(
+                    op,
+                    Err(Error::System(SystemError::SystemShuttingDown)),
+                ));
+                continue;
             }
-            let slot = match later.await {
-                Ok(slot) => slot,
-                Err(_dropped) => {
-                    return (
-                        op.on_failed_submission(),
-                        Err(Error::System(SystemError::SystemShuttingDown)),
-                    )
-                }
-            };
-            slot
-        }
-    };
+            slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
+                per_system_metrics
+                    .as_ref()
+                    .observe_slots_submission_queue_depth(queue_depth);
+                slot
+            }
+            slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
+                // All slots are taken and we're waiting in line.
+                // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
+                // This is in the hope that we'll wake ourselves up.
 
-    let submit_res = slot.use_for_op(&mut op, |sqe| do_submit(open_guard, sqe));
-    if let Err(err) = submit_res {
-        return (op.on_failed_submission(), Err(Error::System(err)));
+                per_system_metrics
+                    .as_ref()
+                    .observe_slots_submission_queue_depth(queue_depth);
+                if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
+                    // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
+                    open_guard.submitter.submit().unwrap();
+                    open_guard
+                        .completion_side
+                        .lock()
+                        .unwrap()
+                        .process_completions(ProcessCompletionsCause::Regular);
+                }
+                let slot = match later.await {
+                    Ok(slot) => slot,
+                    Err(_dropped) => {
+                        result_futs.push_back(wait_or_immediate_result(
+                            op,
+                            Err(Error::System(SystemError::SystemShuttingDown)),
+                        ));
+                        continue;
+                    }
+                };
+                slot
+            }
+        };
+
+        let fut = match slot.use_for_op(&mut op, |sqe| do_submit(&mut open_guard, sqe)) {
+	    Ok(()) => wait_or_immediate_result(op, Ok(slot)),
+	    Err(err) => wait_or_immediate_result(op, Err(Error::System(err))),
+	};
+        result_futs.push_back(fut);
     }
-    slot.wait_for_completion(op).await
+
+    // drop it to enable timely shutdown
+    drop(open_guard);
+
+    let mut results = Vec::new();
+    use futures::StreamExt;
+    while let Some(res) = result_futs.next().await {
+	results.push(res);
+    }
+    results
+}
+
+async fn wait_or_immediate_result<O>(
+    op: O,
+    submit_result: Result<SlotHandle, Error<O::Error>>,
+) -> (O::Resources, Result<O::Success, Error<O::Error>>)
+where
+    O: Op + Send + 'static,
+{
+    match submit_result {
+        Ok(mut slot) => slot.wait_for_completion(op).await,
+        Err(err) => (op.on_failed_submission(), Err(err)),
+    }
 }

@@ -9,7 +9,7 @@ use uring_common::{
 use crate::{
     metrics::PerSystemMetrics,
     ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx, write::WriteOp},
-    system::submission::{op_fut::execute_op, SubmitSide},
+    system::submission::{op_fut::execute_op, op_fut::execute_ops, SubmitSide},
 };
 
 /// Owned handle to the [`System`](crate::System) created by [`System::launch`](crate::System::launch).
@@ -116,6 +116,25 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             Arc::clone(&inner.per_system_metrics),
         )
     }
+
+    // v is vector of (File, offset, buf)
+    pub fn read_batch<F: IoFd + Send, B: BoundedBufMut + Send>(
+        &self,
+	v: Vec<(F, u64, B)>,
+    ) -> impl std::future::Future<
+        Output = Vec<((F, B), Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>)>,
+    > {
+        let inner = self.inner.as_ref().unwrap();
+	let ops = v.into_iter().map(|(file, offset, buf)| {
+            ReadOp { file, offset, buf }
+	});
+        execute_ops(
+	    ops,
+	    inner.submit_side.weak(),
+	    Arc::clone(&inner.per_system_metrics),
+        )
+    }
+
     pub fn open<P: AsRef<Path>>(
         &self,
         path: P,

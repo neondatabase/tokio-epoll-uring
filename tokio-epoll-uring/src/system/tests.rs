@@ -82,7 +82,7 @@ async fn op_state_pending_but_future_dropped() {
 }
 
 #[tokio::test]
-async fn basic() {
+async fn read_from_pipe() {
     let system = SharedSystemHandle::launch().await.unwrap();
 
     let (reader, mut writer) = os_pipe::pipe().unwrap();
@@ -91,6 +91,7 @@ async fn basic() {
     writer.write_all(&[1]).unwrap();
 
     let buf = vec![0; 1];
+    // fixme: what does it mean to read from a pipe at an offset?
     let ((_, buf), res) = system.read(reader, 0, buf).await;
     let sz = res.unwrap();
     assert_eq!(sz, 1);
@@ -98,6 +99,38 @@ async fn basic() {
 
     system.initiate_shutdown().await;
 }
+
+#[tokio::test]
+async fn read_batch() {
+    let system = SharedSystemHandle::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let file_path = tempdir.path().join("some_file");
+    let content = b"some content";
+    std::fs::write(&file_path, content).unwrap();
+
+    let std_file = std::fs::File::open(&file_path).unwrap();
+    let fd = Arc::new(OwnedFd::from(std_file));
+
+    // batched read
+    let ios = vec![
+	(fd.clone(), 0, vec![0; 4]),
+	(fd.clone(), 5, vec![0; 7]),
+    ];
+    let results = system.read_batch(ios).await;
+
+    let ((_fd, buf), result) = &results[0];
+    assert_eq!(*result.as_ref().unwrap(), 4);
+    assert_eq!(buf, b"some");
+
+    let ((_fd, buf), result) = &results[1];
+    assert_eq!(*result.as_ref().unwrap(), 7);
+    assert_eq!(buf, b"content");
+    
+    system.initiate_shutdown().await;
+}
+    
+    
 
 // This test changes & observes process-wide state.
 // To avoid requiring cargo nextest / --test-threads 1, we do some trickery.

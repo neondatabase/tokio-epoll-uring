@@ -429,48 +429,48 @@ async fn poller_impl_impl(
         loop {
             is_timeout_wakeup = false;
             let mut guard = tokio::select! {
-                            ready_res = fd.ready(tokio::io::Interest::READABLE) => {
-                                ready_res.unwrap()
-                            }
-                            _ = async {
-                                match &mut preempt_in_epoll {
-                                    Some(preempt) => {
-                                        let tell_caller = preempt.resubscribe().recv().await.unwrap();
-                                        tell_caller.send(()).ok().unwrap();
-                                        futures::future::pending::<()>().await;
-                                        unreachable!("we should get dropped at above .await point");
-                                    },
-                                    None => {
-                                        futures::future::pending().await
-                                    },
-                                }
-                            } => {
-                                unreachable!("see above");
-                            }
-                            rx = shutdown_rx.recv()  => {
-                                match rx {
-                                    crate::util::oneshot_nonconsuming::RecvResult::FirstRecv(ShutdownRequest { done_tx, submit_side_inner }) => {
-                                        tracing::debug!("got explicit shutdown request");
-                                        let mut inner = submit_side_inner.lock().await;
-                                        let open = match std::mem::replace(&mut *inner, SubmitSideInner::ShutDownInitiated) {
-                                            SubmitSideInner::Open(open) => open,
-                                            SubmitSideInner::ShutDownInitiated => unreachable!("poller_impl transitions to state ShuttingDownPreemptible when we return a shutdown request, so, it won't call poller_impl_impl again"),
-                                        };
-                                        return ShutdownRequestImpl { done_tx, submit_side_open: open };
-                                    }
-                                    crate::util::oneshot_nonconsuming::RecvResult::NotFirstRecv => {
-                                        panic!("once we observe a shutdown request, we return it and the caller does through with shutdown, without a chance for the executor to intervene")
-                                    }
-                                    crate::util::oneshot_nonconsuming::RecvResult::SenderDropped => {
-                                        panic!("implementation error: SystemHandle _must_ send shutdown request");
-                                    }
-                                }
-                            }
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                                is_timeout_wakeup = true;
-                                break;
-                            }
-                        };
+                ready_res = fd.ready(tokio::io::Interest::READABLE) => {
+                    ready_res.unwrap()
+                }
+                _ = async {
+                    match &mut preempt_in_epoll {
+                        Some(preempt) => {
+                            let tell_caller = preempt.resubscribe().recv().await.unwrap();
+                            tell_caller.send(()).ok().unwrap();
+                            futures::future::pending::<()>().await;
+                            unreachable!("we should get dropped at above .await point");
+                        },
+                        None => {
+                            futures::future::pending().await
+                        },
+                    }
+                } => {
+                    unreachable!("see above");
+                }
+                rx = shutdown_rx.recv()  => {
+                    match rx {
+                        crate::util::oneshot_nonconsuming::RecvResult::FirstRecv(ShutdownRequest { done_tx, submit_side_inner }) => {
+                            tracing::debug!("got explicit shutdown request");
+                            let mut inner = submit_side_inner.lock().await;
+                            let open = match std::mem::replace(&mut *inner, SubmitSideInner::ShutDownInitiated) {
+                                SubmitSideInner::Open(open) => open,
+                                SubmitSideInner::ShutDownInitiated => unreachable!("poller_impl transitions to state ShuttingDownPreemptible when we return a shutdown request, so, it won't call poller_impl_impl again"),
+                            };
+                            return ShutdownRequestImpl { done_tx, submit_side_open: open };
+                        }
+                        crate::util::oneshot_nonconsuming::RecvResult::NotFirstRecv => {
+                            panic!("once we observe a shutdown request, we return it and the caller does through with shutdown, without a chance for the executor to intervene")
+                        }
+                        crate::util::oneshot_nonconsuming::RecvResult::SenderDropped => {
+                            panic!("implementation error: SystemHandle _must_ send shutdown request");
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    is_timeout_wakeup = true;
+                    break;
+                }
+            };
             if !guard.ready().is_readable() {
                 trace!("spurious wakeup");
                 continue;
