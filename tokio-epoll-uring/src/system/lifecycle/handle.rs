@@ -9,7 +9,7 @@ use uring_common::{
 use crate::{
     metrics::PerSystemMetrics,
     ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx, write::WriteOp},
-    system::submission::{op_fut::execute_op, SubmitSide},
+    system::submission::{op_fut::enqueue_op, op_fut::execute_op, op_fut::SystemError, SubmitSide},
 };
 
 /// Owned handle to the [`System`](crate::System) created by [`System::launch`](crate::System::launch).
@@ -97,6 +97,8 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             Arc::clone(&inner.per_system_metrics),
         )
     }
+
+    /// Read from a file at given offset. Similar to [std::os::unix::fs::FileExt::read_at].
     pub fn read<F: IoFd + Send, B: BoundedBufMut + Send>(
         &self,
         file: F,
@@ -116,6 +118,77 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             Arc::clone(&inner.per_system_metrics),
         )
     }
+
+    /// This is like [Self::read], but we separate pushing the operation to the io_uring submission
+    /// queue, and notifying the kernel about it. This allows efficiently queuing multiple read
+    /// operations and submitting them all in one syscall.
+    ///
+    /// The first step - pushing to the submission queue - is done by this function. When the future
+    /// completes, the operation has been pushed to the submission queue. The second step is to
+    /// notify the kernel about the pending operation in the submission queue - see the
+    /// [Self::submit_batched] function. The final step is to wait for the IO to complete - that is
+    /// done by awaiting the future returned by this function.
+    ///
+    /// If the submission queue is full, any existing queued IOs are submitted and we wait for an IO
+    /// to complete and free up an IO slot.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let system = tokio_epoll_uring::System::launch().await.unwrap();
+    /// # use std::sync::Arc;
+    ///
+    /// let file = std::fs::File::open("/dev/zero").unwrap();
+    /// let fd: Arc<std::os::fd::OwnedFd> = Arc::new(file.into());
+    ///
+    /// // Push two independent read IOs to the submission queue. These 'awaits' will complete
+    /// // immediately unless the submission queue is full.
+    /// let io1 = system.read_batched(fd.clone(), 0, vec![0; 512]).await;
+    /// let io2 = system.read_batched(fd.clone(), 1024, vec![0; 512]).await;
+    ///
+    /// // Notify the kernel to start processing the IOs that we enqueued
+    /// system.submit_batched().await;
+    ///
+    /// // Process results
+    /// let result1 = io1.await;
+    /// let result2 = io2.await;
+    ///
+    /// # }
+    /// ```
+    ///
+    /// Currently, this is the only function that supports batching, all the other functions submit
+    /// the operation immediately. It would be straightforward to split other functions into
+    /// separate enqueue and waits steps, too, but currently this is the only one where we have the
+    /// need.
+    ///
+    /// NOTE: If all the IO slots are in use, the submission does not complete until some pending IO
+    /// futures have completed (or dropped)! The above example relies on there being at least two
+    /// slots free. To ensure that in the general case, poll the completion futures concurrently
+    /// with submitting new IOs, for example by using a separate task or
+    /// [futures::stream::StreamExt::buffered].
+    pub async fn read_batched<F: IoFd + Send, B: BoundedBufMut + Send>(
+        &self,
+        file: F,
+        offset: u64,
+        buf: B,
+    ) -> impl std::future::Future<
+        Output = (
+            (F, B),
+            Result<usize, crate::system::submission::op_fut::Error<std::io::Error>>,
+        ),
+    > {
+        let op = ReadOp { file, offset, buf };
+        let inner = self.inner.as_ref().unwrap();
+        enqueue_op(
+            op,
+            inner.submit_side.weak(),
+            Arc::clone(&inner.per_system_metrics),
+        )
+        .await
+    }
+
     pub fn open<P: AsRef<Path>>(
         &self,
         path: P,
@@ -242,5 +315,18 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             inner.submit_side.weak(),
             Arc::clone(&inner.per_system_metrics),
         )
+    }
+
+    /// Notify the kernel about enqueued operations in the submission queue. See
+    /// [Self::read_batched].
+    pub async fn submit_batched(&self) -> Result<(), SystemError> {
+        let inner = self.inner.as_ref().unwrap();
+        match inner.submit_side.weak().upgrade_to_open().await {
+            Some(mut open) => {
+                open.submit_raw();
+                Ok(())
+            }
+            None => Err(SystemError::SystemShuttingDown),
+        }
     }
 }

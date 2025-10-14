@@ -68,4 +68,28 @@ impl SharedSystemHandle {
             .expect("SharedSystemHandle is shut down, cannot submit new operations");
         guard.read(file, offset, buf)
     }
+
+    pub async fn read_batched<B: IoBufMut + Send, F: crate::IoFd + Send>(
+        &self,
+        file: F,
+        offset: u64,
+        buf: B,
+    ) -> impl std::future::Future<Output = ((F, B), Result<usize, SystemError<std::io::Error>>)>
+    {
+        let guard = self.0.read().unwrap();
+        let guard = guard
+            .as_ref()
+            .expect("SharedSystemHandle is shut down, cannot submit new operations");
+        guard.read_batched(file, offset, buf).await
+    }
+
+    pub async fn submit_batched(
+        &self,
+    ) -> Result<(), crate::system::submission::op_fut::SystemError> {
+        let guard = self.0.read().unwrap();
+        let guard = guard
+            .as_ref()
+            .expect("SharedSystemHandle is shut down, cannot submit new operations");
+        guard.submit_batched().await
+    }
 }

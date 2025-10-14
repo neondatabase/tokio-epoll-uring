@@ -82,7 +82,7 @@ async fn op_state_pending_but_future_dropped() {
 }
 
 #[tokio::test]
-async fn basic() {
+async fn read_from_pipe() {
     let system = SharedSystemHandle::launch().await.unwrap();
 
     let (reader, mut writer) = os_pipe::pipe().unwrap();
@@ -91,10 +91,69 @@ async fn basic() {
     writer.write_all(&[1]).unwrap();
 
     let buf = vec![0; 1];
+    // fixme: what does it mean to read from a pipe at an offset?
     let ((_, buf), res) = system.read(reader, 0, buf).await;
     let sz = res.unwrap();
     assert_eq!(sz, 1);
     assert_eq!(buf, vec![1]);
+
+    system.initiate_shutdown().await;
+}
+
+#[tokio::test]
+async fn read_batched() {
+    let system = SharedSystemHandle::launch().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let file_path = tempdir.path().join("some_file");
+
+    let mut content = Vec::new();
+    for _ in 0..1000 {
+        content.extend_from_slice(b"some content");
+    }
+    let mut std_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+    std_file.write(&content).unwrap();
+    let fd = Arc::new(OwnedFd::from(std_file));
+
+    // Perform many read operations in a batched fashion.
+    let nreads = (RING_SIZE * 10) as usize;
+    let offsets: Vec<usize> = (0..nreads)
+        .map(|idx| (idx * 13) % (content.len() - 10))
+        .collect();
+    {
+        // This stream pushes the operations to the submission queue and yields futures to wait for
+        // their completions.
+        //
+        // Note: We must process the results concurrently with submitting new operations! Otherwise
+        // we will hang when all IO slots are filled up.
+        let system_ref = &system;
+        let offsets_ref = &offsets;
+        let submit_stream = async_stream::stream! {
+            for &offset in offsets_ref {
+                let wait_fut = system_ref.read_batched(fd.clone(), offset as u64, vec![0; 10]).await;
+                yield wait_fut;
+            }
+
+            // All submitted, wake up the kernel one last time
+            system_ref.submit_batched().await.unwrap();
+        };
+
+        // Start the IOs
+        let mut s = std::pin::pin!(submit_stream.buffered(offsets.len()));
+
+        // Process the results
+        for &offset in offsets_ref {
+            let ((_fd, buf), result) = s.next().await.unwrap();
+            assert_eq!(*result.as_ref().unwrap(), 10);
+            assert_eq!(buf, content[offset..(offset + 10)]);
+        }
+        assert!(s.next().await.is_none());
+    }
 
     system.initiate_shutdown().await;
 }

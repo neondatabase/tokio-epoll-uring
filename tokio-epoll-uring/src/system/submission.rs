@@ -87,20 +87,22 @@ impl Drop for SubmitSide {
 }
 
 impl SubmitSideOpen {
-    pub(crate) fn submit_raw(
+    pub(crate) fn push_raw(
         &mut self,
-        sqe: io_uring::squeue::Entry,
+        sqe: &io_uring::squeue::Entry,
     ) -> std::result::Result<(), SubmitError> {
-        self.sq.sync();
-        match unsafe { self.sq.push(&sqe) } {
+        match unsafe { self.sq.push(sqe) } {
             Ok(()) => {}
             Err(_queue_full) => {
                 return Err(SubmitError::QueueFull);
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn submit_raw(&mut self) {
         self.sq.sync();
         self.submitter.submit().unwrap();
-        Ok(())
     }
 }
 
