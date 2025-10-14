@@ -16,10 +16,7 @@ use uring_common::io_uring;
 
 use crate::{
     metrics::PerSystemMetrics,
-    system::{
-        completion::ProcessCompletionsCause,
-        slots::{self, SlotHandle},
-    },
+    system::{completion::ProcessCompletionsCause, slots},
 };
 
 use super::{SubmitSideOpenGuard, SubmitSideWeak};
@@ -54,7 +51,6 @@ impl<T: Display> Display for Error<T> {
 pub(crate) async fn execute_op<O, M>(
     op: O,
     submit_side: SubmitSideWeak,
-    slot: Option<SlotHandle>,
     per_system_metrics: Arc<M>,
 ) -> (O::Resources, Result<O::Success, Error<O::Error>>)
 where
@@ -107,49 +103,44 @@ where
         }
     }
 
-    match slot {
-        Some(slot) => slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await,
-        None => {
-            match open_guard.slots.try_get_slot() {
-                slots::TryGetSlotResult::Draining => (
-                    op.on_failed_submission(),
-                    Err(Error::System(SystemError::SystemShuttingDown)),
-                ),
-                slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
-                    per_system_metrics
-                        .as_ref()
-                        .observe_slots_submission_queue_depth(queue_depth);
-                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
-                }
-                slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
-                    // All slots are taken and we're waiting in line.
-                    // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
-                    // This is in the hope that we'll wake ourselves up.
+    match open_guard.slots.try_get_slot() {
+        slots::TryGetSlotResult::Draining => (
+            op.on_failed_submission(),
+            Err(Error::System(SystemError::SystemShuttingDown)),
+        ),
+        slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
+            per_system_metrics
+                .as_ref()
+                .observe_slots_submission_queue_depth(queue_depth);
+            slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+        }
+        slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
+            // All slots are taken and we're waiting in line.
+            // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
+            // This is in the hope that we'll wake ourselves up.
 
-                    per_system_metrics
-                        .as_ref()
-                        .observe_slots_submission_queue_depth(queue_depth);
-                    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
-                        // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
-                        open_guard.submitter.submit().unwrap();
-                        open_guard
-                            .completion_side
-                            .lock()
-                            .unwrap()
-                            .process_completions(ProcessCompletionsCause::Regular);
-                    }
-                    let slot = match later.await {
-                        Ok(slot) => slot,
-                        Err(_dropped) => {
-                            return (
-                                op.on_failed_submission(),
-                                Err(Error::System(SystemError::SystemShuttingDown)),
-                            )
-                        }
-                    };
-                    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
-                }
+            per_system_metrics
+                .as_ref()
+                .observe_slots_submission_queue_depth(queue_depth);
+            if *crate::env_tunables::PROCESS_COMPLETIONS_ON_QUEUE_FULL {
+                // TODO shouldn't we loop here until we've got a slot? This one-off poll doesn't make much sense.
+                open_guard.submitter.submit().unwrap();
+                open_guard
+                    .completion_side
+                    .lock()
+                    .unwrap()
+                    .process_completions(ProcessCompletionsCause::Regular);
             }
+            let slot = match later.await {
+                Ok(slot) => slot,
+                Err(_dropped) => {
+                    return (
+                        op.on_failed_submission(),
+                        Err(Error::System(SystemError::SystemShuttingDown)),
+                    )
+                }
+            };
+            slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
         }
     }
 }

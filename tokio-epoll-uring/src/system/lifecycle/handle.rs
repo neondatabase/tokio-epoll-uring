@@ -94,7 +94,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
     }
@@ -114,7 +113,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
     }
@@ -137,7 +135,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         let per_system_metrics = Arc::clone(&inner.per_system_metrics);
         let weak = inner.submit_side.weak();
         futures::future::Either::Right(async move {
-            let (_, res) = execute_op(op, weak, None, per_system_metrics).await;
+            let (_, res) = execute_op(op, weak, per_system_metrics).await;
             res
         })
     }
@@ -157,7 +155,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
         .await
@@ -178,7 +175,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
         .await
@@ -205,7 +201,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         let (resources, result) = execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
         .await;
@@ -245,7 +240,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
     }
