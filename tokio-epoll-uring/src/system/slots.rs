@@ -443,11 +443,13 @@ type UseForOpOutput<O> = (
 );
 
 impl SlotHandle {
+    /// Places 'op' in the given slot and submits the operation to io_uring. On success, returns a
+    /// future to wait for its completion. Can fail if the system is being shut down.
     pub(crate) fn use_for_op<O, S>(
         self,
         mut op: O,
         do_submit: S,
-    ) -> impl std::future::Future<Output = UseForOpOutput<O>>
+    ) -> Result<impl std::future::Future<Output = UseForOpOutput<O>>, (O::Resources, SystemError)>
     where
         O: Op + Send + 'static,
         S: FnOnce(io_uring::squeue::Entry),
@@ -465,17 +467,12 @@ impl SlotHandle {
             }
         });
         let Ok(()) = res else {
-            return futures::future::Either::Left(async move {
-                (
-                    op.on_failed_submission(),
-                    Err(Error::<O::Error>::System(SystemError::SystemShuttingDown)),
-                )
-            });
+            return Err((op.on_failed_submission(), SystemError::SystemShuttingDown));
         };
 
         do_submit(sqe);
 
-        futures::future::Either::Right(self.wait_for_completion(op))
+        Ok(self.wait_for_completion(op))
     }
 
     async fn wait_for_completion<O: Op + Send + 'static>(

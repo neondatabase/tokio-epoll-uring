@@ -145,5 +145,9 @@ where
         }
     };
 
-    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+    match slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)) {
+        Ok(wait_fut) => wait_fut,
+        Err((resources, err)) => return (resources, Err(Error::System(err))),
+    }
+    .await
 }
