@@ -1,7 +1,6 @@
 //! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
-use futures::FutureExt;
-use std::{mem::MaybeUninit, os::fd::OwnedFd, path::Path, sync::Arc, task::ready};
+use std::{mem::MaybeUninit, os::fd::OwnedFd, path::Path, sync::Arc};
 use uring_common::{
     buf::{BoundedBuf, BoundedBufMut},
     io_fd::IoFd,
@@ -72,25 +71,6 @@ impl<M: PerSystemMetrics> SystemHandle<M> {
             .take()
             .expect("we only consume here and during Drop");
         inner.shutdown()
-    }
-}
-
-struct WaitShutdownFut {
-    done_rx: tokio::sync::oneshot::Receiver<()>,
-}
-
-impl std::future::Future for WaitShutdownFut {
-    type Output = ();
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
-        let done_rx = &mut self.done_rx;
-        match ready!(done_rx.poll_unpin(cx)) {
-            Ok(()) => std::task::Poll::Ready(()),
-            Err(_) => panic!("implementation error: poller must not die before SystemHandle"),
-        }
     }
 }
 
