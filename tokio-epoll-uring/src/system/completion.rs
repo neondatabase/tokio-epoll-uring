@@ -276,7 +276,9 @@ async fn poller_impl(
         match &mut poller_guard.state {
             PollerState::ShuttingDownNoMorePreemptible => unreachable!(),
             PollerState::ShutDown => {
-                unreachable!("if poller_impl_impl shuts shuts down, we never get back here, caller guarantees it")
+                unreachable!(
+                    "if poller_impl_impl shuts down, we never get back here, caller guarantees it"
+                )
             }
             PollerState::ShuttingDownPreemptible(inner, req) => {
                 let new_state =
@@ -645,7 +647,6 @@ mod tests {
             let jh = tokio::spawn(async move {
                 let system = System::launch_with_testing(
                     Some(testing),
-                    None,
                     &crate::metrics::GLOBAL_STORAGE,
                     Arc::new(()),
                 )

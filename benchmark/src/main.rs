@@ -35,6 +35,10 @@ struct Args {
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
     block_size_shift: NonZeroU64,
+    #[clap(long, default_value = "1")]
+    batch_size: usize,
+    #[clap(long)]
+    batched: bool,
     #[clap(long, default_value = "until-ctrl-c")]
     run_duration: RunDuration,
     #[clap(subcommand)]

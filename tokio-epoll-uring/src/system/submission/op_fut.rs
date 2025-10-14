@@ -1,4 +1,4 @@
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, future::Future, sync::Arc};
 
 /// An io_uring operation and the resources it operates on.
 ///
@@ -16,7 +16,7 @@ use uring_common::io_uring;
 
 use crate::{
     metrics::PerSystemMetrics,
-    system::{completion::ProcessCompletionsCause, slots},
+    system::{completion::ProcessCompletionsCause, slots, slots::WaitForCompletion},
 };
 
 use super::{SubmitSideOpenGuard, SubmitSideWeak};
@@ -48,74 +48,92 @@ impl<T: Display> Display for Error<T> {
     }
 }
 
+/// Push 'op' to the submission queue and submit it
 pub(crate) async fn execute_op<O, M>(
     op: O,
     submit_side: SubmitSideWeak,
     per_system_metrics: Arc<M>,
 ) -> (O::Resources, Result<O::Success, Error<O::Error>>)
 where
-    // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
     M: PerSystemMetrics,
 {
-    let open_guard = match submit_side.upgrade_to_open().await {
+    // enqueue the operation and immediately wait for it
+    let wait_fut = enqueue_op_internal(op, submit_side, per_system_metrics, true).await;
+    wait_fut.await
+}
+
+/// Push 'op' to the submission queue
+pub(crate) async fn enqueue_op<O, M>(
+    op: O,
+    submit_side: SubmitSideWeak,
+    per_system_metrics: Arc<M>,
+) -> impl Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
+where
+    O: Op + Send + 'static + Unpin,
+    M: PerSystemMetrics,
+{
+    enqueue_op_internal(op, submit_side, per_system_metrics, false).await
+}
+
+/// Shared implementation of [execute_op] and [enqueue_op]
+pub(crate) async fn enqueue_op_internal<O, M>(
+    op: O,
+    submit_side: SubmitSideWeak,
+    per_system_metrics: Arc<M>,
+    submit_immediately: bool,
+) -> impl Future<Output = (O::Resources, Result<O::Success, Error<O::Error>>)>
+where
+    O: Op + Send + 'static + Unpin,
+    M: PerSystemMetrics,
+{
+    let mut open_guard = match submit_side.upgrade_to_open().await {
         Some(open) => open,
         None => {
-            return (
+            return wait_or_immediate_result(Err((
                 op.on_failed_submission(),
-                Err(Error::System(SystemError::SystemShuttingDown)),
-            );
+                Error::System(SystemError::SystemShuttingDown),
+            )));
         }
     };
 
-    fn do_submit(mut open_guard: SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
-        if open_guard.submit_raw(sqe).is_err() {
-            // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
-            // So, we could just submit_and_wait here. But, that'd prevent the
-            // current executor thread from making progress on other tasks.
-            //
-            // So, for now, keep SQ size == inflight ops size == Slots size.
-            // This potentially limits throughput if SQ size is chosen too small.
-            //
-            // FIXME: why not just async mutex?
-            unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
-        }
-
-        // this allows us to keep the possible guard in cq_guard because the arc lives on stack
-        #[allow(unused_assignments)]
-        let mut cq_owned = None;
-
-        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
-            let cq = Arc::clone(&open_guard.completion_side);
-            cq_owned = Some(cq);
-            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
-        } else {
-            None
-        };
-        drop(open_guard); // drop it asap to enable timely shutdown
-
-        if let Some(mut cq) = cq_guard {
-            // opportunistically process completion immediately
-            // TODO do it during ::poll() as well?
-            //
-            // FIXME: why are we doing this while holding the SubmitSideOpen
-            cq.process_completions(ProcessCompletionsCause::Regular);
+    fn do_enqueue(open_guard: &mut SubmitSideOpenGuard, sqe: io_uring::squeue::Entry) {
+        if open_guard.push_raw(&sqe).is_err() {
+            open_guard.sq.sync();
+            if open_guard.push_raw(&sqe).is_err() {
+                // TODO: DESIGN: io_uring can deal have more ops inflight than the SQ.
+                // So, we could just submit_and_wait here. But, that'd prevent the
+                // current executor thread from making progress on other tasks.
+                //
+                // So, for now, keep SQ size == inflight ops size == Slots size.
+                // This potentially limits throughput if SQ size is chosen too small.
+                //
+                // FIXME: why not just async mutex?
+                unreachable!("the `ops` has same size as the SQ, so, if SQ is full, we wouldn't have been able to get this slot");
+            }
         }
     }
 
-    match open_guard.slots.try_get_slot() {
-        slots::TryGetSlotResult::Draining => (
-            op.on_failed_submission(),
-            Err(Error::System(SystemError::SystemShuttingDown)),
-        ),
+    let slot = match open_guard.slots.try_get_slot() {
+        slots::TryGetSlotResult::Draining => {
+            return wait_or_immediate_result(Err((
+                op.on_failed_submission(),
+                Error::System(SystemError::SystemShuttingDown),
+            )))
+        }
         slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
             per_system_metrics
                 .as_ref()
                 .observe_slots_submission_queue_depth(queue_depth);
-            slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+            slot
         }
         slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
             // All slots are taken and we're waiting in line.
+            //
+            // Nudge the kernel to start processing any IOs that we have already submitted, so that
+            // they will eventually complete and free up slots.
+            open_guard.submit_raw();
+
             // If enabled, do some opportunistic completion processing to wake up futures that will release ops slots.
             // This is in the hope that we'll wake ourselves up.
 
@@ -131,16 +149,72 @@ where
                     .unwrap()
                     .process_completions(ProcessCompletionsCause::Regular);
             }
-            let slot = match later.await {
+
+            match later.await {
                 Ok(slot) => slot,
                 Err(_dropped) => {
-                    return (
+                    return wait_or_immediate_result(Err((
                         op.on_failed_submission(),
-                        Err(Error::System(SystemError::SystemShuttingDown)),
-                    )
+                        Error::System(SystemError::SystemShuttingDown),
+                    )))
                 }
-            };
-            slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+            }
         }
+    };
+
+    let wait_fut = match slot.use_for_op(op, |sqe| do_enqueue(&mut open_guard, sqe)) {
+        Ok(wait_fut) => wait_fut,
+        Err((op, err)) => return wait_or_immediate_result(Err((op, Error::System(err)))),
+    };
+
+    if submit_immediately {
+        open_guard.submit_raw();
+
+        // this allows us to keep the possible guard in cq_guard because the arc lives on stack
+        #[allow(unused_assignments)]
+        let mut cq_owned = None;
+
+        let cq_guard = if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+            let cq = Arc::clone(&open_guard.completion_side);
+            cq_owned = Some(cq);
+            Some(cq_owned.as_ref().expect("we just set it").lock().unwrap())
+        } else {
+            None
+        };
+
+        // drop it to enable timely shutdown
+        drop(open_guard);
+
+        if let Some(mut cq) = cq_guard {
+            // opportunistically process completion immediately
+            // TODO do it during ::poll() as well?
+            //
+            // FIXME: why are we doing this while holding the SubmitSideOpen
+            cq.process_completions(ProcessCompletionsCause::Regular);
+        }
+    };
+
+    wait_or_immediate_result(Ok(wait_fut))
+}
+
+/// A helper that calls the future to wait for IO completion, or immediately returns a submission
+/// error.  This is needed to have a single future type for both, similar to
+/// [futures::future::Either].
+#[allow(clippy::type_complexity)]
+async fn wait_or_immediate_result<O>(
+    submit_result: Result<WaitForCompletion<O>, (O::Resources, Error<O::Error>)>,
+) -> (O::Resources, Result<O::Success, Error<O::Error>>)
+where
+    O: Op + Send + 'static + Unpin,
+{
+    let wait_fut = match submit_result {
+        Ok(wait_fut) => wait_fut,
+        Err((resources, err)) => return (resources, Err(err)),
+    };
+
+    let (resources, result, poll_count) = wait_fut.await;
+    if poll_count == 1 && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
+        tokio::task::yield_now().await;
     }
+    (resources, result)
 }

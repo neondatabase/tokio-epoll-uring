@@ -1,3 +1,5 @@
+use futures::future::Either;
+use futures::StreamExt;
 use rand::Rng;
 use std::{
     alloc::Layout,
@@ -149,13 +151,17 @@ impl EngineTokioEpollUring {
             ClientWorkKind::NoWork {} => ClientWorkFd::NoWork,
         };
 
-        // alloc aligned to make O_DIRECT work
-        let buf = unsafe {
-            let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
-            assert!(!ptr.is_null());
-            Vec::from_raw_parts(ptr, 0, block_size)
-        };
-        let mut loop_buf = Some(buf);
+        // Allocate buffers to read into. Alignment is required to make O_DIRECT work.
+        let mut loop_bufs = Vec::with_capacity(args.batch_size);
+        for _ in 0..args.batch_size {
+            let buf = unsafe {
+                let ptr =
+                    std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
+                assert!(!ptr.is_null());
+                Vec::from_raw_parts(ptr, 0, block_size)
+            };
+            loop_bufs.push(buf);
+        }
 
         let validate_buf = unsafe {
             let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
@@ -173,11 +179,15 @@ impl EngineTokioEpollUring {
             // simulate Timeline::layers.read().await
             let _guard = rwlock.read().await;
 
-            // find a random aligned 8k offset inside the file
+            // pick a random block-size-aligned offset inside the file for each IO in the batch
             debug_assert!(1024 * 1024 % block_size == 0);
-            let offset_in_file = rand::thread_rng()
-                .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
-                * block_size_u64;
+            let mut offsets = Vec::with_capacity(args.batch_size);
+            for _ in 0..args.batch_size {
+                let offset_in_file = rand::thread_rng()
+                    .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
+                    * block_size_u64;
+                offsets.push(offset_in_file);
+            }
 
             let start = std::time::Instant::now();
             match fd {
@@ -185,8 +195,6 @@ impl EngineTokioEpollUring {
                     raw_fd: file_fd,
                     validate,
                 } => {
-                    let owned_buf = loop_buf.take().unwrap();
-                    let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
                     // We use it to get one io_uring submission & completion ring per core / executor thread.
                     // The thread-local rings are not great if there's block_in_place in the codebase. It's fine here.
                     // Ideally we'd have one submission ring per core and a single completion ring, because, completion
@@ -196,27 +204,65 @@ impl EngineTokioEpollUring {
 
                     let handle = tokio_epoll_uring::thread_local_system().await;
 
-                    let ((file, owned_buf), res) =
-                        handle.read(file, offset_in_file, owned_buf).await;
+                    let mut used_bufs = Vec::new();
+                    {
+                        // This stream submits the reads to io_uring and produces futures to wait
+                        // for their completion.
+                        let offsets_ref = &offsets;
+                        let loop_bufs_mut = &mut loop_bufs;
+                        let reads = async_stream::stream! {
+                            for &offset in offsets_ref.iter() {
+                                let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
+                                let owned_buf = loop_bufs_mut.pop().unwrap();
+                                let handle = &handle;
 
-                    let count = res.unwrap();
-                    assert_eq!(count, owned_buf.len());
-                    assert_eq!(count, block_size);
+                                let read_fut = if args.batched {
+                                    Either::Left(
+                                        handle.read_batched(file, offset, owned_buf).await,
+                                    )
+                                } else {
+                                    Either::Right(handle.read(file, offset, owned_buf))
+                                };
+                                yield read_fut;
+                            }
+                            // All IOs have now been queued. Notify the kernel to start processing
+                            // them. (Some of them may already have been submitted implicitly, if
+                            // the batch size is larger than the ring size. This ensures that they
+                            // are all submitted.)
+                            if args.batched {
+                                handle.submit_batched().await.unwrap();
+                            }
+                        };
 
-                    if validate {
-                        let mut owned_validate_buf = loop_validate_buf.take().unwrap();
-                        owned_validate_buf.resize(block_size, 0);
-                        let std_file = unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) };
-                        let nread = std_file
-                            .read_at(&mut owned_validate_buf, offset_in_file)
-                            .unwrap();
-                        assert_eq!(nread, block_size);
-                        assert_eq!(owned_buf, owned_validate_buf);
-                        loop_validate_buf = Some(owned_validate_buf);
-                        let _ = std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
+                        // Process the results
+                        let reads = std::pin::pin!(reads);
+                        let mut reads = reads.buffered(args.batch_size + 1).enumerate();
+                        while let Some((idx, ((file, owned_buf), res))) = reads.next().await {
+                            let offset_in_file = offsets[idx];
+                            let count = res.unwrap();
+                            assert_eq!(count, owned_buf.len());
+                            assert_eq!(count, block_size);
+
+                            if validate {
+                                let mut owned_validate_buf = loop_validate_buf.take().unwrap();
+                                owned_validate_buf.resize(block_size, 0);
+                                let std_file =
+                                    unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) };
+                                let nread = std_file
+                                    .read_at(&mut owned_validate_buf, offset_in_file)
+                                    .unwrap();
+                                assert_eq!(nread, block_size);
+                                assert_eq!(owned_buf, owned_validate_buf);
+                                loop_validate_buf = Some(owned_validate_buf);
+                                let _ = std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
+                            }
+                            used_bufs.push(owned_buf);
+                            let _ = file.into_raw_fd(); // so that it's there for next iteration
+                        }
                     }
-                    loop_buf = Some(owned_buf);
-                    let _ = file.into_raw_fd(); // so that it's there for next iteration
+                    assert!(loop_bufs.is_empty());
+                    assert!(used_bufs.len() == args.batch_size);
+                    loop_bufs = used_bufs;
                 }
                 ClientWorkFd::TimerFd(_timerfd, _duration) => {
                     unimplemented!()
