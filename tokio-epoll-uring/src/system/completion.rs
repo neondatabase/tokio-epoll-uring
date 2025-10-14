@@ -645,7 +645,6 @@ mod tests {
             let jh = tokio::spawn(async move {
                 let system = System::launch_with_testing(
                     Some(testing),
-                    None,
                     &crate::metrics::GLOBAL_STORAGE,
                     Arc::new(()),
                 )

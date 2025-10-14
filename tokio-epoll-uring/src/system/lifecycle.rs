@@ -22,8 +22,6 @@ use super::{
     submission::{SubmitSide, SubmitSideInner, SubmitSideNewArgs},
 };
 
-use slots::SlotsTesting;
-
 /// A running `tokio_epoll_uring` system. Use [`Self::launch`] to start, then [`SystemHandle`] to interact.
 pub struct System {
     #[allow(dead_code)]
@@ -109,18 +107,11 @@ impl System {
     where
         M: PerSystemMetrics,
     {
-        Self::launch_with_testing(
-            None,
-            None,
-            &crate::metrics::GLOBAL_STORAGE,
-            per_system_metrics,
-        )
-        .await
+        Self::launch_with_testing(None, &crate::metrics::GLOBAL_STORAGE, per_system_metrics).await
     }
 
     pub(crate) async fn launch_with_testing<M>(
         poller_testing: Option<PollerTesting>,
-        slots_testing: Option<SlotsTesting>,
         global_metrics_storage: &'static GlobalMetricsStorage,
         per_system_metrics: Arc<M>,
     ) -> Result<SystemHandle<M>, LaunchResult>
@@ -131,8 +122,7 @@ impl System {
 
         let (submit_side, poller_ready_fut) = {
             // TODO: should we mlock `slots`? io_uring mmap is mlocked, slots are equally important for the system to function;
-            let (slots_submit_side, slots_completion_side, slots_poller) =
-                super::slots::new(id, slots_testing.unwrap_or_default());
+            let (slots_submit_side, slots_completion_side, slots_poller) = super::slots::new(id);
 
             let uring = Box::new(
                 io_uring::IoUring::builder()

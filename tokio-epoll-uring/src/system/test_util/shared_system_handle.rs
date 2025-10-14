@@ -30,7 +30,6 @@ impl SharedSystemHandle {
     ) -> Result<Self, LaunchResult> {
         let handle = System::launch_with_testing(
             poller_testing,
-            None,
             &crate::metrics::GLOBAL_STORAGE,
             Arc::new(()),
         )

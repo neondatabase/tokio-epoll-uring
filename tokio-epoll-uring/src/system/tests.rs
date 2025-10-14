@@ -208,12 +208,7 @@ fn test_metrics() {
     let metrics = Box::leak(Box::new(GlobalMetricsStorage::new_const()));
     let metrics_ptr = metrics as *mut _;
     let system = rt
-        .block_on(System::launch_with_testing(
-            None,
-            None,
-            metrics,
-            Arc::new(()),
-        ))
+        .block_on(System::launch_with_testing(None, metrics, Arc::new(())))
         .unwrap();
     assert_eq!(
         1,

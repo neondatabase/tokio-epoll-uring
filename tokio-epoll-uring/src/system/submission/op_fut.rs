@@ -54,7 +54,6 @@ pub(crate) async fn execute_op<O, M>(
     per_system_metrics: Arc<M>,
 ) -> (O::Resources, Result<O::Success, Error<O::Error>>)
 where
-    // FIXME: probably dont need the unpin
     O: Op + Send + 'static + Unpin,
     M: PerSystemMetrics,
 {
@@ -145,9 +144,16 @@ where
         }
     };
 
-    match slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)) {
-        Ok(wait_fut) => wait_fut,
-        Err((resources, err)) => return (resources, Err(Error::System(err))),
+    let (resources, result, poll_count) =
+        match slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)) {
+            Ok(wait_fut) => wait_fut,
+            Err((resources, err)) => return (resources, Err(Error::System(err))),
+        }
+        .await;
+
+    if poll_count == 1 && *crate::env_tunables::YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL {
+        tokio::task::yield_now().await;
     }
-    .await
+
+    (resources, result)
 }
