@@ -103,16 +103,18 @@ where
         }
     }
 
-    match open_guard.slots.try_get_slot() {
-        slots::TryGetSlotResult::Draining => (
-            op.on_failed_submission(),
-            Err(Error::System(SystemError::SystemShuttingDown)),
-        ),
+    let slot = match open_guard.slots.try_get_slot() {
+        slots::TryGetSlotResult::Draining => {
+            return (
+                op.on_failed_submission(),
+                Err(Error::System(SystemError::SystemShuttingDown)),
+            )
+        }
         slots::TryGetSlotResult::GotSlot { slot, queue_depth } => {
             per_system_metrics
                 .as_ref()
                 .observe_slots_submission_queue_depth(queue_depth);
-            slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+            slot
         }
         slots::TryGetSlotResult::NoSlots { later, queue_depth } => {
             // All slots are taken and we're waiting in line.
@@ -131,7 +133,7 @@ where
                     .unwrap()
                     .process_completions(ProcessCompletionsCause::Regular);
             }
-            let slot = match later.await {
+            match later.await {
                 Ok(slot) => slot,
                 Err(_dropped) => {
                     return (
@@ -139,8 +141,9 @@ where
                         Err(Error::System(SystemError::SystemShuttingDown)),
                     )
                 }
-            };
-            slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
+            }
         }
-    }
+    };
+
+    slot.use_for_op(op, |sqe| do_submit(open_guard, sqe)).await
 }
