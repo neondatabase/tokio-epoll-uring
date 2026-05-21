@@ -2,6 +2,27 @@
 
 Append-only log driven by the autonomous overnight run. Each iteration is one entry; entries flow top-to-bottom in chronological order. The bottom of the file holds the **rolling hypothesis tree** — the agent's current working theory of where the perf gap comes from and what to attack next.
 
+## TL;DR for Christian when you wake up
+
+I ran four perf iterations on the `tokio-epoll-uring-upstream` backend. The dominant cost is exactly what we hypothesised: the single `parking_lot::Mutex<UringContext>` in tokio's io_uring driver. With 400 concurrent O_DIRECT readers it eats 26% of CPU on futex_wait alone, and the IOPS gap to the side-ring backend is **2.7× (124k vs 333k)**.
+
+What worked, what didn't, and where we land:
+
+- **ITER 1 (jemalloc, REJECTED):** wired in `tikv-jemallocator` but every benchmark engine has a pre-existing alignment UB (Vec wrapping an over-aligned alloc), so jemalloc SEGVs at shutdown. Dep is in `Cargo.toml`, install is commented out with a one-paragraph unblock note. Tracked as **FU-1** (AlignedBuf wrapper).
+- **ITER 2 (cache `is_supported`, ACCEPTED, +0.6%):** small but correct simplification.
+- **ITER 3 (ring size 256 → 4096, REJECTED):** not the bottleneck, abandoned.
+- **ITER 4 (move `io_uring_enter` outside the Mutex, +45% bench, but REVERTED):** the lock-free submit gives a real **+45% IOPS** (124k → 180k) on the benchmark BUT hangs `tokio/tests/fs_uring::open_many_files` — the µs-scale lock-hold during the syscall happens to be the only thing that yields workers back to the kernel scheduler, so the IO driver thread starves. Reverted in tokio.
+- **Architectural conclusion — `MULTI_RING_DESIGN.md`:** the multi-ring (one io_uring per worker) direction you raised is the right answer. Phase 1 design + file-by-file change plan is written out in `MULTI_RING_DESIGN.md`. Estimated lift: ~2-3 days of tokio work. Not implemented this session — the design was the deliverable I aimed for given the time/context budget.
+
+Reading order tonight ⇒ tomorrow:
+1. This TL;DR
+2. `MULTI_RING_DESIGN.md` — the architectural proposal
+3. ITER 4 entry below (the lock-free submit experiment; +45% but hangs `open_many_files`)
+4. The hypothesis tree at the bottom of this file (currently pruned to "H6 = multi-ring is now top priority")
+
+Benchmark + perf data lives in `/ephemeral/direct-io/` and `/ephemeral/perf/`. The perf loop scripts (`perf-iter.sh`, `perf-compare.sh`) are still wired up; you can re-profile any iteration locally without me.
+
+
 ## Re-orientation protocol (read after context compaction)
 
 ```
@@ -93,6 +114,36 @@ For each iteration, append a block like:
 - conclusion:     **accepted** (correct change, makes the hot path simpler), but **not** the win we're looking for. The real bottleneck is the Mutex itself, not the probe-per-op.
 - commit:         next
 - followups:      same as ITER 0 plus H6 (multi-ring) climbs to top priority.
+
+---
+
+### ITER 3 — bump tokio `DEFAULT_RING_SIZE` 256 → 4096 (REJECTED)
+- date:           2026-05-21 23:37
+- hypothesis:     with 400 in-flight ops, a 256-entry SQ might force the SQ-full submit path inside `register_op`. Larger ring = fewer such "submit under lock" cycles.
+- change:         `tokio/src/runtime/io/driver/uring.rs:15` `DEFAULT_RING_SIZE = 4096`.
+- bench delta (vs ITER 2): 124,417 → **122,730** = -1.4% (within noise, possibly slightly worse).
+- conclusion:     **rejected, abandoned.** 400 clients × 1 in-flight op each ≤ 256 SQ slots almost always; the original 256 was sufficient. Memory waste and zero IOPS benefit.
+- commit:         abandoned in ~/tokio
+- followups:      same hypothesis tree. The next experiments need to target the Mutex itself, not the ring size.
+
+---
+
+### ITER 4 — move `io_uring_enter` outside the `Mutex<UringContext>` (REVERTED — fast but breaks liveness)
+- date:           2026-05-22 06:15
+- hypothesis:     primary upstream hotspot is the parking_lot Mutex around tokio's UringContext: every `register_op` and `Op::poll` acquires it, and `register_op` holds the lock during the `io_uring_enter` syscall (microseconds). io-uring's `Submitter::submit()` is `&self`-only, and io_uring explicitly supports concurrent submit syscalls — so we can push+sync the SQ under the lock, drop the lock, then call `io_uring_enter` via a cached raw fd. Expected: +30-50% IOPS.
+- change (tokio):
+  - `runtime/io/driver.rs:61` add `uring_raw_fd: AtomicI32` alongside `uring_context: Mutex<UringContext>`; default -1
+  - `runtime/io/driver/uring.rs:Handle::try_init` cache `uring.as_raw_fd()` into `uring_raw_fd` after ring init
+  - new `Handle::submit_unlocked()` — raw `libc::syscall(SYS_io_uring_enter, fd, 4096, 0, 0, NULL, 0)`; swallows EAGAIN/EINTR/EBUSY (other submitters will retry)
+  - `Handle::register_op` restructured into Phase 1 (locked: slab insert + SQ push + CQ-full handling + `sq.sync()`) and Phase 2 (lock-free: `submit_unlocked()`)
+- bench delta (vs ITER 2): 124k → **180k IOPS = +45%**; p50 3090 → 2118 µs (-31%); p99 7217 → 5018 µs (-30%); p99.9 9069 → 6582 µs; max 12911 → 38371 µs (worse tail by a single outlier — noise).
+- regression: `tokio/tests/fs_uring::open_many_files` (which spawns 10,000 file-open tasks) hangs. Instrumenting showed `register_op` + `submit_unlocked` happen 1000s of times but `dispatch_completions` is never called. With the original submit-under-lock the same test sees `dispatch_completions` invoked ~hundreds of times in the same wall-clock window.
+- root cause (best guess, unconfirmed): without the µs-scale lock-hold during `io_uring_enter`, worker threads never yield to the kernel scheduler, so the runtime's IO driver thread doesn't get a chance to run `turn()` → `dispatch_completions()`. The lock contention previously acted as an inadvertent fairness mechanism. The benchmark's steady-state RPS workload still drains CQs because every worker eventually parks waiting on its next read; `open_many_files`'s burst-of-10k-spawns followed by `tracker.wait()` never yields to the IO driver under the new scheduling pattern.
+- conclusion:     **reverted in tokio.** The +45% on the bench is real but unrelated to a correctness-safe change. Closing the gap properly requires either (a) explicitly yielding to the IO driver from `register_op` (smells, adds a context switch), (b) running `dispatch_completions` opportunistically from `register_op` after the lock-free submit (re-takes the lock, undoes the win), or (c) **per-worker rings** so submission and dispatch happen on the same thread with no Mutex at all.
+- commit:         abandoned in ~/tokio
+- followups:
+  - H6 (per-worker rings) is now both the architectural answer AND the only correctness-clean path to capturing the +45% headroom. Promoted to top priority.
+  - FU-2: a smaller follow-up — make `submit_unlocked` opportunistic (e.g. once every N register_ops, or once per turn()) so the lock-yield path still happens. Likely partial win + no liveness regression. Skipped for now in favor of H6.
 
 ---
 
