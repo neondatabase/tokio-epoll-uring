@@ -65,4 +65,22 @@ For each iteration, append a block like:
 
 ---
 
+### ITER 1 — jemalloc as global allocator (REJECTED, blocked by pre-existing UB)
+- date:           2026-05-21 23:30
+- hypothesis:     Christian requested jemalloc to match PageServer's production allocator. Should be net-positive or neutral; uniformly applied to all engines so comparisons stay fair.
+- change:         `benchmark/Cargo.toml` add `tikv-jemallocator = "0.6"` dep; `benchmark/src/main.rs` install `#[global_allocator]`.
+- result:         **SIGSEGV at shutdown.** Every engine SEGVs (exit 139) right after the last "Client X stopping" log line, before the JSON output is written.
+- root cause:     pre-existing UB in benchmark allocator usage. Every engine has:
+    ```
+    let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
+    Vec::from_raw_parts(ptr, 0, block_size)
+    ```
+    `Vec<u8>::Drop` frees with `Layout::array::<u8>(block_size)` (align=1), not the original alignment (= block_size). System allocator silently forgives this; jemalloc rejects it as a heap corruption and aborts.
+- conclusion:     **rejected for now**; would also reject without jemalloc if you ran under valgrind/MIRI. Logged as a follow-up; jemalloc dep stays in `Cargo.toml` with a clear comment in `main.rs` describing the unblock path.
+- commit:         (jemalloc dep retained, allocator install commented out)
+- followups:
+  - **FU-1:** introduce an `AlignedBuf` wrapper that owns the aligned alloc separately from the Vec view, fix every engine (`benchmark/src/engines/*.rs`), then re-enable jemalloc. Probably 1-2h of work; not on the critical path for the perf demo.
+
+---
+
 (iterations continue below)

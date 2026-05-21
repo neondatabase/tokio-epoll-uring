@@ -1,3 +1,17 @@
+// jemalloc is wired into Cargo.toml but **not** installed as the global
+// allocator yet: every benchmark engine allocates O_DIRECT-aligned IO
+// buffers via `std::alloc::alloc(Layout::from_size_align(N, N))` and then
+// hands them to `Vec::from_raw_parts(ptr, 0, N)`. Vec's Drop frees with
+// `Layout::array::<u8>(N)` (align=1), not the original alignment. The
+// system allocator forgives this mismatch; jemalloc rejects it and the
+// benchmark SIGSEGVs at shutdown. Fixing the UB requires either an
+// `AlignedBuf` wrapper that owns the alloc separately, or using
+// `bytes::BytesMut` with custom alignment. Tracked in ITER_LOG.
+// To enable: replace this comment with
+//   #[global_allocator]
+//   static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// after the alignment UB is fixed across all engines.
+
 use std::{
     alloc::Layout,
     collections::HashMap,
