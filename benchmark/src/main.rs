@@ -17,6 +17,7 @@ use clap::Parser;
 use crossbeam_utils::CachePadded;
 use engines::{
     std_thread::EngineStd, tokio_epoll_uring::EngineTokioEpollUring,
+    tokio_epoll_uring_upstream::EngineTokioEpollUringUpstream,
     tokio_on_executor_thread::EngineTokioOnExecutorThread,
     tokio_spawn_blocking::EngineTokioSpawnBlocking, tokio_uring::EngineTokioUring,
 };
@@ -155,6 +156,10 @@ enum EngineKind {
         spawn_blocking_pool_size: NonZeroUsize,
     },
     TokioEpollUring,
+    /// Same client loop as TokioEpollUring, but drives the operations
+    /// through tokio's own io_uring ring via the new public
+    /// `tokio::io_uring` API (TOKIO_EPOLL_URING_BACKEND=tokio-upstream).
+    TokioEpollUringUpstream,
     TokioUring,
 }
 
@@ -651,6 +656,7 @@ fn setup_engine(engine_kind: &EngineKind) -> Box<dyn Engine> {
             spawn_blocking_pool_size,
         } => Box::new(EngineTokioSpawnBlocking::new(*spawn_blocking_pool_size)),
         EngineKind::TokioEpollUring => Box::new(EngineTokioEpollUring::new()),
+        EngineKind::TokioEpollUringUpstream => Box::new(EngineTokioEpollUringUpstream::new()),
         EngineKind::TokioUring => Box::new(EngineTokioUring::new()),
     }
 }

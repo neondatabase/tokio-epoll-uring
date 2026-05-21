@@ -1,0 +1,225 @@
+//! Identical to the side-ring `EngineTokioEpollUring` engine, but sets
+//! `TOKIO_EPOLL_URING_BACKEND=tokio-upstream` in `new()` so the crate's
+//! runtime backend dispatches via tokio's own ring.
+
+use rand::Rng;
+use std::{
+    alloc::Layout,
+    ops::ControlFlow,
+    os::{
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+        unix::prelude::FileExt,
+    },
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tracing::{debug, info};
+
+use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
+
+pub(crate) struct EngineTokioEpollUringUpstream {
+    rt: tokio::runtime::Runtime,
+}
+
+impl EngineTokioEpollUringUpstream {
+    pub fn new() -> Self {
+        // This routes every tokio-epoll-uring System::launch in this process
+        // to the upstream backend, which submits SQEs through tokio's own
+        // io_uring ring via the public tokio::io_uring API.
+        std::env::set_var("TOKIO_EPOLL_URING_BACKEND", "tokio-upstream");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        Self { rt }
+    }
+}
+
+impl Engine for EngineTokioEpollUringUpstream {
+    fn run(
+        self: Box<Self>,
+        args: Arc<Args>,
+        works: Vec<ClientWork>,
+        clients_ready: Arc<tokio::sync::Barrier>,
+        stop: Arc<AtomicBool>,
+        stats_state: Arc<StatsState>,
+    ) -> EngineRunResult {
+        let EngineTokioEpollUringUpstream { rt } = *self;
+        let rt = Arc::new(rt);
+
+        rt.block_on(async move {
+            let mut handles = Vec::new();
+            for (i, work) in (0..args.num_clients.get()).zip(works) {
+                let stop = Arc::clone(&stop);
+                let stats_state = Arc::clone(&stats_state);
+                let clients_ready = Arc::clone(&clients_ready);
+                handles.push(tokio::spawn({
+                    let args = Arc::clone(&args);
+                    async move {
+                        clients_ready.wait().await;
+                        Self::client(i, &args, work, &stop, stats_state).await;
+                        std::time::Instant::now()
+                    }
+                }));
+            }
+            let stopped_handles = Arc::new(
+                (0..handles.len())
+                    .map(|_| AtomicBool::new(false))
+                    .collect::<Vec<_>>(),
+            );
+            let stop_stopped_task_status_task = Arc::new(AtomicBool::new(false));
+            let stopped_task_status_task = tokio::spawn({
+                let stopped_handles = Arc::clone(&stopped_handles);
+                let stop_clients = Arc::clone(&stop);
+                let stop_stopped_task_status_task = Arc::clone(&stop_stopped_task_status_task);
+                async move {
+                    while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
+                        if !stop_clients.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                            debug!("waiting for clients to stop");
+                            continue;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let stopped = stopped_handles
+                            .iter()
+                            .map(|x| x.load(Ordering::Relaxed))
+                            .filter(|x| *x)
+                            .count();
+                        let not_stopped = stopped_handles
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, stopped)| !stopped.load(Ordering::Relaxed))
+                            .map(|(i, _)| i)
+                            .collect::<Vec<usize>>();
+                        let total = stopped_handles.len();
+                        info!("handles stopped {stopped} total {total}");
+                        info!("  not stopped: {not_stopped:?}",)
+                    }
+                }
+            });
+            let mut client_finish_times = Vec::new();
+            for (i, handle) in handles.into_iter().enumerate() {
+                info!("awaiting client {i}");
+                let runtime = handle.await.unwrap();
+                stopped_handles[i].store(true, Ordering::Relaxed);
+                client_finish_times.push(runtime);
+            }
+            stop_stopped_task_status_task.store(true, Ordering::Relaxed);
+            info!("awaiting stopped_task_status_task");
+            stopped_task_status_task.await.unwrap();
+            info!("stopped_task_status_task stopped");
+            EngineRunResult {
+                client_finish_times,
+            }
+        })
+    }
+}
+
+impl EngineTokioEpollUringUpstream {
+    #[tracing::instrument(skip_all, level = "trace", fields(client=%i))]
+    async fn client(
+        i: u64,
+        args: &Args,
+        work: ClientWork,
+        stop: &AtomicBool,
+        stats_state: Arc<StatsState>,
+    ) {
+        let block_size = 1 << args.block_size_shift.get();
+        let rwlock = Arc::new(tokio::sync::RwLock::new(()));
+
+        #[derive(Copy, Clone)]
+        enum ClientWorkFd {
+            DiskAccess { raw_fd: RawFd, validate: bool },
+            TimerFd(RawFd, Duration),
+            NoWork,
+        }
+
+        let fd = match work.kind {
+            ClientWorkKind::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+                raw_fd: file.into_raw_fd(),
+                validate,
+            },
+            ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
+                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
+                std::mem::forget(timerfd);
+                ret
+            }
+            ClientWorkKind::NoWork {} => ClientWorkFd::NoWork,
+        };
+
+        let buf = unsafe {
+            let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
+            assert!(!ptr.is_null());
+            Vec::from_raw_parts(ptr, 0, block_size)
+        };
+        let mut loop_buf = Some(buf);
+
+        let validate_buf = unsafe {
+            let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
+            assert!(!ptr.is_null());
+            Vec::from_raw_parts(ptr, 0, block_size)
+        };
+        let mut loop_validate_buf = Some(validate_buf);
+
+        let block_size_u64: u64 = block_size.try_into().unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            let ControlFlow::Continue(()) = work.ops_left.take_one_op() else {
+                break;
+            };
+
+            let _guard = rwlock.read().await;
+
+            debug_assert!(1024 * 1024 % block_size == 0);
+            let offset_in_file = rand::thread_rng()
+                .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
+                * block_size_u64;
+
+            let start = std::time::Instant::now();
+            match fd {
+                ClientWorkFd::DiskAccess {
+                    raw_fd: file_fd,
+                    validate,
+                } => {
+                    let owned_buf = loop_buf.take().unwrap();
+                    let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
+
+                    let handle = tokio_epoll_uring::thread_local_system().await;
+
+                    let ((file, owned_buf), res) =
+                        handle.read(file, offset_in_file, owned_buf).await;
+
+                    let count = res.unwrap();
+                    assert_eq!(count, owned_buf.len());
+                    assert_eq!(count, block_size);
+
+                    if validate {
+                        let mut owned_validate_buf = loop_validate_buf.take().unwrap();
+                        owned_validate_buf.resize(block_size, 0);
+                        let std_file = unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) };
+                        let nread = std_file
+                            .read_at(&mut owned_validate_buf, offset_in_file)
+                            .unwrap();
+                        assert_eq!(nread, block_size);
+                        assert_eq!(owned_buf, owned_validate_buf);
+                        loop_validate_buf = Some(owned_validate_buf);
+                        let _ = std_file.into_raw_fd();
+                    }
+                    loop_buf = Some(owned_buf);
+                    let _ = file.into_raw_fd();
+                }
+                ClientWorkFd::TimerFd(_timerfd, _duration) => {
+                    unimplemented!()
+                }
+                ClientWorkFd::NoWork => (),
+            }
+
+            stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
+                .fetch_add(1, Ordering::Relaxed);
+            stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
+        }
+        info!("Client {i} stopping");
+    }
+}
