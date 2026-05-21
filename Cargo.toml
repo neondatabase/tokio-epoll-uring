@@ -5,3 +5,12 @@ members = [
     "benchmark",
     "uring-common",
 ]
+
+# Pin every tokio dep in the workspace to the locally-patched checkout, which
+# exposes the public `tokio::io_uring` API the new upstream backend relies on.
+[patch.crates-io]
+tokio = { path = "/home/christian.schwarz/tokio/tokio" }
+tokio-macros = { path = "/home/christian.schwarz/tokio/tokio-macros" }
+tokio-stream = { path = "/home/christian.schwarz/tokio/tokio-stream" }
+tokio-util = { path = "/home/christian.schwarz/tokio/tokio-util" }
+tokio-test = { path = "/home/christian.schwarz/tokio/tokio-test" }

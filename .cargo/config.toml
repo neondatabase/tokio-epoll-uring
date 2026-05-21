@@ -1,0 +1,3 @@
+[build]
+# Required so the patched tokio (which gates io_uring on this cfg) compiles.
+rustflags = ["--cfg", "tokio_unstable"]

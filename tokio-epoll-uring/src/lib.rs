@@ -96,6 +96,38 @@ pub mod metrics;
 
 #[doc(hidden)]
 pub mod env_tunables {
+    /// Which io_uring backend powers the `System`. Read once at the first call
+    /// to [`crate::System::launch`].
+    ///
+    /// - `SideRing` (default): tokio-epoll-uring runs its own io_uring ring on
+    ///   a dedicated poller task driven by epoll on the ring's fd.
+    /// - `TokioUpstream`: SQEs are submitted through tokio's own ring via the
+    ///   public `tokio::io_uring` API. No side ring, no poller, no slots.
+    ///
+    /// Selected via the `TOKIO_EPOLL_URING_BACKEND` env var (`side-ring` /
+    /// `tokio-upstream`). The crate's public surface is unaffected — the
+    /// same `SystemHandle::read/write/...` methods route to whichever
+    /// backend was selected.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Backend {
+        SideRing,
+        TokioUpstream,
+    }
+    pub(crate) static BACKEND: once_cell::sync::Lazy<Backend> =
+        once_cell::sync::Lazy::new(|| match std::env::var("TOKIO_EPOLL_URING_BACKEND") {
+            Ok(v) => match v.as_str() {
+                "side-ring" => Backend::SideRing,
+                "tokio-upstream" => Backend::TokioUpstream,
+                other => panic!(
+                    "TOKIO_EPOLL_URING_BACKEND must be 'side-ring' or 'tokio-upstream', got {other:?}"
+                ),
+            },
+            Err(std::env::VarError::NotPresent) => Backend::SideRing,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("TOKIO_EPOLL_URING_BACKEND must be a unicode string")
+            }
+        });
+
     pub(crate) static YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: once_cell::sync::Lazy<bool> =
         once_cell::sync::Lazy::new(|| {
             std::env::var("EPOLL_URING_YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL")
@@ -142,5 +174,6 @@ pub mod env_tunables {
                 | "EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT" => {}
                 x => panic!("env var starts with EPOLL_URING but is not an env_tunable: {x:?}"),
             });
+        // `TOKIO_EPOLL_URING_BACKEND` is validated lazily in `BACKEND` above.
     }
 }

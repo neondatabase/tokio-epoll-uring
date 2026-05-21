@@ -129,6 +129,18 @@ impl System {
     {
         let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // Branch on the process-wide backend selection. The Upstream backend
+        // skips all of the side-ring setup: no second ring, no Poller task,
+        // no Slots, no Submitter — tokio owns the ring and SQ/CQ.
+        if *crate::env_tunables::BACKEND == crate::env_tunables::Backend::TokioUpstream {
+            global_metrics_storage
+                .systems_created
+                .fetch_add(1, Ordering::Relaxed);
+            // PollerTesting/SlotsTesting are side-ring-only knobs; ignored.
+            let _ = (poller_testing, slots_testing);
+            return Ok(SystemHandle::new_upstream(id, per_system_metrics));
+        }
+
         let (submit_side, poller_ready_fut) = {
             // TODO: should we mlock `slots`? io_uring mmap is mlocked, slots are equally important for the system to function;
             let (slots_submit_side, slots_completion_side, slots_poller) =
