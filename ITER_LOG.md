@@ -83,4 +83,17 @@ For each iteration, append a block like:
 
 ---
 
+### ITER 2 — skip `is_supported(opcode).await` after first hit per opcode
+- date:           2026-05-21 23:34
+- hypothesis:     Every SQE submit awaits `tokio::io_uring::is_supported(opcode)`. After first init, the OnceCell is already populated so the function returns "instantly" — but it's still an async fn that polls a future and walks the get_or_try_init path. Caching the per-opcode result in an AtomicU64 bitmap in TEU's adapter should skip ~100ns/op + remove the future state machine. Expected: small IOPS gain (1-3%), should be visible in the perf top.
+- change:         `tokio-epoll-uring/src/system/backend_upstream.rs:1-25` adds a process-wide `static OPCODE_SUPPORTED_BITMAP: AtomicU64` and shortcuts the probe in `execute_op_upstream` when the bit is already set.
+- profile tags:   `tokio-epoll-uring-upstream__iter2_20260521-233429`
+- bench delta (vs ITER 0): IOPS 123,726 → **124,417** = +0.6% (within run-to-run noise). p50/p99/tail unchanged.
+- perf delta:     overall lock-related leaves slightly down (`unlock_slow` -150k, `register_op` -112k, `futex_wake` -252k samples) — confirming the await *did* cost some CPU. But the net IOPS effect is within noise because we're contention-bound regardless.
+- conclusion:     **accepted** (correct change, makes the hot path simpler), but **not** the win we're looking for. The real bottleneck is the Mutex itself, not the probe-per-op.
+- commit:         next
+- followups:      same as ITER 0 plus H6 (multi-ring) climbs to top priority.
+
+---
+
 (iterations continue below)
