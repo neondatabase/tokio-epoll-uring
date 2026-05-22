@@ -129,10 +129,10 @@ impl System {
     {
         let id = SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Branch on the process-wide backend selection. The Upstream backend
-        // skips all of the side-ring setup: no second ring, no Poller task,
-        // no Slots, no Submitter — tokio owns the ring and SQ/CQ.
-        if *crate::env_tunables::BACKEND == crate::env_tunables::Backend::TokioUpstream {
+        // Branch on the process-wide backend selection. The TokioNative
+        // backend skips all of the side-ring setup: no second ring, no Poller
+        // task, no Slots, no Submitter — tokio owns the ring and SQ/CQ.
+        if crate::default_backend() == crate::Backend::TokioNative {
             global_metrics_storage
                 .systems_created
                 .fetch_add(1, Ordering::Relaxed);

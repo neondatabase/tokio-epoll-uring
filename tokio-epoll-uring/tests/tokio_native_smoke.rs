@@ -1,19 +1,20 @@
-//! Smoke tests for the `TOKIO_EPOLL_URING_BACKEND=tokio-upstream` backend.
+//! Smoke tests for the `Backend::TokioNative` backend.
 //!
-//! Runs in its own integration-test binary so the env var doesn't race with
-//! other tests (which assume the default side-ring backend).
+//! Runs in its own integration-test binary so the global `set_default_backend`
+//! state doesn't conflict with other tests (which assume the default
+//! side-ring backend).
 
 use std::os::fd::OwnedFd;
 
-fn install_upstream_backend() {
-    // Set before any tokio-epoll-uring code reads the env var. Tests in this
-    // binary share a process, but they all want the same backend.
-    std::env::set_var("TOKIO_EPOLL_URING_BACKEND", "tokio-upstream");
+fn install_tokio_native_backend() {
+    // Idempotent within a process. Call before any tokio-epoll-uring System
+    // is launched.
+    let _ = tokio_epoll_uring::set_default_backend(tokio_epoll_uring::Backend::TokioNative);
 }
 
 #[test]
-fn upstream_nop_roundtrip() {
-    install_upstream_backend();
+fn tokio_native_nop_roundtrip() {
+    install_tokio_native_backend();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -26,8 +27,8 @@ fn upstream_nop_roundtrip() {
 }
 
 #[test]
-fn upstream_read_dev_zero() {
-    install_upstream_backend();
+fn tokio_native_read_dev_zero() {
+    install_tokio_native_backend();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -48,8 +49,8 @@ fn upstream_read_dev_zero() {
 }
 
 #[test]
-fn upstream_drop_in_flight() {
-    install_upstream_backend();
+fn tokio_native_drop_in_flight() {
+    install_tokio_native_backend();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

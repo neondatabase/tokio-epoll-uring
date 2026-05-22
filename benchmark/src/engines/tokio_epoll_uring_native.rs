@@ -1,6 +1,6 @@
-//! Identical to the side-ring `EngineTokioEpollUring` engine, but sets
-//! `TOKIO_EPOLL_URING_BACKEND=tokio-upstream` in `new()` so the crate's
-//! runtime backend dispatches via tokio's own ring.
+//! Identical to the side-ring `EngineTokioEpollUring` engine, but flips the
+//! crate-wide default backend to `Backend::TokioNative` in `new()` so the
+//! crate's runtime backend dispatches via tokio's own ring.
 
 use rand::Rng;
 use std::{
@@ -26,10 +26,11 @@ pub(crate) struct EngineTokioEpollUringUpstream {
 
 impl EngineTokioEpollUringUpstream {
     pub fn new() -> Self {
-        // This routes every tokio-epoll-uring System::launch in this process
-        // to the upstream backend, which submits SQEs through tokio's own
+        // Route every tokio-epoll-uring System::launch in this process to
+        // the TokioNative backend, which submits SQEs through tokio's own
         // io_uring ring via the public tokio::io_uring API.
-        std::env::set_var("TOKIO_EPOLL_URING_BACKEND", "tokio-upstream");
+        tokio_epoll_uring::set_default_backend(tokio_epoll_uring::Backend::TokioNative)
+            .expect("benchmark engines own backend selection; conflict means a prior engine set a different backend in the same process");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
