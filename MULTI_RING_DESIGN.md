@@ -317,6 +317,66 @@ When this lands the user-facing demo should be:
 - Whether `current_worker_id()` should be public — probably yes eventually (useful for other affinity-aware integrations).
 - Whether `Slot` should be `Arc<Slot>` (simpler, one alloc per op) or `*const Slot` into a fixed pool (zero per-op alloc, more unsafe). Start with `Arc<Slot>`, optimise later if perf demands.
 
+## Phase 2 conservative refinement (decided 2026-05-22)
+
+The aggressive "io_uring_enter as park primitive" design was deferred — too radical for existing tokio users (changes signal handling, shutdown timing, observable kernel state) even though it'd be the cleanest. The pragmatic Phase 2 keeps mio as the park primitive but eliminates the M→K bounce in Scenario B (one core idle, others busy).
+
+### The bounce we're eliminating
+
+Without per-poll owner-side drain, when ring K has a CQE while worker K is busy:
+
+```
+ring K cqe ─► mio wakes M (parked elsewhere) ─► M acquires K's Mutex
+                                             ─► M drains K's CQ
+                                             ─► M fires task waker (task runs on K)
+                                             ─► waker pushes to K's run queue   (cross-CPU)
+                                             ─► K eventually picks it up
+```
+
+Two cache-line crossings (M→K queue push, K→M next mio wake) plus a Mutex acquire on K's ring that K could have done locally. Invisible at the bench's p99 (NVMe service time dominates), but real on tight io_uring workloads.
+
+### The fix: per-poll Path II drain with a free empty-check
+
+```rust
+fn maybe_drain_own_ring(&self, ...) {
+    let ring = handle.get_uring(self.worker_index);
+    // Two atomic loads on shared CQ memory. ~1-2 ns. Effectively free.
+    if !ring.cq_has_entries() { return; }
+    // try_lock so we never block the task loop.
+    if let Some(mut g) = ring.try_lock() { g.dispatch_completions(); }
+}
+```
+
+Called after **every** task poll, not every 61. The `cq_has_entries()` fast path is two `atomic load Acquire` on the SQ memory mapping — cache-hot, ~ns. We pay almost nothing when the ring is empty (the common case mid-task) and we drain immediately when CQEs exist. Busy worker K processes a task, finishes the poll, checks own ring, drains, fires waker locally → next task on K's LIFO slot. **No bounce.**
+
+### Aspirational: Path III drains-self-only + unparks-others
+
+The parked worker M in `Driver::turn` ideally drains only its own ring; for events on ring K, it unparks K so K can drain locally. Requires cross-layer plumbing (io driver needs scheduler's per-worker unpark API). **Deferred.** With per-poll Path II, the central drain rarely sees CQEs to begin with (busy workers self-drain; idle workers' rings get caught by mio-parked worker as backstop).
+
+### Tail-latency expectations by scenario
+
+| Scenario | Dominant drain path | Effective dispatch latency |
+|----------|---------------------|----------------------------|
+| All cores busy | Path II (per-poll, empty-check) | ~1 task poll ≈ 5 µs |
+| 1 core idle (rest busy) | Path II for busy, Path III backup for the parked one's own ring | ~µs |
+| Multiple cores idle | Same as above | ~µs |
+| All cores idle | mio wake + Path III on parked worker's ring | ~µs |
+| CPU-saturated (no Path II hits) | Path II on next yield | bounded by tokio's `coop::budget` (128 polls) |
+
+The "61-tick DRAIN_EVERY" floor (~300 µs) from the initial proposal is gone — drain runs every poll. The cost is two atomic loads per task poll, which is below measurement noise.
+
+### Non-worker fallback comment
+
+The `unwrap_or(0)` on `pick_ring_id` falls back to worker 0's ring for callers outside a worker context (current_thread runtime, block_on from main thread, spawn_blocking-nested block_on). TEU never hits this path (all submissions are from worker-bound async tasks). The fallback exists only to keep the patched `tokio::fs::*` and the existing `fs_uring` tests working without panicking. Worker 0's ring takes the contention from non-worker callers; rare in practice.
+
+### What we are NOT doing in this Phase 2
+
+- io_uring_enter as park primitive (too radical, deferred to a later phase if ever)
+- Per-worker mio Poll (full split, large refactor, no measured need)
+- Arc<Slot> + AtomicWaker lock-free `Op::poll` (overkill — per-ring Mutex is owner-affine and uncontested after these changes)
+- Multishot POLL_ADD of mio epoll fd into own ring (only needed for the aggressive design)
+- Builder::io_uring_per_worker(bool) — env var stepping stone is fine for the demo; Builder API for upstream PR
+
 ## Authoring notes
 
 - This design was reached after the overnight perf iteration confirmed the Mutex is the dominant cost. The micro-optimization branch (ITER 1-4 in `ITER_LOG.md`) ruled out cheaper fixes.

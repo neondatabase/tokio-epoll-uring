@@ -98,6 +98,7 @@ impl EngineStd {
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
+            crate::do_cpu_work(&args);
         }
         info!("Client {i} stopping");
     }

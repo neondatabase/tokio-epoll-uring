@@ -52,8 +52,44 @@ struct Args {
     block_size_shift: NonZeroU64,
     #[clap(long, default_value = "until-ctrl-c")]
     run_duration: RunDuration,
+    /// Average nanoseconds of CPU "application work" to do after each
+    /// completed read, modeling a workload that does some processing
+    /// per IO. Each iteration's CPU burn is drawn uniformly from
+    /// `[0, 2N]` (so average = N, ±100% spread). Default 0 = no work.
+    ///
+    /// Used to study how the various engines degrade under CPU load:
+    /// in tokio-epoll-uring's side-ring backend, the per-thread poller
+    /// is itself a tokio task and competes with these CPU-bound client
+    /// tasks for worker time.
+    #[clap(long, default_value_t = 0)]
+    cpu_work_per_op_ns: u64,
     #[clap(subcommand)]
     work_kind: WorkKind,
+}
+
+/// Busy-wait for a randomized duration centred on
+/// `args.cpu_work_per_op_ns`. Called after each completed read in every
+/// engine's client loop. No-op if the knob is zero (the common case).
+///
+/// The randomness uses each thread's RNG and the bounds are
+/// `[0, 2*N]` ns so the average is `N`. We rely on `Instant::now()`
+/// polling rather than calibrated arithmetic so the busy-wait is
+/// hardware-independent.
+#[inline]
+pub(crate) fn do_cpu_work(args: &Args) {
+    if args.cpu_work_per_op_ns == 0 {
+        return;
+    }
+    let two_n = args.cpu_work_per_op_ns.saturating_mul(2);
+    let target = rand::random::<u64>() % (two_n + 1);
+    if target == 0 {
+        return;
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_nanos(target);
+    while std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
