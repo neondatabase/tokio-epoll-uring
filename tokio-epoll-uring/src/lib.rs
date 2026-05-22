@@ -94,6 +94,72 @@ pub(crate) mod util;
 
 pub mod metrics;
 
+/// Which io_uring backend powers a [`System`].
+///
+/// Set process-wide via [`set_default_backend`] before launching any [`System`].
+/// Defaults to [`Backend::SideRing`] if never set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// tokio-epoll-uring runs its own io_uring ring on a dedicated poller task
+    /// driven by epoll on the ring's fd. The historical default.
+    SideRing,
+    /// SQEs are submitted through tokio's own ring via the public
+    /// `tokio::io_uring` API. No side ring, no poller, no slots — tokio owns
+    /// the ring and SQ/CQ. Requires the tokio runtime to be built with the
+    /// `io-uring` feature enabled.
+    TokioNative,
+}
+
+static DEFAULT_BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
+
+/// Returned by [`set_default_backend`] when a *different* backend was already set.
+#[derive(Debug, Clone, Copy)]
+pub struct BackendAlreadySet {
+    pub existing: Backend,
+    pub attempted: Backend,
+}
+
+impl std::fmt::Display for BackendAlreadySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tokio-epoll-uring default backend already set to {:?}, cannot change to {:?}",
+            self.existing, self.attempted
+        )
+    }
+}
+
+impl std::error::Error for BackendAlreadySet {}
+
+/// Set the backend used for [`System`]s launched after this call. Call once at
+/// process startup, before the first [`System::launch`] or
+/// [`thread_local_system`] usage.
+///
+/// Idempotent if called multiple times with the same value. Returns
+/// [`BackendAlreadySet`] if a *different* backend was already set.
+pub fn set_default_backend(backend: Backend) -> Result<(), BackendAlreadySet> {
+    match DEFAULT_BACKEND.set(backend) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let existing = *DEFAULT_BACKEND.get().expect("set above");
+            if existing == backend {
+                Ok(())
+            } else {
+                Err(BackendAlreadySet {
+                    existing,
+                    attempted: backend,
+                })
+            }
+        }
+    }
+}
+
+/// The configured default backend, or [`Backend::SideRing`] if
+/// [`set_default_backend`] was never called.
+pub fn default_backend() -> Backend {
+    DEFAULT_BACKEND.get().copied().unwrap_or(Backend::SideRing)
+}
+
 #[doc(hidden)]
 pub mod env_tunables {
     pub(crate) static YIELD_TO_EXECUTOR_IF_READY_ON_FIRST_POLL: once_cell::sync::Lazy<bool> =

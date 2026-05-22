@@ -1,0 +1,6 @@
+[build]
+# - tokio_unstable: required for the patched tokio's public io_uring API
+# - force-frame-pointers: lets `perf record --call-graph=fp` (cheap, fast)
+#   resolve into Rust frames; without this we'd need --call-graph=dwarf
+#   which is 5-10x larger perf.data files and slower to record
+rustflags = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]

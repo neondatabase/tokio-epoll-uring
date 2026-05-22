@@ -79,6 +79,7 @@ ensure_page_cache_size_at_least() {
 compare_engines=(
 	tokio-epoll-uring--no-force-yield
 	tokio-epoll-uring--force-yield
+	tokio-epoll-uring-native
 	tokio-spawn-blocking--512
 	tokio-uring
 )
