@@ -6,27 +6,8 @@
 //! difference is where SQEs/CQEs flow.
 
 use crate::system::submission::op_fut::{Error, Op, SystemError};
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io_uring::{is_ready, is_supported, Cancellable, Completable, CqeResult, Submission};
+use tokio::io_uring::{is_supported, Cancellable, Completable, CqeResult, Submission};
 use uring_common::io_uring;
-
-/// Process-wide bitmap of opcodes we've already confirmed are supported by
-/// the running kernel. Bit `n` set ⇒ opcode `n` was successfully probed via
-/// `tokio::io_uring::is_supported`, the tokio uring driver is initialised,
-/// and `Submission::new` will accept SQEs of this opcode without panicking.
-///
-/// Why: `tokio::io_uring::is_supported(opcode)` is async because it may
-/// perform the one-time `io_uring_setup` / `IORING_REGISTER_PROBE`. After
-/// the first hit it's effectively a `OnceCell::get + probe.is_supported`,
-/// but it's still an `.await` per SQE which shows up under perf
-/// (additional future-state-machine + waker). The hot path runs millions
-/// of times per second on busy benchmarks — we cache the per-opcode result
-/// in an `AtomicU64` and skip the await once we've seen the opcode
-/// supported.
-///
-/// Opcodes in current kernels are u8 but only ~60 distinct values are
-/// defined, so a single u64 holds them all.
-static OPCODE_SUPPORTED_BITMAP: AtomicU64 = AtomicU64::new(0);
 
 /// Adapter that turns a tokio-epoll-uring [`Op`] into something tokio's
 /// `Submission<T>` can drive.
@@ -80,27 +61,25 @@ where
 {
     let sqe = op.make_sqe();
     let opcode = sqe_opcode(&sqe);
-    // Fast path: we've previously confirmed this opcode is supported and
-    // the tokio uring probe has been initialised. Skip the async probe.
-    if opcode < 64 && OPCODE_SUPPORTED_BITMAP.load(Ordering::Relaxed) & (1u64 << opcode) != 0 {
-        // Already supported.
-    } else if opcode < 64 && is_ready(opcode) {
-        // tokio's probe was initialised for a different opcode; this one
-        // happens to be in the cached probe and supported. Mark and skip.
-        OPCODE_SUPPORTED_BITMAP.fetch_or(1u64 << opcode, Ordering::Relaxed);
-    } else {
-        // First time we see this opcode (or the tokio probe hasn't run
-        // yet at all). Pay the async-probe cost once; cache the result.
-        let supported = is_supported(opcode).await.unwrap_or(false);
-        if !supported {
-            return (
-                op.on_failed_submission(),
-                Err(Error::System(SystemError::SystemShuttingDown)),
-            );
-        }
-        if opcode < 64 {
-            OPCODE_SUPPORTED_BITMAP.fetch_or(1u64 << opcode, Ordering::Relaxed);
-        }
+    // Always probe via `is_supported(opcode).await`. This is per-Handle
+    // cached inside tokio (via `OnceCell` on `uring_probe`), so the
+    // amortized cost is one async-future-poll per opcode per runtime.
+    //
+    // The previous `OPCODE_SUPPORTED_BITMAP` static was a process-wide
+    // bypass — but tokio's `uring_probe` is per-Handle (per-runtime),
+    // and consumers like PageServer construct multiple tokio runtimes
+    // (e.g. a separate runtime per role). The bitmap would say "this
+    // opcode is supported" — set by runtime A's probe — while runtime
+    // B's probe was still uninitialised. The downstream
+    // `register_op`'s `assert!(self.uring_probe.initialized())` then
+    // fires. See pageserver basebackup-handler crash for the
+    // motivating bug.
+    let supported = is_supported(opcode).await.unwrap_or(false);
+    if !supported {
+        return (
+            op.on_failed_submission(),
+            Err(Error::System(SystemError::SystemShuttingDown)),
+        );
     }
     let adapter = OpCompletable { op };
     // SAFETY: `op` (now inside `adapter`) owns every kernel-readable
