@@ -459,3 +459,114 @@ async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get
 
     Arc::into_inner(system).unwrap().initiate_shutdown().await;
 }
+
+/// Regression test for the file-descriptor leak that occurred when a
+/// `SystemHandle::open` future was cancelled (dropped) after the kernel had
+/// already produced the open's completion. `OpenAtOp`'s FD lives only in the
+/// completion result, so if the op is dropped without inspecting that result the
+/// FD is never wrapped in an `OwnedFd` and therefore never `close(2)`d.
+///
+/// Both cancellation paths are exercised:
+/// - the op is dropped while still owned by the kernel and later reaped as
+///   `Slot::PendingButFutureDropped` (drained by the shutdown below); and
+/// - the op is dropped after its completion has been observed (`Slot::Ready`),
+///   reached via a custom waker that proves the poller set the slot to `Ready`
+///   without letting the executor re-poll the future (which would take the
+///   normal completion path instead of the cancellation path).
+///
+/// Holding an open in the cancellation window requires `PROCESS_COMPLETIONS_ON_
+/// SUBMIT=0`: io_uring's `openat` never blocks in flight (its nonblocking-first
+/// attempt makes an `O_RDONLY` open complete immediately, even for a FIFO), so
+/// there is no I/O-level way to keep the open pending; not processing on submit
+/// is what leaves the slot `Pending` after the first poll. That tunable is
+/// process-wide and read once, so the test only sets up deterministically in its
+/// own process (nextest) or with `--test-threads=1`; otherwise it skips rather
+/// than flake, mirroring [`hitting_memlock_limit_does_not_panic`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_fd_not_leaked_when_open_future_cancelled() {
+    use std::future::Future;
+
+    // SAFETY (edition 2021): set before the tunable's Lazy is first read.
+    std::env::set_var("EPOLL_URING_PROCESS_COMPLETIONS_ON_SUBMIT", "0");
+    if *crate::env_tunables::PROCESS_COMPLETIONS_ON_SUBMIT {
+        eprintln!(
+            "skipping open_fd_not_leaked_when_open_future_cancelled: \
+             PROCESS_COMPLETIONS_ON_SUBMIT already initialized to true by another \
+             test in this process; run with nextest or --test-threads=1"
+        );
+        return;
+    }
+
+    fn read_opts() -> crate::ops::open_at::OpenOptions {
+        let mut opts = crate::ops::open_at::OpenOptions::new();
+        opts.read(true);
+        opts
+    }
+
+    // Count only the FDs that point at our specific file, so FDs opened
+    // concurrently by other tests in this process do not affect the measurement.
+    fn fds_pointing_to(target: &std::path::Path) -> usize {
+        let mut count = 0;
+        for entry in std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd") {
+            let path = entry.expect("dir entry").path();
+            if std::fs::read_link(&path).is_ok_and(|dest| dest == target) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    // A dedicated file so leaked FDs are unambiguously attributable to this test.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let path = file.path().canonicalize().unwrap();
+
+    let system = Arc::new(System::launch().await.unwrap());
+
+    // Warm up so any one-time FDs the runtime opens lazily are already open.
+    drop(system.open(&path, &read_opts()).await.unwrap());
+    // The `NamedTempFile` itself holds one FD to `path`; that is our baseline.
+    let baseline = fds_pointing_to(&path);
+
+    // Path 1 (PendingButFutureDropped): submit, then drop while the slot is still
+    // `Pending`. Completions are not processed on submit, and we do not yield
+    // between the poll and the drop, so the poller cannot have reaped it yet; the
+    // drop parks it as `PendingButFutureDropped`, reaped by the shutdown drain.
+    {
+        let mut fut = Box::pin(unconstrained(system.open(&path, &read_opts())));
+        assert!(futures::poll!(&mut fut).is_pending());
+        drop(fut);
+    }
+
+    // Path 2 (Ready): let the completion be observed (slot `Ready`) before the
+    // drop. The custom waker fires once the poller sets `Ready`, without the
+    // executor re-polling the future (which would take the normal path).
+    {
+        struct Notify(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl futures::task::ArcWake for Notify {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                if let Some(tx) = arc_self.0.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let waker = futures::task::waker(Arc::new(Notify(std::sync::Mutex::new(Some(tx)))));
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let mut fut = Box::pin(unconstrained(system.open(&path, &read_opts())));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        rx.await.unwrap(); // poller set Slot::Ready and woke our waker
+        drop(fut); // -> Slot::Ready cancellation path
+    }
+
+    // The draining shutdown reaps the still-in-flight PendingButFutureDropped
+    // completion (Path 1), invoking the on-cancel hook. No sleep required.
+    Arc::into_inner(system).unwrap().initiate_shutdown().await;
+
+    let after = fds_pointing_to(&path);
+    let leaked = after.saturating_sub(baseline);
+    assert_eq!(
+        leaked, 0,
+        "cancelled opens leaked {leaked} fds to {path:?} (baseline={baseline}, after={after})"
+    );
+}

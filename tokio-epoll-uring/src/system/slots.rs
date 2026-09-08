@@ -37,7 +37,7 @@ use uring_common::io_uring;
 use crate::system::submission::op_fut::Error;
 
 use super::{
-    submission::op_fut::{Op, SystemError},
+    submission::op_fut::{DroppedFutureOp, Op, SystemError},
     RING_SIZE,
 };
 
@@ -118,8 +118,10 @@ enum Slot {
         waker: Option<std::task::Waker>, // None if it hasn't been polled yet
     },
     PendingButFutureDropped {
-        /// When a future gets dropped while the Op is still running, it gets Box'ed  This is a Box'ed `ResourcesOwnedByKernel`
-        _resources_owned_by_kernel: Box<dyn std::any::Any + Send>,
+        /// The op, boxed and kept alive here after its future was dropped, so its
+        /// kernel-owned resources outlive the in-flight op. It is handed the CQE
+        /// result on completion to reclaim any resource that only lives in the CQE.
+        op_owned_by_kernel: Box<dyn DroppedFutureOp>,
     },
     Ready {
         result: i32,
@@ -313,12 +315,16 @@ impl SlotsInner {
                 }
                 // The slot will be returned by `wait_for_completion`.
             }
-            Slot::PendingButFutureDropped {
-                _resources_owned_by_kernel,
-            } => {
-                *slot = Slot::Ready {
-                    result: cqe.result(),
+            Slot::PendingButFutureDropped { .. } => {
+                let res = cqe.result();
+                let Slot::PendingButFutureDropped { op_owned_by_kernel } =
+                    std::mem::replace(slot, Slot::Ready { result: res })
+                else {
+                    unreachable!("we just matched this variant")
                 };
+                // Hand the result to the op so it can reclaim any resource that
+                // only lives in the CQE (e.g. the FD from `open`).
+                op_owned_by_kernel.on_completion(res);
                 self.return_slot(idx);
             }
             Slot::Ready { .. } => {
@@ -514,24 +520,23 @@ impl SlotHandle {
                     Slot::Pending { .. } => {
                         // The resource needs to be kept alive until the op completes.
                         // So, move it into the Slot.
-                        // `process_completion` will drop the box and return the slot
-                        // once it observes the completion.
+                        // `process_completion` will observe the completion, hand the
+                        // result to the op, and return the slot.
                         *slot_mut = Slot::PendingButFutureDropped {
-                            _resources_owned_by_kernel: Box::new(op),
+                            op_owned_by_kernel: Box::new(op),
                         };
                     }
                     Slot::Ready { result } => {
                         // The op completed and called the waker that would eventually cause this future to be polled
                         // and transition from Inflight to one of the Done states. But this future got dropped first.
                         // So, it's our job to drop the slot.
-                        *slot_mut = Slot::Ready { result: *result };
+                        let result = *result;
+                        *slot_mut = Slot::Ready { result };
                         inner.return_slot(slot.idx);
-                        // SAFETY:
-                        // The op is ready, hence the resources aren't onwed by the kernel anymore.
-                        #[allow(unused_unsafe)]
-                        unsafe {
-                            drop(op);
-                        }
+                        // The op is ready, so its resources aren't owned by the kernel
+                        // anymore. Hand it the result so it can reclaim any resource
+                        // that only lives in the CQE (e.g. an opened FD).
+                        op.on_op_completion_but_future_dropped(result);
                     }
                     Slot::PendingButFutureDropped { .. } => {
                         unreachable!("above is the only transition into this state, and this function only runs once")

@@ -56,4 +56,12 @@ impl Op for OpenAtOp {
         };
         (self.dir_fd, res)
     }
+
+    fn on_op_completion_but_future_dropped(self, res: i32) {
+        // The future that would have owned the opened FD was dropped; wrap the
+        // kernel-allocated FD so its `Drop` closes it, otherwise it leaks.
+        if res >= 0 {
+            drop(unsafe { OwnedFd::from_raw_fd(res) });
+        }
+    }
 }

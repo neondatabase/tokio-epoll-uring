@@ -10,6 +10,20 @@ pub trait Op: crate::sealed::Sealed + Sized + Send + 'static {
     fn on_failed_submission(self) -> Self::Resources;
     fn on_op_completion(self, res: i32) -> (Self::Resources, Result<Self::Success, Self::Error>);
     fn make_sqe(&mut self) -> io_uring::squeue::Entry;
+
+    fn on_op_completion_but_future_dropped(self, res: i32) {
+        let _ = res;
+    }
+}
+
+pub(crate) trait DroppedFutureOp: Send + 'static {
+    fn on_completion(self: Box<Self>, res: i32);
+}
+
+impl<O: Op> DroppedFutureOp for O {
+    fn on_completion(self: Box<Self>, res: i32) {
+        Op::on_op_completion_but_future_dropped(*self, res);
+    }
 }
 
 use uring_common::io_uring;
