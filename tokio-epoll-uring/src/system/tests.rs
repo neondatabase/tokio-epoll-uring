@@ -498,14 +498,20 @@ async fn open_fd_not_leaked_when_open_future_cancelled() {
 
     let system = Arc::new(System::launch().await.unwrap());
 
+    // Opening each FIFO's write end with O_CREAT makes io_uring punt the open
+    // to io-wq, where it remains pending until we open the corresponding reader.
     let reader_pending = {
         let mut fut = Box::pin(unconstrained(
             system.open(&fifo_pending, &write_create_opts()),
         ));
         assert!(futures::poll!(&mut fut).is_pending());
+        // Drop before opening the reader to exercise Slot::PendingOpButFutureDropped.
         drop(fut);
-        let path = fifo_pending.clone();
-        std::thread::spawn(move || std::fs::File::open(&path).unwrap())
+        // The submitted writer runs in io-wq, so this rendezvous does not
+        // require a Tokio task to run while the reader open blocks.
+        // Returning proves the FIFO rendezvous happened; the writer's CQE
+        // may still be pending and will be drained during shutdown below.
+        std::fs::File::open(&fifo_pending).unwrap()
     };
 
     let reader_ready = {
@@ -525,15 +531,17 @@ async fn open_fd_not_leaked_when_open_future_cancelled() {
             system.open(&fifo_ready, &write_create_opts()),
         ));
         assert!(fut.as_mut().poll(&mut cx).is_pending());
-        let path = fifo_ready.clone();
-        let reader_ready = std::thread::spawn(move || std::fs::File::open(&path).unwrap());
+        // Open the reader first so the slot reaches Slot::Ready before we drop the future.
+        let reader_ready = std::fs::File::open(&fifo_ready).unwrap();
+        // The completion handler stores Ready before invoking our waker.
+        // Wait for that notification, then drop without repolling the future.
         rx.await.unwrap();
         drop(fut);
         reader_ready
     };
 
-    let reader_pending = reader_pending.join().unwrap();
-    let reader_ready = reader_ready.join().unwrap();
+    // Linux records the FIFO rendezvous even if the reader closes before
+    // the writer resumes, so closing these readers cannot strand its open.
     drop(reader_pending);
     drop(reader_ready);
 
@@ -545,6 +553,6 @@ async fn open_fd_not_leaked_when_open_future_cancelled() {
     );
     assert!(
         !writer_still_open(&fifo_ready),
-        "Ready path leaked the open fd"
+        "Slot::Ready with dropped future leaked the open fd"
     );
 }
