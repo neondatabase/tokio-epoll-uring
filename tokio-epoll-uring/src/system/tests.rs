@@ -40,7 +40,7 @@ async fn drop_system_handle() {
 
 #[tokio::test]
 async fn op_state_pending_but_future_dropped() {
-    // Get the op slot into state PendingButFutureDropped
+    // Get the op slot into state PendingOpButFutureDropped
     // then let process_completions run and see what happens.
 
     let system = SharedSystemHandle::launch().await.unwrap();
@@ -73,7 +73,7 @@ async fn op_state_pending_but_future_dropped() {
     // assert!(matches!(read_fut), ...) it's an `async fn`, can't match :(
 
     drop(read_fut);
-    // op should be in state PendingButFutureDropped by now
+    // op should be in state PendingOpButFutureDropped by now
 
     // wake up poller task to process completions
     writer.write_all(&[1]).unwrap();
@@ -458,4 +458,101 @@ async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get
     res.unwrap();
 
     Arc::into_inner(system).unwrap().initiate_shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_fd_not_leaked_when_open_future_cancelled() {
+    use std::future::Future;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn write_create_opts() -> crate::ops::open_at::OpenOptions {
+        let mut opts = crate::ops::open_at::OpenOptions::new();
+        opts.write(true).create(true);
+        opts
+    }
+
+    fn writer_still_open(fifo: &std::path::Path) -> bool {
+        let mut rd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(fifo)
+            .unwrap();
+        let mut buf = [0u8; 1];
+        match rd.read(&mut buf) {
+            Ok(0) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            other => panic!("unexpected read result on fifo {fifo:?}: {other:?}"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo_pending = dir.path().join("pending");
+    let fifo_ready = dir.path().join("ready");
+    nix::unistd::mkfifo(
+        &fifo_pending,
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )
+    .unwrap();
+    nix::unistd::mkfifo(&fifo_ready, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+
+    let system = Arc::new(System::launch().await.unwrap());
+
+    // Opening each FIFO's write end with O_CREAT makes io_uring punt the open
+    // to io-wq, where it remains pending until we open the corresponding reader.
+    let reader_pending = {
+        let mut fut = Box::pin(unconstrained(
+            system.open(&fifo_pending, &write_create_opts()),
+        ));
+        assert!(futures::poll!(&mut fut).is_pending());
+        // Drop before opening the reader to exercise Slot::PendingOpButFutureDropped.
+        drop(fut);
+        // The submitted writer runs in io-wq, so this rendezvous does not
+        // require a Tokio task to run while the reader open blocks.
+        // Returning proves the FIFO rendezvous happened; the writer's CQE
+        // may still be pending and will be drained during shutdown below.
+        std::fs::File::open(&fifo_pending).unwrap()
+    };
+
+    let reader_ready = {
+        struct Notify(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl futures::task::ArcWake for Notify {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                if let Some(tx) = arc_self.0.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let waker = futures::task::waker(Arc::new(Notify(std::sync::Mutex::new(Some(tx)))));
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let mut fut = Box::pin(unconstrained(
+            system.open(&fifo_ready, &write_create_opts()),
+        ));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        // Open the reader first so the slot reaches Slot::Ready before we drop the future.
+        let reader_ready = std::fs::File::open(&fifo_ready).unwrap();
+        // The completion handler stores Ready before invoking our waker.
+        // Wait for that notification, then drop without repolling the future.
+        rx.await.unwrap();
+        drop(fut);
+        reader_ready
+    };
+
+    // Linux records the FIFO rendezvous even if the reader closes before
+    // the writer resumes, so closing these readers cannot strand its open.
+    drop(reader_pending);
+    drop(reader_ready);
+
+    Arc::into_inner(system).unwrap().initiate_shutdown().await;
+
+    assert!(
+        !writer_still_open(&fifo_pending),
+        "PendingOpButFutureDropped path leaked the open fd"
+    );
+    assert!(
+        !writer_still_open(&fifo_ready),
+        "Slot::Ready with dropped future leaked the open fd"
+    );
 }
