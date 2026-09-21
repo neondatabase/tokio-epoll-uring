@@ -5,3 +5,18 @@ members = [
     "benchmark",
     "uring-common",
 ]
+
+# Release builds keep debug info (line tables + frame pointers via rustflags
+# in .cargo/config.toml) so perf can resolve Rust symbols when profiling the
+# upstream backend. Adds a few MB to the binary but no runtime cost.
+[profile.release]
+debug = "line-tables-only"
+
+# Pin every tokio dep in the workspace to the locally-patched checkout, which
+# exposes the public `tokio::io_uring` API the new upstream backend relies on.
+[patch.crates-io]
+tokio = { path = "/home/christian.schwarz/tokio/tokio" }
+tokio-macros = { path = "/home/christian.schwarz/tokio/tokio-macros" }
+tokio-stream = { path = "/home/christian.schwarz/tokio/tokio-stream" }
+tokio-util = { path = "/home/christian.schwarz/tokio/tokio-util" }
+tokio-test = { path = "/home/christian.schwarz/tokio/tokio-test" }

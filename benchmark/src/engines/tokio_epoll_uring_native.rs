@@ -1,3 +1,7 @@
+//! Identical to the side-ring `EngineTokioEpollUring` engine, but flips the
+//! crate-wide default backend to `Backend::TokioNative` in `new()` so the
+//! crate's runtime backend dispatches via tokio's own ring.
+
 use rand::Rng;
 use std::{
     alloc::Layout,
@@ -16,14 +20,18 @@ use tracing::{debug, info};
 
 use crate::{Args, ClientWork, ClientWorkKind, Engine, EngineRunResult, StatsState};
 
-pub(crate) struct EngineTokioEpollUring {
+pub(crate) struct EngineTokioEpollUringUpstream {
     rt: tokio::runtime::Runtime,
 }
 
-impl EngineTokioEpollUring {
+impl EngineTokioEpollUringUpstream {
     pub fn new() -> Self {
+        // Route every tokio-epoll-uring System::launch in this process to
+        // the TokioNative backend, which submits SQEs through tokio's own
+        // io_uring ring via the public tokio::io_uring API.
+        tokio_epoll_uring::set_default_backend(tokio_epoll_uring::Backend::TokioNative)
+            .expect("benchmark engines own backend selection; conflict means a prior engine set a different backend in the same process");
         let rt = tokio::runtime::Builder::new_multi_thread()
-            // .worker_threads(1) // useful for debugging
             .enable_all()
             .build()
             .unwrap();
@@ -31,7 +39,7 @@ impl EngineTokioEpollUring {
     }
 }
 
-impl Engine for EngineTokioEpollUring {
+impl Engine for EngineTokioEpollUringUpstream {
     fn run(
         self: Box<Self>,
         args: Arc<Args>,
@@ -40,7 +48,7 @@ impl Engine for EngineTokioEpollUring {
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
     ) -> EngineRunResult {
-        let EngineTokioEpollUring { rt } = *self;
+        let EngineTokioEpollUringUpstream { rt } = *self;
         let rt = Arc::new(rt);
 
         rt.block_on(async move {
@@ -58,7 +66,6 @@ impl Engine for EngineTokioEpollUring {
                     }
                 }));
             }
-            // task that prints periodically which clients have exited
             let stopped_handles = Arc::new(
                 (0..handles.len())
                     .map(|_| AtomicBool::new(false))
@@ -71,13 +78,11 @@ impl Engine for EngineTokioEpollUring {
                 let stop_stopped_task_status_task = Arc::clone(&stop_stopped_task_status_task);
                 async move {
                     while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
-                        // don't print until `stop` is set
                         if !stop_clients.load(Ordering::Relaxed) {
                             tokio::time::sleep(Duration::from_millis(1000)).await;
                             debug!("waiting for clients to stop");
                             continue;
                         }
-                        // log list of not-stopped clients every second
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         let stopped = stopped_handles
                             .iter()
@@ -114,8 +119,8 @@ impl Engine for EngineTokioEpollUring {
     }
 }
 
-impl EngineTokioEpollUring {
-    #[tracing::instrument(skip_all, level="trace", fields(client=%i))]
+impl EngineTokioEpollUringUpstream {
+    #[tracing::instrument(skip_all, level = "trace", fields(client=%i))]
     async fn client(
         i: u64,
         args: &Args,
@@ -123,10 +128,7 @@ impl EngineTokioEpollUring {
         stop: &AtomicBool,
         stats_state: Arc<StatsState>,
     ) {
-        // tokio::time::sleep(Duration::from_secs(i)).await;
-        // tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
-
         let rwlock = Arc::new(tokio::sync::RwLock::new(()));
 
         #[derive(Copy, Clone)]
@@ -143,13 +145,12 @@ impl EngineTokioEpollUring {
             },
             ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
-                std::mem::forget(timerfd); // they don't support into_raw_fd
+                std::mem::forget(timerfd);
                 ret
             }
             ClientWorkKind::NoWork {} => ClientWorkFd::NoWork,
         };
 
-        // alloc aligned to make O_DIRECT work
         let buf = unsafe {
             let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
             assert!(!ptr.is_null());
@@ -170,10 +171,8 @@ impl EngineTokioEpollUring {
                 break;
             };
 
-            // simulate Timeline::layers.read().await
             let _guard = rwlock.read().await;
 
-            // find a random aligned 8k offset inside the file
             debug_assert!(1024 * 1024 % block_size == 0);
             let offset_in_file = rand::thread_rng()
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
@@ -187,12 +186,6 @@ impl EngineTokioEpollUring {
                 } => {
                     let owned_buf = loop_buf.take().unwrap();
                     let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
-                    // We use it to get one io_uring submission & completion ring per core / executor thread.
-                    // The thread-local rings are not great if there's block_in_place in the codebase. It's fine here.
-                    // Ideally we'd have one submission ring per core and a single completion ring, because, completion
-                    // wakes up the task but we don't know which runtime it is one.
-                    // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
-                    //  affine to a completion queue somehow... The design space is big.)
 
                     let handle = tokio_epoll_uring::thread_local_system().await;
 
@@ -213,17 +206,16 @@ impl EngineTokioEpollUring {
                         assert_eq!(nread, block_size);
                         assert_eq!(owned_buf, owned_validate_buf);
                         loop_validate_buf = Some(owned_validate_buf);
-                        let _ = std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
+                        let _ = std_file.into_raw_fd();
                     }
                     loop_buf = Some(owned_buf);
-                    let _ = file.into_raw_fd(); // so that it's there for next iteration
+                    let _ = file.into_raw_fd();
                 }
                 ClientWorkFd::TimerFd(_timerfd, _duration) => {
                     unimplemented!()
                 }
                 ClientWorkFd::NoWork => (),
             }
-            // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
 
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);

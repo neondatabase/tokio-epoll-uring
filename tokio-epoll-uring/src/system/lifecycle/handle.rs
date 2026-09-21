@@ -10,7 +10,10 @@ use uring_common::{
 use crate::{
     metrics::PerSystemMetrics,
     ops::{fsync::FsyncOp, open_at::OpenAtOp, read::ReadOp, statx, write::WriteOp},
-    system::submission::{op_fut::execute_op, SubmitSide},
+    system::{
+        backend_upstream::execute_op_upstream,
+        submission::{op_fut::execute_op, SubmitSide},
+    },
 };
 
 /// Owned handle to the [`System`](crate::System) created by [`System::launch`](crate::System::launch).
@@ -26,19 +29,36 @@ pub struct SystemHandle<M: PerSystemMetrics = ()> {
     inner: Option<SystemHandleInner<M>>,
 }
 
-struct SystemHandleInner<M: PerSystemMetrics> {
-    #[allow(dead_code)]
-    pub(super) id: usize,
-    pub(crate) submit_side: SubmitSide,
-    per_system_metrics: Arc<M>,
+enum SystemHandleInner<M: PerSystemMetrics> {
+    SideRing {
+        #[allow(dead_code)]
+        id: usize,
+        submit_side: SubmitSide,
+        per_system_metrics: Arc<M>,
+    },
+    Upstream {
+        #[allow(dead_code)]
+        id: usize,
+        #[allow(dead_code)]
+        per_system_metrics: Arc<M>,
+    },
 }
 
 impl<M: PerSystemMetrics> SystemHandle<M> {
     pub(crate) fn new(id: usize, submit_side: SubmitSide, per_system_metrics: Arc<M>) -> Self {
         SystemHandle {
-            inner: Some(SystemHandleInner {
+            inner: Some(SystemHandleInner::SideRing {
                 id,
                 submit_side,
+                per_system_metrics,
+            }),
+        }
+    }
+
+    pub(crate) fn new_upstream(id: usize, per_system_metrics: Arc<M>) -> Self {
+        SystemHandle {
+            inner: Some(SystemHandleInner::Upstream {
+                id,
                 per_system_metrics,
             }),
         }
@@ -71,7 +91,15 @@ impl<M: PerSystemMetrics> SystemHandle<M> {
             .inner
             .take()
             .expect("we only consume here and during Drop");
-        inner.shutdown()
+        match inner {
+            SystemHandleInner::SideRing { submit_side, .. } => {
+                futures::future::Either::Left(submit_side.shutdown())
+            }
+            SystemHandleInner::Upstream { .. } => {
+                // tokio owns the ring; nothing for us to shut down here.
+                futures::future::Either::Right(async {})
+            }
+        }
     }
 }
 
@@ -94,9 +122,43 @@ impl std::future::Future for WaitShutdownFut {
     }
 }
 
+
 impl<M: PerSystemMetrics> SystemHandleInner<M> {
-    fn shutdown(self) -> impl std::future::Future<Output = ()> + Send {
-        self.submit_side.shutdown()
+    /// Drive an op through whichever backend this handle is bound to.
+    /// Both arms produce a `Send` future with the same `Output` shape, so
+    /// callers wrap them in `futures::future::Either`.
+    fn dispatch_op<O>(
+        &self,
+        op: O,
+    ) -> futures::future::Either<
+        impl std::future::Future<
+            Output = (O::Resources, Result<O::Success, crate::Error<O::Error>>),
+        >,
+        impl std::future::Future<
+            Output = (O::Resources, Result<O::Success, crate::Error<O::Error>>),
+        >,
+    >
+    where
+        O: crate::system::submission::op_fut::Op<Error = std::io::Error>
+            + Send
+            + 'static
+            + Unpin,
+    {
+        match self {
+            SystemHandleInner::SideRing {
+                submit_side,
+                per_system_metrics,
+                ..
+            } => futures::future::Either::Left(execute_op(
+                op,
+                submit_side.weak(),
+                None,
+                Arc::clone(per_system_metrics),
+            )),
+            SystemHandleInner::Upstream { .. } => {
+                futures::future::Either::Right(execute_op_upstream(op))
+            }
+        }
     }
 }
 
@@ -110,13 +172,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         ),
     > {
         let op = crate::ops::nop::Nop {};
-        let inner = self.inner.as_ref().unwrap();
-        execute_op(
-            op,
-            inner.submit_side.weak(),
-            None,
-            Arc::clone(&inner.per_system_metrics),
-        )
+        self.inner.as_ref().unwrap().dispatch_op(op)
     }
     pub fn read<F: IoFd + Send, B: BoundedBufMut + Send>(
         &self,
@@ -130,13 +186,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         ),
     > {
         let op = ReadOp { file, offset, buf };
-        let inner = self.inner.as_ref().unwrap();
-        execute_op(
-            op,
-            inner.submit_side.weak(),
-            None,
-            Arc::clone(&inner.per_system_metrics),
-        )
+        self.inner.as_ref().unwrap().dispatch_op(op)
     }
     pub fn open<P: AsRef<Path>>(
         &self,
@@ -154,10 +204,9 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             }
         };
         let inner = self.inner.as_ref().unwrap();
-        let per_system_metrics = Arc::clone(&inner.per_system_metrics);
-        let weak = inner.submit_side.weak();
+        let fut = inner.dispatch_op(op);
         futures::future::Either::Right(async move {
-            let (_, res) = execute_op(op, weak, None, per_system_metrics).await;
+            let (_, res) = fut.await;
             res
         })
     }
@@ -173,14 +222,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             file,
             flags: uring_common::io_uring::types::FsyncFlags::empty(),
         };
-        let inner = self.inner.as_ref().unwrap();
-        execute_op(
-            op,
-            inner.submit_side.weak(),
-            None,
-            Arc::clone(&inner.per_system_metrics),
-        )
-        .await
+        self.inner.as_ref().unwrap().dispatch_op(op).await
     }
 
     pub async fn fdatasync<F: IoFd + Send>(
@@ -194,14 +236,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             file,
             flags: uring_common::io_uring::types::FsyncFlags::DATASYNC,
         };
-        let inner = self.inner.as_ref().unwrap();
-        execute_op(
-            op,
-            inner.submit_side.weak(),
-            None,
-            Arc::clone(&inner.per_system_metrics),
-        )
-        .await
+        self.inner.as_ref().unwrap().dispatch_op(op).await
     }
 
     pub async fn statx<F: IoFd + Send>(
@@ -221,14 +256,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
             file,
             statxbuf: buf,
         });
-        let inner = self.inner.as_ref().unwrap();
-        let (resources, result) = execute_op(
-            op,
-            inner.submit_side.weak(),
-            None,
-            Arc::clone(&inner.per_system_metrics),
-        )
-        .await;
+        let (resources, result) = self.inner.as_ref().unwrap().dispatch_op(op).await;
         let crate::ops::statx::Resources::ByFileDescriptor { file, statxbuf } = resources;
         match result {
             Ok(()) => (
@@ -261,12 +289,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         ),
     > {
         let op = WriteOp { file, offset, buf };
-        let inner = self.inner.as_ref().unwrap();
-        execute_op(
-            op,
-            inner.submit_side.weak(),
-            None,
-            Arc::clone(&inner.per_system_metrics),
-        )
+        self.inner.as_ref().unwrap().dispatch_op(op)
     }
 }

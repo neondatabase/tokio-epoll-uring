@@ -23,4 +23,5 @@ serde = { version = "1.0.176", features = ["serde_derive"] }
 serde_with = "3.1.0"
 humantime = "2.1.0"
 tokio-uring = "0.4.0"
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 

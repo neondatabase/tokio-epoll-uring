@@ -1,3 +1,4 @@
+pub(super) mod backend_upstream;
 pub(super) mod completion;
 pub(super) mod lifecycle;
 pub(crate) mod slots;
