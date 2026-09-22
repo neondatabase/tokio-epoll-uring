@@ -2,8 +2,8 @@
 //!
 //! [`Slots`] serves the following purposes:
 //!
-//! - Have a place to which we can transfer ownership of the resources (FD, buffer)
-//!   if the future gets dropped while op is still in flight.
+//! - Own each submitted operation and its resources (FD, buffer) until the CQE
+//!   is processed, independently of the lifetime of the operation future.
 //! - Heep track of what ops are in flight so during system shutdown we know when we're done.
 //! - Limit queue depth & provide means for a task to wait until it's the task's turn.
 //!   The queue depth limit is currently hard-coded to [`crate::system::RING_SIZE`].
@@ -20,14 +20,15 @@
 //! - get the slot using [`Slots::try_get_slot`].
 //! - use the slot (and submit the op to the kernel) using [`SlotHandle::use_for_op`]
 //!
-//! [`SlotHandle::use_for_op`] enforces correct ownership of the resources that the
-//! io_uring operation operates on.
+//! [`SlotHandle::use_for_op`] moves the operation into the slot before submission.
+//! Completion sends the typed output to the future through a one-shot channel;
+//! if the future was dropped, the output is dropped by the completion side.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    future::poll_fn,
+    future::{poll_fn, Future},
+    pin::pin,
     sync::{Arc, Mutex, Weak},
-    task::Poll,
 };
 
 use tokio::sync::oneshot;
@@ -37,7 +38,7 @@ use uring_common::io_uring;
 use crate::system::submission::op_fut::Error;
 
 use super::{
-    submission::op_fut::{DroppedFutureOp, Op, SystemError},
+    submission::op_fut::{Op, SystemError},
     RING_SIZE,
 };
 
@@ -115,14 +116,28 @@ pub(crate) struct SlotHandle {
 
 enum Slot {
     Pending {
-        waker: Option<std::task::Waker>, // None if it hasn't been polled yet
+        completion: Box<dyn PendingCompletion>,
     },
-    PendingOpButFutureDropped {
-        op_owned_by_kernel: Box<dyn DroppedFutureOp>,
-    },
-    Ready {
-        result: i32,
-    },
+}
+
+trait PendingCompletion: Send + 'static {
+    fn complete(self: Box<Self>, res: i32);
+}
+
+struct PendingCompletionImpl<O: Op> {
+    op: O,
+    result_tx: oneshot::Sender<UseForOpOutput<O>>,
+}
+
+impl<O: Op> PendingCompletion for PendingCompletionImpl<O> {
+    fn complete(self: Box<Self>, res: i32) {
+        let PendingCompletionImpl { op, result_tx } = *self;
+        let (resources, result) = op.on_op_completion(res);
+        // If the operation future was cancelled, sending returns ownership of
+        // the normal completion output. Dropping it performs the same cleanup
+        // as dropping a successfully returned value (notably OwnedFd::drop).
+        drop(result_tx.send((resources, result.map_err(Error::Op))));
+    }
 }
 
 pub(super) fn new(
@@ -203,14 +218,10 @@ impl SlotsInner {
         fn clear_slot(slot_storage_ref: &mut Option<Slot>) {
             match slot_storage_ref {
                 None => (),
-                Some(slot_ref) => match slot_ref {
-                    Slot::Pending { .. } | Slot::PendingOpButFutureDropped { .. } => {
-                        panic!("implementation error: potential memory unsafety: we must not return a slot that is still pending  {:?}", slot_ref.discriminant_str());
-                    }
-                    Slot::Ready { .. } => {
-                        *slot_storage_ref = None;
-                    }
-                },
+                Some(slot_ref) => panic!(
+                    "implementation error: potential memory unsafety: we must not return a slot that is still pending  {:?}",
+                    slot_ref.discriminant_str()
+                ),
             }
         }
         match &mut self.state {
@@ -285,50 +296,31 @@ impl Slots<{ co_owner::COMPLETION_SIDE }> {
         &mut self,
         cqes: impl Iterator<Item = io_uring::cqueue::Entry>,
     ) {
-        let mut inner_guard = self.inner.lock().unwrap();
         for cqe in cqes {
-            inner_guard.process_completion(cqe);
+            let (completion, res) = {
+                let mut inner_guard = self.inner.lock().unwrap();
+                inner_guard.take_completion(cqe)
+            };
+            // Do operation-specific completion and drop user resources without
+            // holding the slots mutex. Destructors are allowed to call back
+            // into the system.
+            completion.complete(res);
         }
     }
 }
 
 impl SlotsInner {
-    fn process_completion(&mut self, cqe: io_uring::cqueue::Entry) {
+    fn take_completion(
+        &mut self,
+        cqe: io_uring::cqueue::Entry,
+    ) -> (Box<dyn PendingCompletion>, i32) {
         let idx: u64 = cqe.user_data();
         let idx = usize::try_from(idx).unwrap();
-
-        let storage = &mut self.storage;
-        let slot = &mut storage[idx];
-        let slot = slot.as_mut().unwrap();
-        match slot {
-            Slot::Pending { waker } => {
-                let waker = waker.take();
-                *slot = Slot::Ready {
-                    result: cqe.result(),
-                };
-                if let Some(waker) = waker {
-                    trace!("waking up future");
-                    waker.wake();
-                }
-                // The slot will be returned by `wait_for_completion`.
-            }
-            Slot::PendingOpButFutureDropped { .. } => {
-                let res = cqe.result();
-                let Slot::PendingOpButFutureDropped { op_owned_by_kernel } =
-                    std::mem::replace(slot, Slot::Ready { result: res })
-                else {
-                    unreachable!()
-                };
-                op_owned_by_kernel.on_completion(res);
-                self.return_slot(idx);
-            }
-            Slot::Ready { .. } => {
-                unreachable!(
-                    "completions only come in once: {:?}",
-                    slot.discriminant_str()
-                )
-            }
-        }
+        let Slot::Pending { completion } = self.storage[idx]
+            .take()
+            .expect("completion must refer to a submitted operation");
+        self.return_slot(idx);
+        (completion, cqe.result())
     }
 }
 
@@ -379,12 +371,12 @@ impl<const O: usize> Slots<O> {
             .iter()
             .cloned()
             .collect::<HashSet<usize>>();
-        // at this time, all slots must be either in unused_indices (their state is None) or they must be in Ready state
+        // Once every CQE has been processed, all slots have been returned.
         assert_eq!(
             inner_guard.slots_owned_by_user_space().count(),
             RING_SIZE.try_into().unwrap()
         );
-        assert!(unused_indices.is_subset(&slots_owned_by_user_space));
+        assert_eq!(unused_indices, slots_owned_by_user_space);
 
         // assert the calling owner is the only remaining owner
         let mut expected_co_owner_live = [false; co_owner::NUM_CO_OWNERS];
@@ -456,161 +448,53 @@ impl SlotHandle {
         let sqe = op.make_sqe();
         let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
 
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut pending = Some(PendingCompletionImpl { op, result_tx });
+
         let res = self.slots_weak.try_upgrade_mut(|inner| match inner.state {
             SlotsInnerState::Open { .. } => {
                 assert!(inner.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
-                inner.storage[self.idx] = Some(Slot::Pending { waker: None });
+                inner.storage[self.idx] = Some(Slot::Pending {
+                    completion: Box::new(pending.take().unwrap()),
+                });
             }
             SlotsInnerState::Draining => {
                 inner.return_slot(self.idx);
             }
         });
-        let Ok(()) = res else {
+        if let Some(PendingCompletionImpl { op, .. }) = pending.take() {
+            // Either the slots allocation has already disappeared, or the
+            // system entered Draining after handing this SlotHandle out.
             return futures::future::Either::Left(async move {
                 (
                     op.on_failed_submission(),
                     Err(Error::<O::Error>::System(SystemError::SystemShuttingDown)),
                 )
             });
-        };
+        }
+        debug_assert!(res.is_ok());
 
         do_submit(sqe);
 
-        futures::future::Either::Right(self.wait_for_completion(op))
+        futures::future::Either::Right(self.wait_for_completion::<O>(result_rx))
     }
 
     async fn wait_for_completion<O: Op + Send + 'static>(
         self,
-        op: O,
+        result_rx: oneshot::Receiver<UseForOpOutput<O>>,
     ) -> (O::Resources, Result<O::Success, Error<O::Error>>) {
-        let slot = self;
-
-        // invariant: op.is_some() <=> we haven't observed the poll_fn below complete yet
-        let op = std::sync::Mutex::new(Some(op));
-
-        // If this future gets dropped _before_ the op completes, we need to make sure
-        // that the resources owned by the kernel continue to live until the op completes.
-        // Otherwise, the kernel will operate on the dropped resource. The most concerning
-        // case are memory buffers which would be use-after-freed by the kernel. For example,
-        // for a read uring op, the kernel could write into the buffer that has been freed and/or re-used.
-        //
-        // If this futures gets dropped _after_ the op completes but before this future
-        // is poll()ed, we need to return the slot in addition to freeing the resources.
-        scopeguard::defer! {
-            if op.lock().unwrap().is_none() {
-                // fast-path to avoid the try_upgrade_mut() call
-                return;
-            }
-            let res = slot.slots_weak.try_upgrade_mut(|inner| {
-                let Some(op) = op.lock().unwrap().take() else {
-                    return;
-                };
-                let storage = &mut inner.storage;
-                let slot_storage_mut = &mut storage[slot.idx];
-                // the invariant is: `op.is_some() <=> `
-                let slot_mut = slot_storage_mut
-                    .as_mut()
-                    .expect("op is Some(), so the poll_fn below hasn't returned the slot yet");
-                match &mut *slot_mut {
-                    Slot::Pending { .. } => {
-                        *slot_mut = Slot::PendingOpButFutureDropped {
-                            op_owned_by_kernel: Box::new(op),
-                        };
-                    }
-                    Slot::Ready { result } => {
-                        let result = *result;
-                        inner.return_slot(slot.idx);
-                        op.on_op_completion_but_future_dropped(result);
-                    }
-                    Slot::PendingOpButFutureDropped { .. } => {
-                        unreachable!("above is the only transition into this state, and this function only runs once")
-                    }
-                }
-            });
-            match res {
-                Ok(()) => (),
-                Err(()) => {
-                    // SAFETY:
-                    // This future has an outdated view of the system; it shut down in the meantime.
-                    // Shutdown makes sure that all inflight ops complete, so, it is safe to drop the resources owned by kernel at this point.
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        let Some(op) = op.lock().unwrap().take() else {
-                            return;
-                        };
-                        drop(op);
-                    }
-                }
-            }
-        };
-
-        // Now that we've set up the scope guard, get to business.
-        // Inspect the slot to check whether the poller task already processed the completion.
-        // If it has, good for us.
-        // If not, store a waker in the slot so the poller task will wake us up to poll again
-        // and observe the Slot::Ready then.
-        //
-        // If we get cancelled in the meantime (i.e., this future gets dropped), the scopeguard
-        // will make sure the resources stay alive until the op is complete.
+        let mut result_rx = pin!(result_rx);
         let mut poll_count = 0;
         let poll_res = poll_fn(|cx| {
             poll_count += 1;
-            let try_upgrade_res = slot.slots_weak.try_upgrade_mut(|inner| {
-                let storage = &mut inner.storage;
-                let slot_storage_ref = &mut storage[slot.idx];
-                let slot_mut = slot_storage_ref.as_mut().unwrap();
-
-                match &mut *slot_mut {
-                    Slot::Pending { waker } => {
-                        trace!("op is still pending, storing waker in it");
-                        let waker_mut_ref = waker.get_or_insert_with(|| cx.waker().clone());
-                        if !cx.waker().will_wake(waker_mut_ref) {
-                            waker.replace(cx.waker().clone());
-                        }
-                        Poll::Pending
-                    }
-                    Slot::PendingOpButFutureDropped { .. } => {
-                        unreachable!("if it's dropped, it's not pollable")
-                    }
-                    Slot::Ready { result: res } => {
-                        trace!("op is ready, returning resources to user");
-                        let res = *res;
-                        inner.return_slot(slot.idx);
-                        // SAFETY: the slot is ready, so, ownership is back with userspace.
-                        #[allow(unused_unsafe)]
-                        unsafe {
-                            let op = op.lock().unwrap().take().unwrap();
-                            Poll::Ready(op.on_op_completion(res))
-                        }
-                    }
-                }
-            });
-            match try_upgrade_res {
-                Err(()) => {
-                    // SAFETY:
-                    // This future has an outdated view of the system; it shut down in the meantime.
-                    // Shutdown makes sure that all inflight ops complete, so,
-                    // these resources are no longer owned by the kernel and can be returned as an error.
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        let op = op.lock().unwrap().take().unwrap();
-                        Poll::Ready((
-                            op.on_failed_submission(),
-                            Err(Error::System(SystemError::SystemShuttingDown)),
-                        ))
-                    }
-                }
-                Ok(Poll::Ready((resources, res))) => {
-                    Poll::Ready((resources, res.map_err(Error::Op)))
-                }
-                Ok(Poll::Pending) => Poll::Pending,
-            }
+            result_rx.as_mut().poll(cx)
         })
-        .await;
+        .await
+        .expect("the slot must complete every successfully submitted operation");
         assert!(poll_count >= 1);
         #[cfg(test)]
         {
-            let on_wake = { slot.test_on_wake.lock().unwrap().take() };
+            let on_wake = { self.test_on_wake.lock().unwrap().take() };
             if let Some(on_wake) = on_wake {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 on_wake.send(tx).unwrap();
@@ -629,14 +513,7 @@ impl SlotsInner {
         self.storage
             .iter()
             .enumerate()
-            .filter_map(|(idx, x)| match x {
-                None => Some(idx),
-                Some(slot_ref) => match slot_ref {
-                    Slot::Pending { .. } => None,
-                    Slot::PendingOpButFutureDropped { .. } => None,
-                    Slot::Ready { .. } => Some(idx),
-                },
-            })
+            .filter_map(|(idx, x)| x.is_none().then_some(idx))
     }
 }
 
@@ -644,8 +521,6 @@ impl Slot {
     pub(super) fn discriminant_str(&self) -> &'static str {
         match self {
             Slot::Pending { .. } => "Pending",
-            Slot::PendingOpButFutureDropped { .. } => "PendingOpButFutureDropped",
-            Slot::Ready { .. } => "Ready",
         }
     }
 }

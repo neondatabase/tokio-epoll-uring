@@ -56,10 +56,4 @@ impl Op for OpenAtOp {
         };
         (self.dir_fd, res)
     }
-
-    fn on_op_completion_but_future_dropped(self, res: i32) {
-        if res >= 0 {
-            drop(unsafe { OwnedFd::from_raw_fd(res) });
-        }
-    }
 }

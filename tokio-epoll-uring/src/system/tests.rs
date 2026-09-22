@@ -39,9 +39,9 @@ async fn drop_system_handle() {
 }
 
 #[tokio::test]
-async fn op_state_pending_but_future_dropped() {
-    // Get the op slot into state PendingOpButFutureDropped
-    // then let process_completions run and see what happens.
+async fn operation_resources_outlive_dropped_future() {
+    // Drop an operation future while its read is pending, then let completion
+    // processing finish the operation and release its resources.
 
     let system = SharedSystemHandle::launch().await.unwrap();
 
@@ -73,8 +73,6 @@ async fn op_state_pending_but_future_dropped() {
     // assert!(matches!(read_fut), ...) it's an `async fn`, can't match :(
 
     drop(read_fut);
-    // op should be in state PendingOpButFutureDropped by now
-
     // wake up poller task to process completions
     writer.write_all(&[1]).unwrap();
 
@@ -397,8 +395,9 @@ async fn test_slot_exhaustion_behavior_when_op_future_gets_dropped() {
 /// and hence occupy a slot, but the future never gets polled to completion,
 /// even though the io_uring-level operation has long completed.
 ///
-/// The current behavior is that the operation waits for a slot to
-/// become available, i.e., it never completes.
+/// A completed kernel operation releases its slot even when its future has
+/// not been polled again. The completed output is owned by the future's
+/// one-shot receiver instead of occupying ring capacity.
 ///
 /// NB: In this test, we use the pattern of `select! { ..., sleep(2 seconds) }` to drive op futures
 /// to the point where they are enqueued and occupy a slot. This will become flaky if that takes
@@ -439,23 +438,17 @@ async fn test_slot_exhaustion_behavior_when_op_completes_but_future_does_not_get
         timerfd.set(Duration::from_millis(1));
     }
 
-    // despite the completed io_uring operations, our nop future is still waiting for a slot
-    tokio::select! {
-        biased; // ensure future gets queued first
-        res = &mut nop => {
-            panic!("nop shouldn't be able to get a slot because all slots are still used: {res:?}")
-        }
-        _ = tokio::time::sleep(Duration::from_secs(2)) => { }
-    }
+    // CQE processing releases a slot without waiting for the read futures to
+    // consume their outputs, so the queued nop can now complete.
+    let ((), res) = tokio::time::timeout(Duration::from_secs(2), &mut nop)
+        .await
+        .expect("a completed operation should release its slot");
+    res.unwrap();
 
     //
     // Cleanup
     //
     while let Some(()) = reads.next().await {}
-
-    // nop can now get a slot because the read futs have been polled to completion
-    let ((), res) = nop.await;
-    res.unwrap();
 
     Arc::into_inner(system).unwrap().initiate_shutdown().await;
 }
@@ -489,12 +482,18 @@ async fn open_fd_not_leaked_when_open_future_cancelled() {
     let dir = tempfile::tempdir().unwrap();
     let fifo_pending = dir.path().join("pending");
     let fifo_ready = dir.path().join("ready");
+    let fifo_shutdown = dir.path().join("shutdown");
     nix::unistd::mkfifo(
         &fifo_pending,
         nix::sys::stat::Mode::from_bits_truncate(0o600),
     )
     .unwrap();
     nix::unistd::mkfifo(&fifo_ready, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    nix::unistd::mkfifo(
+        &fifo_shutdown,
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )
+    .unwrap();
 
     let system = Arc::new(System::launch().await.unwrap());
 
@@ -505,7 +504,7 @@ async fn open_fd_not_leaked_when_open_future_cancelled() {
             system.open(&fifo_pending, &write_create_opts()),
         ));
         assert!(futures::poll!(&mut fut).is_pending());
-        // Drop before opening the reader to exercise Slot::PendingOpButFutureDropped.
+        // Drop before opening the reader to exercise cancellation before CQE.
         drop(fut);
         // The submitted writer runs in io-wq, so this rendezvous does not
         // require a Tokio task to run while the reader open blocks.
@@ -531,13 +530,34 @@ async fn open_fd_not_leaked_when_open_future_cancelled() {
             system.open(&fifo_ready, &write_create_opts()),
         ));
         assert!(fut.as_mut().poll(&mut cx).is_pending());
-        // Open the reader first so the slot reaches Slot::Ready before we drop the future.
+        // Open the reader first so completion is published before we drop the future.
         let reader_ready = std::fs::File::open(&fifo_ready).unwrap();
-        // The completion handler stores Ready before invoking our waker.
-        // Wait for that notification, then drop without repolling the future.
+        // Wait for the completion notification, then drop without repolling.
         rx.await.unwrap();
         drop(fut);
         reader_ready
+    };
+
+    let (shutdown_fut, reader_shutdown) = {
+        struct Notify(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl futures::task::ArcWake for Notify {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                if let Some(tx) = arc_self.0.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let waker = futures::task::waker(Arc::new(Notify(std::sync::Mutex::new(Some(tx)))));
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let mut fut = Box::pin(unconstrained(
+            system.open(&fifo_shutdown, &write_create_opts()),
+        ));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        let reader = std::fs::File::open(&fifo_shutdown).unwrap();
+        rx.await.unwrap();
+        (fut, reader)
     };
 
     // Linux records the FIFO rendezvous even if the reader closes before
@@ -547,12 +567,21 @@ async fn open_fd_not_leaked_when_open_future_cancelled() {
 
     Arc::into_inner(system).unwrap().initiate_shutdown().await;
 
+    // The completed output outlives Slots. Dropping its receiver after
+    // shutdown must still drop the OwnedFd produced by normal completion.
+    drop(shutdown_fut);
+    drop(reader_shutdown);
+
     assert!(
         !writer_still_open(&fifo_pending),
-        "PendingOpButFutureDropped path leaked the open fd"
+        "cancellation before CQE leaked the open fd"
     );
     assert!(
         !writer_still_open(&fifo_ready),
-        "Slot::Ready with dropped future leaked the open fd"
+        "cancellation after CQE leaked the open fd"
+    );
+    assert!(
+        !writer_still_open(&fifo_shutdown),
+        "cancellation after system shutdown leaked the open fd"
     );
 }
