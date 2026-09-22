@@ -333,9 +333,12 @@ async fn poller_impl(
             let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
             completion_side_guard.slots.transition_to_draining();
-            let pending_count = completion_side_guard.slots.pending_slot_count();
-            debug!(pending_count, "waiting for pending operations to complete");
-            if pending_count == 0 {
+            let outstanding_count = completion_side_guard.slots.outstanding_slot_count();
+            debug!(
+                outstanding_count,
+                "waiting for operations and reservations to finish"
+            );
+            if outstanding_count == 0 {
                 break;
             }
             completion_side_guard.process_completions(ProcessCompletionsCause::Shutdown);

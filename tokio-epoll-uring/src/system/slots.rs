@@ -66,7 +66,7 @@ pub(crate) struct SlotsWeak {
 struct SlotsInner {
     #[allow(dead_code)]
     id: usize,
-    storage: [Option<Slot>; RING_SIZE as usize],
+    storage: [Slot; RING_SIZE as usize],
     unused_indices: Vec<usize>,
     co_owner_live: [bool; co_owner::NUM_CO_OWNERS],
     state: SlotsInnerState,
@@ -100,7 +100,7 @@ enum SlotsInnerState {
     Open {
         myself: SlotsWeak,
         // FIXME: this is a basic channel right? could be a tokio::sync::mpsc::channel(1) instead
-        waiters: VecDeque<tokio::sync::oneshot::Sender<SlotHandle>>,
+        waiters: VecDeque<SlotWaiter>,
     },
     Draining,
 }
@@ -117,7 +117,31 @@ pub(crate) struct SlotHandle {
         std::sync::Mutex<Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>>,
 }
 
+enum SlotWaiter {
+    Tokio(oneshot::Sender<SlotHandle>),
+    #[cfg(test)]
+    Test(Box<dyn FnOnce(SlotHandle) -> Result<(), SlotHandle> + Send>),
+}
+
+impl SlotWaiter {
+    fn send(self, slot: SlotHandle) -> Result<(), SlotHandle> {
+        match self {
+            SlotWaiter::Tokio(sender) => sender.send(slot),
+            #[cfg(test)]
+            SlotWaiter::Test(sender) => sender(slot),
+        }
+    }
+}
+
+struct PreparedDelivery {
+    waiter: SlotWaiter,
+    #[cfg(test)]
+    test_on_wake: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
+}
+
 enum Slot {
+    Free,
+    Reserved,
     Pending {
         completion: Box<dyn PendingCompletion>,
     },
@@ -154,10 +178,7 @@ pub(super) fn new(
     let inner = Arc::new_cyclic(|inner_weak| {
         Mutex::new(SlotsInner {
             id,
-            storage: {
-                const NONE: Option<Slot> = None;
-                [NONE; RING_SIZE as usize]
-            },
+            storage: std::array::from_fn(|_| Slot::Free),
             unused_indices: (0..RING_SIZE.try_into().unwrap()).collect(),
             co_owner_live: [false; co_owner::NUM_CO_OWNERS],
             state: SlotsInnerState::Open {
@@ -214,55 +235,84 @@ impl SlotsWeak {
             None => Err(()),
         }
     }
+
+    fn return_reservation(&self, idx: usize) {
+        loop {
+            let waiter = match self.try_upgrade_mut(|inner| inner.prepare_return(idx)) {
+                Ok(waiter) => waiter,
+                Err(()) => return,
+            };
+            let Some(delivery) = waiter else {
+                return;
+            };
+
+            let handle = SlotHandle {
+                slots_weak: self.clone(),
+                idx: Some(idx),
+                #[cfg(test)]
+                test_on_wake: Mutex::new(delivery.test_on_wake),
+            };
+            match delivery.waiter.send(handle) {
+                Ok(()) => {
+                    // Sending relinquishes this return loop's ownership. The
+                    // receiver may already have consumed or dropped the handle.
+                    trace!(idx, "handed slot reservation to a waiter");
+                    return;
+                }
+                Err(mut rejected) => {
+                    let recovered = rejected
+                        .idx
+                        .take()
+                        .expect("a rejected handle must own its reservation");
+                    debug_assert_eq!(recovered, idx);
+                    // Retry from the mutex-protected state transition. Shutdown
+                    // may have changed Open to Draining while send ran.
+                }
+            }
+        }
+    }
 }
 
 impl SlotsInner {
-    fn return_slot(&mut self, idx: usize) {
-        fn clear_slot(slot_storage_ref: &mut Option<Slot>) {
-            match slot_storage_ref {
-                None => (),
-                Some(slot_ref) => panic!(
-                    "implementation error: potential memory unsafety: we must not return a slot that is still pending  {:?}",
-                    slot_ref.discriminant_str()
-                ),
-            }
-        }
+    /// Prepare a reservation return while holding the slots mutex. Delivery
+    /// itself must happen after releasing the mutex because sending can destroy
+    /// the delivered SlotHandle synchronously.
+    fn prepare_return(&mut self, idx: usize) -> Option<PreparedDelivery> {
+        assert!(
+            matches!(self.storage[idx], Slot::Reserved),
+            "only a reserved slot can be returned; slot {idx} is {}",
+            self.storage[idx].discriminant_str()
+        );
         match &mut self.state {
-            SlotsInnerState::Open { myself, waiters } => {
-                clear_slot(&mut self.storage[idx]);
-                while let Some(waiter) = waiters.pop_front() {
-                    match waiter.send(SlotHandle {
-                        slots_weak: myself.clone(),
-                        idx: Some(idx),
-                        #[cfg(test)]
-                        test_on_wake: Mutex::new((self.testing.test_on_wake)()),
-                    }) {
-                        Ok(()) => {
-                            trace!("handed `idx` to a waiter");
-                            return;
-                        }
-                        Err(mut rejected) => {
-                            // We still own `idx` and will offer it to the next
-                            // waiter. Disarm the rejected handle before it is
-                            // dropped while the slots mutex is held.
-                            rejected.idx.take();
-                            // the future requesting wakeup got dropped. wake up next one
-                            continue;
-                        }
-                    }
+            SlotsInnerState::Open { waiters, .. } => match waiters.pop_front() {
+                Some(waiter) => Some(PreparedDelivery {
+                    waiter,
+                    #[cfg(test)]
+                    test_on_wake: (self.testing.test_on_wake)(),
+                }),
+                None => {
+                    self.storage[idx] = Slot::Free;
+                    self.unused_indices.push(idx);
+                    None
                 }
-                self.unused_indices.push(idx);
-            }
+            },
             SlotsInnerState::Draining => {
-                clear_slot(&mut self.storage[idx]);
-                trace!("draining, returning idx to unused_indices");
+                self.storage[idx] = Slot::Free;
                 self.unused_indices.push(idx);
+                None
             }
         }
     }
 }
 
 impl<const O: usize> Slots<O> {
+    fn slots_weak(&self) -> SlotsWeak {
+        SlotsWeak {
+            id: self.id,
+            inner_weak: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub(super) fn poller_timeout_debug_dump(&self) {
         let inner = self.inner.lock().unwrap();
         // TODO: only do this if some env var is set?
@@ -276,21 +326,11 @@ impl<const O: usize> Slots<O> {
                 // you want to move it out, use tracing::enabled to still avoid the overhead.
                 let mut by_state_discr = HashMap::new();
                 for s in storage {
-                    match s {
-                        Some(slot) => {
-                            let discr = slot.discriminant_str();
-                            by_state_discr
-                                .entry(discr)
-                                .and_modify(|v| *v += 1)
-                                .or_insert(1);
-                        }
-                        None => {
-                            by_state_discr
-                                .entry("None")
-                                .and_modify(|v| *v += 1)
-                                .or_insert(1);
-                        }
-                    }
+                    let discr = s.discriminant_str();
+                    by_state_discr
+                        .entry(discr)
+                        .and_modify(|v| *v += 1)
+                        .or_insert(1);
                 }
                 by_state_discr
             }
@@ -304,10 +344,11 @@ impl Slots<{ co_owner::COMPLETION_SIDE }> {
         cqes: impl Iterator<Item = io_uring::cqueue::Entry>,
     ) {
         for cqe in cqes {
-            let (completion, res) = {
+            let (idx, completion, res) = {
                 let mut inner_guard = self.inner.lock().unwrap();
                 inner_guard.take_completion(cqe)
             };
+            self.slots_weak().return_reservation(idx);
             // Do operation-specific completion and drop user resources without
             // holding the slots mutex. Destructors are allowed to call back
             // into the system.
@@ -320,14 +361,14 @@ impl SlotsInner {
     fn take_completion(
         &mut self,
         cqe: io_uring::cqueue::Entry,
-    ) -> (Box<dyn PendingCompletion>, i32) {
+    ) -> (usize, Box<dyn PendingCompletion>, i32) {
         let idx: u64 = cqe.user_data();
         let idx = usize::try_from(idx).unwrap();
-        let Slot::Pending { completion } = self.storage[idx]
-            .take()
-            .expect("completion must refer to a submitted operation");
-        self.return_slot(idx);
-        (completion, cqe.result())
+        let slot = std::mem::replace(&mut self.storage[idx], Slot::Reserved);
+        let Slot::Pending { completion } = slot else {
+            panic!("completion must refer to a pending operation")
+        };
+        (idx, completion, cqe.result())
     }
 }
 
@@ -349,16 +390,19 @@ impl Slots<{ co_owner::COMPLETION_SIDE }> {
 }
 
 impl Slots<{ co_owner::COMPLETION_SIDE }> {
-    pub(super) fn pending_slot_count(&self) -> usize {
-        let ring_size = usize::try_from(RING_SIZE).unwrap();
+    /// Count every slot that shutdown must wait for: both submitted operations
+    /// and reservations that have not yet been submitted or relinquished.
+    pub(super) fn outstanding_slot_count(&self) -> usize {
         let inner_guard = self.inner.lock().unwrap();
         match inner_guard.state {
             SlotsInnerState::Open { .. } => {
                 panic!("implementation error: must only call this method after set_draining")
             }
-            SlotsInnerState::Draining => {
-                ring_size - inner_guard.slots_owned_by_user_space().count()
-            }
+            SlotsInnerState::Draining => inner_guard
+                .storage
+                .iter()
+                .filter(|slot| !matches!(slot, Slot::Free))
+                .count(),
         }
     }
 }
@@ -370,20 +414,25 @@ impl<const O: usize> Slots<O> {
             SlotsInnerState::Open { .. } => panic!("we should be Draining by now"),
             SlotsInnerState::Draining => (),
         };
-        let slots_owned_by_user_space = inner_guard
-            .slots_owned_by_user_space()
-            .collect::<HashSet<_>>();
         let unused_indices = inner_guard
             .unused_indices
             .iter()
             .cloned()
             .collect::<HashSet<usize>>();
-        // Once every CQE has been processed, all slots have been returned.
         assert_eq!(
-            inner_guard.slots_owned_by_user_space().count(),
-            RING_SIZE.try_into().unwrap()
+            inner_guard.unused_indices.len(),
+            unused_indices.len(),
+            "unused_indices contains duplicate returns"
         );
-        assert_eq!(unused_indices, slots_owned_by_user_space);
+        assert!(unused_indices.iter().all(|idx| *idx < RING_SIZE as usize));
+        for (idx, slot) in inner_guard.storage.iter().enumerate() {
+            assert!(matches!(slot, Slot::Free), "slot {idx} is not free");
+            assert!(
+                unused_indices.contains(&idx),
+                "free slot {idx} is unavailable"
+            );
+        }
+        assert_eq!(unused_indices.len(), RING_SIZE as usize);
 
         // assert the calling owner is the only remaining owner
         let mut expected_co_owner_live = [false; co_owner::NUM_CO_OWNERS];
@@ -413,19 +462,23 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
             SlotsInnerState::Open { myself, waiters } => {
                 let num_in_use_slots = RING_SIZE as u64 - inner.unused_indices.len() as u64;
                 match inner.unused_indices.pop() {
-                    Some(idx) => TryGetSlotResult::GotSlot {
-                        slot: SlotHandle {
-                            slots_weak: myself.clone(),
-                            idx: Some(idx),
-                            #[cfg(test)]
-                            test_on_wake: Mutex::new((inner.testing.test_on_wake)()),
-                        },
-                        queue_depth: num_in_use_slots,
-                    },
+                    Some(idx) => {
+                        assert!(matches!(inner.storage[idx], Slot::Free));
+                        inner.storage[idx] = Slot::Reserved;
+                        TryGetSlotResult::GotSlot {
+                            slot: SlotHandle {
+                                slots_weak: myself.clone(),
+                                idx: Some(idx),
+                                #[cfg(test)]
+                                test_on_wake: Mutex::new((inner.testing.test_on_wake)()),
+                            },
+                            queue_depth: num_in_use_slots,
+                        }
+                    }
                     None => {
                         let (wake_up_tx, wake_up_rx) = tokio::sync::oneshot::channel();
                         let num_waiters = waiters.len() as u64;
-                        waiters.push_back(wake_up_tx);
+                        waiters.push_back(SlotWaiter::Tokio(wake_up_tx));
                         TryGetSlotResult::NoSlots {
                             later: wake_up_rx,
                             queue_depth: num_in_use_slots + num_waiters,
@@ -461,10 +514,10 @@ impl SlotHandle {
 
         let res = self.slots_weak.try_upgrade_mut(|inner| match inner.state {
             SlotsInnerState::Open { .. } => {
-                assert!(inner.storage[idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
-                inner.storage[idx] = Some(Slot::Pending {
+                assert!(matches!(inner.storage[idx], Slot::Reserved));
+                inner.storage[idx] = Slot::Pending {
                     completion: Box::new(pending.take().unwrap()),
-                });
+                };
             }
             SlotsInnerState::Draining => {}
         });
@@ -521,28 +574,15 @@ impl Drop for SlotHandle {
         let Some(idx) = self.idx.take() else {
             return;
         };
-        let _ = self.slots_weak.try_upgrade_mut(|inner| {
-            assert!(
-                inner.storage[idx].is_none(),
-                "an unconsumed reservation must not own an operation"
-            );
-            inner.return_slot(idx);
-        });
-    }
-}
-
-impl SlotsInner {
-    pub(super) fn slots_owned_by_user_space(&self) -> impl Iterator<Item = usize> + '_ {
-        self.storage
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, x)| x.is_none().then_some(idx))
+        self.slots_weak.return_reservation(idx);
     }
 }
 
 impl Slot {
     pub(super) fn discriminant_str(&self) -> &'static str {
         match self {
+            Slot::Free => "Free",
+            Slot::Reserved => "Reserved",
             Slot::Pending { .. } => "Pending",
         }
     }
@@ -550,12 +590,31 @@ impl Slot {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     use crate::{
         system::slots::{SlotsTesting, TryGetSlotResult},
         System,
     };
+
+    fn assert_all_slots_free<const O: usize>(slots: &super::Slots<O>) {
+        let inner = slots.inner.lock().unwrap();
+        let unique = inner
+            .unused_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(inner.unused_indices.len(), super::RING_SIZE as usize);
+        assert_eq!(unique.len(), super::RING_SIZE as usize);
+        assert!(unique.iter().all(|idx| *idx < super::RING_SIZE as usize));
+        assert!(inner
+            .storage
+            .iter()
+            .all(|slot| matches!(slot, super::Slot::Free)));
+    }
 
     #[test]
     fn cancelled_delivered_reservation_is_returned() {
@@ -583,10 +642,57 @@ mod tests {
         drop(slot);
         drop(reservations);
 
-        assert_eq!(
-            submit_side.inner.lock().unwrap().unused_indices.len(),
-            super::RING_SIZE as usize
-        );
+        assert_all_slots_free(&submit_side);
+    }
+
+    #[test]
+    fn successful_delivery_may_destroy_reservation_inside_send() {
+        let (submit_side, _completion_side, _poller) = super::new(1, SlotsTesting::default());
+        let mut reservations = Vec::new();
+        for _ in 0..super::RING_SIZE {
+            let TryGetSlotResult::GotSlot { slot, .. } = submit_side.try_get_slot() else {
+                panic!("expected an available slot");
+            };
+            reservations.push(slot);
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_sender = Arc::clone(&calls);
+        let inner = Arc::clone(&submit_side.inner);
+        let test_waiter = super::SlotWaiter::Test(Box::new(move |mut slot| {
+            // A send is allowed to synchronously destroy the delivered value.
+            // Verify that delivery did not retain the slots mutex before
+            // exercising that re-entrant SlotHandle::drop path.
+            let guard = match inner.try_lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    // Avoid calling the locking destructor while reporting a
+                    // lock violation, which would hang the regression test.
+                    slot.idx.take();
+                    panic!("slot mutex is locked during delivery: {error}");
+                }
+            };
+            drop(guard);
+            calls_for_sender.fetch_add(1, Ordering::SeqCst);
+            drop(slot);
+            Ok(())
+        }));
+        {
+            let mut inner = submit_side.inner.lock().unwrap();
+            let super::SlotsInnerState::Open { waiters, .. } = &mut inner.state else {
+                panic!("slots unexpectedly draining");
+            };
+            waiters.push_back(test_waiter);
+        }
+
+        // Returning this reservation invokes the test sender. It destroys the
+        // delivered handle before reporting success, so the recursive return
+        // must complete and the outer delivery loop must stop exactly once.
+        drop(reservations.pop());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(reservations);
+
+        assert_all_slots_free(&submit_side);
     }
 
     // Regression-test for issue https://github.com/neondatabase/tokio-epoll-uring/issues/37
