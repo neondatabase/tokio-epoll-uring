@@ -333,9 +333,12 @@ async fn poller_impl(
             let inner_guard = inner_shared.lock().unwrap();
             let mut completion_side_guard = inner_guard.completion_side.lock().unwrap();
             completion_side_guard.slots.transition_to_draining();
-            let pending_count = completion_side_guard.slots.pending_slot_count();
-            debug!(pending_count, "waiting for pending operations to complete");
-            if pending_count == 0 {
+            let outstanding_count = completion_side_guard.slots.outstanding_slot_count();
+            debug!(
+                outstanding_count,
+                "waiting for operations and reservations to finish"
+            );
+            if outstanding_count == 0 {
                 break;
             }
             completion_side_guard.process_completions(ProcessCompletionsCause::Shutdown);
@@ -603,17 +606,9 @@ mod tests {
             }
         });
 
-        let ((_, _), res) = second_rt.block_on(read_fut);
-        let err = res.expect_err("when poller signals shutdown_done, it has dropped the Slots Arc; read_fut only holds a Weak to it and will fail to upgrade");
-        assert!(
-            matches!(
-                err,
-                crate::SystemError::System(
-                    crate::system::submission::op_fut::SystemError::SystemShuttingDown
-                )
-            ),
-            "{err:?}"
-        );
+        let ((_, buf), res) = second_rt.block_on(read_fut);
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!(buf, vec![23]);
     }
 
     #[test]
