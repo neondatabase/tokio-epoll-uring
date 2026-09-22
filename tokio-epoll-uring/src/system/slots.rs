@@ -108,7 +108,10 @@ enum SlotsInnerState {
 pub(crate) struct SlotHandle {
     // FIXME: why is this weak?
     slots_weak: SlotsWeak,
-    idx: usize,
+    // Some while this handle represents an unconsumed slot reservation. Once
+    // an operation is installed in storage, ownership moves to the slot and
+    // this is set to None.
+    idx: Option<usize>,
     #[cfg(test)]
     test_on_wake:
         std::sync::Mutex<Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>>,
@@ -230,7 +233,7 @@ impl SlotsInner {
                 while let Some(waiter) = waiters.pop_front() {
                     match waiter.send(SlotHandle {
                         slots_weak: myself.clone(),
-                        idx,
+                        idx: Some(idx),
                         #[cfg(test)]
                         test_on_wake: Mutex::new((self.testing.test_on_wake)()),
                     }) {
@@ -238,7 +241,11 @@ impl SlotsInner {
                             trace!("handed `idx` to a waiter");
                             return;
                         }
-                        Err(_) => {
+                        Err(mut rejected) => {
+                            // We still own `idx` and will offer it to the next
+                            // waiter. Disarm the rejected handle before it is
+                            // dropped while the slots mutex is held.
+                            rejected.idx.take();
                             // the future requesting wakeup got dropped. wake up next one
                             continue;
                         }
@@ -409,7 +416,7 @@ impl Slots<{ co_owner::SUBMIT_SIDE }> {
                     Some(idx) => TryGetSlotResult::GotSlot {
                         slot: SlotHandle {
                             slots_weak: myself.clone(),
-                            idx,
+                            idx: Some(idx),
                             #[cfg(test)]
                             test_on_wake: Mutex::new((inner.testing.test_on_wake)()),
                         },
@@ -437,7 +444,7 @@ type UseForOpOutput<O> = (
 
 impl SlotHandle {
     pub(crate) fn use_for_op<O, S>(
-        self,
+        mut self,
         mut op: O,
         do_submit: S,
     ) -> impl std::future::Future<Output = UseForOpOutput<O>>
@@ -445,22 +452,21 @@ impl SlotHandle {
         O: Op + Send + 'static,
         S: FnOnce(io_uring::squeue::Entry),
     {
+        let idx = self.idx.expect("slot reservation must be live");
         let sqe = op.make_sqe();
-        let sqe = sqe.user_data(u64::try_from(self.idx).unwrap());
+        let sqe = sqe.user_data(u64::try_from(idx).unwrap());
 
         let (result_tx, result_rx) = oneshot::channel();
         let mut pending = Some(PendingCompletionImpl { op, result_tx });
 
         let res = self.slots_weak.try_upgrade_mut(|inner| match inner.state {
             SlotsInnerState::Open { .. } => {
-                assert!(inner.storage[self.idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
-                inner.storage[self.idx] = Some(Slot::Pending {
+                assert!(inner.storage[idx].is_none()); // TODO turn Option into tri-state for better semantics: NotTaken, SlotLive, Submitted
+                inner.storage[idx] = Some(Slot::Pending {
                     completion: Box::new(pending.take().unwrap()),
                 });
             }
-            SlotsInnerState::Draining => {
-                inner.return_slot(self.idx);
-            }
+            SlotsInnerState::Draining => {}
         });
         if let Some(PendingCompletionImpl { op, .. }) = pending.take() {
             // Either the slots allocation has already disappeared, or the
@@ -473,6 +479,8 @@ impl SlotHandle {
             });
         }
         debug_assert!(res.is_ok());
+        // The slot now owns the operation and will return the index on CQE.
+        self.idx.take();
 
         do_submit(sqe);
 
@@ -508,6 +516,21 @@ impl SlotHandle {
     }
 }
 
+impl Drop for SlotHandle {
+    fn drop(&mut self) {
+        let Some(idx) = self.idx.take() else {
+            return;
+        };
+        let _ = self.slots_weak.try_upgrade_mut(|inner| {
+            assert!(
+                inner.storage[idx].is_none(),
+                "an unconsumed reservation must not own an operation"
+            );
+            inner.return_slot(idx);
+        });
+    }
+}
+
 impl SlotsInner {
     pub(super) fn slots_owned_by_user_space(&self) -> impl Iterator<Item = usize> + '_ {
         self.storage
@@ -529,7 +552,42 @@ impl Slot {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::{system::slots::SlotsTesting, System};
+    use crate::{
+        system::slots::{SlotsTesting, TryGetSlotResult},
+        System,
+    };
+
+    #[test]
+    fn cancelled_delivered_reservation_is_returned() {
+        let (submit_side, _completion_side, _poller) = super::new(1, SlotsTesting::default());
+        let mut reservations = Vec::new();
+        for _ in 0..super::RING_SIZE {
+            let TryGetSlotResult::GotSlot { slot, .. } = submit_side.try_get_slot() else {
+                panic!("expected an available slot");
+            };
+            reservations.push(slot);
+        }
+
+        let TryGetSlotResult::NoSlots { later, .. } = submit_side.try_get_slot() else {
+            panic!("expected to wait after reserving every slot");
+        };
+
+        // Returning one reservation successfully delivers a new SlotHandle
+        // into `later`. Cancelling before repolling drops that queued handle.
+        drop(reservations.pop());
+        drop(later);
+
+        let TryGetSlotResult::GotSlot { slot, .. } = submit_side.try_get_slot() else {
+            panic!("the cancelled reservation must be available again");
+        };
+        drop(slot);
+        drop(reservations);
+
+        assert_eq!(
+            submit_side.inner.lock().unwrap().unused_indices.len(),
+            super::RING_SIZE as usize
+        );
+    }
 
     // Regression-test for issue https://github.com/neondatabase/tokio-epoll-uring/issues/37
     #[tokio::test]
