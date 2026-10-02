@@ -1,7 +1,6 @@
 //! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
-use futures::FutureExt;
-use std::{mem::MaybeUninit, os::fd::OwnedFd, path::Path, sync::Arc, task::ready};
+use std::{mem::MaybeUninit, os::fd::OwnedFd, path::Path, sync::Arc};
 use uring_common::{
     buf::{BoundedBuf, BoundedBufMut},
     io_fd::IoFd,
@@ -75,25 +74,6 @@ impl<M: PerSystemMetrics> SystemHandle<M> {
     }
 }
 
-struct WaitShutdownFut {
-    done_rx: tokio::sync::oneshot::Receiver<()>,
-}
-
-impl std::future::Future for WaitShutdownFut {
-    type Output = ();
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
-        let done_rx = &mut self.done_rx;
-        match ready!(done_rx.poll_unpin(cx)) {
-            Ok(()) => std::task::Poll::Ready(()),
-            Err(_) => panic!("implementation error: poller must not die before SystemHandle"),
-        }
-    }
-}
-
 impl<M: PerSystemMetrics> SystemHandleInner<M> {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send {
         self.submit_side.shutdown()
@@ -114,7 +94,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
     }
@@ -134,7 +113,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
     }
@@ -157,7 +135,7 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         let per_system_metrics = Arc::clone(&inner.per_system_metrics);
         let weak = inner.submit_side.weak();
         futures::future::Either::Right(async move {
-            let (_, res) = execute_op(op, weak, None, per_system_metrics).await;
+            let (_, res) = execute_op(op, weak, per_system_metrics).await;
             res
         })
     }
@@ -177,7 +155,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
         .await
@@ -198,7 +175,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
         .await
@@ -225,7 +201,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         let (resources, result) = execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
         .await;
@@ -265,7 +240,6 @@ impl<M: PerSystemMetrics> crate::SystemHandle<M> {
         execute_op(
             op,
             inner.submit_side.weak(),
-            None,
             Arc::clone(&inner.per_system_metrics),
         )
     }
