@@ -8,3 +8,5 @@ pub(crate) mod test_util;
 pub(crate) mod tests;
 
 pub(crate) const RING_SIZE: u32 = 128;
+
+pub mod kernel_support;

@@ -80,6 +80,7 @@ mod system;
 #[cfg(target_os = "linux")]
 pub use {
     crate::system::submission::op_fut::Error,
+    system::kernel_support,
     system::lifecycle::handle::SystemHandle,
     system::lifecycle::thread_local::{thread_local_system, Handle},
     system::lifecycle::LaunchResult,
