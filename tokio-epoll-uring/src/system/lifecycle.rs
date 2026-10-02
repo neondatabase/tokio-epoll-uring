@@ -99,12 +99,13 @@ impl System {
     ///
     /// The concept of *poller task* is described in [`crate::doc::design`].
     pub async fn launch() -> Result<SystemHandle, LaunchResult> {
-        Self::launch_with_metrics(Arc::new(())).await
+        Self::launch_with_metrics(Arc::new(()), None).await
     }
 
     /// Like [`Self::launch`], but allows to pass in a [`PerSystemMetrics`] implementation.
     pub async fn launch_with_metrics<M>(
         per_system_metrics: Arc<M>,
+        share_workers_with_system: Option<&SystemHandle<M>>,
     ) -> Result<SystemHandle<M>, LaunchResult>
     where
         M: PerSystemMetrics,
@@ -114,6 +115,7 @@ impl System {
             None,
             &crate::metrics::GLOBAL_STORAGE,
             per_system_metrics,
+            share_workers_with_system,
         )
         .await
     }
@@ -123,6 +125,7 @@ impl System {
         slots_testing: Option<SlotsTesting>,
         global_metrics_storage: &'static GlobalMetricsStorage,
         per_system_metrics: Arc<M>,
+        share_workers_with_system: Option<&SystemHandle<M>>,
     ) -> Result<SystemHandle<M>, LaunchResult>
     where
         M: PerSystemMetrics,
@@ -134,19 +137,27 @@ impl System {
             let (slots_submit_side, slots_completion_side, slots_poller) =
                 super::slots::new(id, slots_testing.unwrap_or_default());
 
-            let uring = Box::new(
-                io_uring::IoUring::builder()
-                    // Don't fork-inherit the MAP_SHARED memory mapping of the SQs and CQs with any child process.
-                    // Rationale: for an individual io_uring instance, tokio-epoll-uring assumes explusive ownership
-                    // of the user-space part of the io_uring user/kernel interface.
-                    //
-                    // For example, we rely on Arc<Mutex<>> to protect the `SubmitSideInner`.
-                    // A child process would have its cloned `Arc<Mutex<>>` but operate on the same MAP_SHARED memory mapping.
-                    // Disaster would ensure.
-                    .dontfork()
+            let uring = Box::new({
+                let mut builder = io_uring::IoUring::builder();
+
+                // Don't fork-inherit the MAP_SHARED memory mapping of the SQs and CQs with any child process.
+                // Rationale: for an individual io_uring instance, tokio-epoll-uring assumes explusive ownership
+                // of the user-space part of the io_uring user/kernel interface.
+                //
+                // For example, we rely on Arc<Mutex<>> to protect the `SubmitSideInner`.
+                // A child process would have its cloned `Arc<Mutex<>>` but operate on the same MAP_SHARED memory mapping.
+                // Disaster would ensure.
+                builder.dontfork();
+                if let Some(millis) = *crate::env_tunables::SETUP_SQPOLL {
+                    builder.setup_sqpoll(millis);
+                }
+                if let Some(existing_system) = share_workers_with_system {
+                    builder.setup_attach_wq(existing_system.ring_fd().await);
+                }
+                builder
                     .build(RING_SIZE)
-                    .map_err(LaunchResult::IoUringBuild)?,
-            );
+                    .map_err(LaunchResult::IoUringBuild)?
+            });
             let flags_set_by_kernel = nix::fcntl::FdFlag::from_bits_truncate(
                 nix::fcntl::fcntl(uring.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap(),
             );
@@ -207,6 +218,7 @@ impl System {
 
             let submit_side = SubmitSide::new(SubmitSideNewArgs {
                 id,
+                fd: uring_fd,
                 submitter,
                 sq,
                 slots: slots_submit_side,

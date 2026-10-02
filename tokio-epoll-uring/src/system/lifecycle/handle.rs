@@ -1,7 +1,13 @@
 //! Owned handle to an explicitly [`System::launch`](crate::System::launch)ed system.
 
 use futures::FutureExt;
-use std::{mem::MaybeUninit, os::fd::OwnedFd, path::Path, sync::Arc, task::ready};
+use std::{
+    mem::MaybeUninit,
+    os::fd::{OwnedFd, RawFd},
+    path::Path,
+    sync::Arc,
+    task::ready,
+};
 use uring_common::{
     buf::{BoundedBuf, BoundedBufMut},
     io_fd::IoFd,
@@ -42,6 +48,15 @@ impl<M: PerSystemMetrics> SystemHandle<M> {
                 per_system_metrics,
             }),
         }
+    }
+
+    /// SAFETY: caller must ensure that `self` outlives the returned `RawFd`.
+    pub(crate) async fn ring_fd(&self) -> RawFd {
+        self.inner
+            .as_ref()
+            .expect("only shutdown transitions this to None, and it consumes `self`")
+            .submit_side
+            .ring_fd().await
     }
 
     /// Initiate system shtudown and return a future to await completion of shutdown.

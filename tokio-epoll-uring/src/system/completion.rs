@@ -648,6 +648,7 @@ mod tests {
                     None,
                     &crate::metrics::GLOBAL_STORAGE,
                     Arc::new(()),
+                    None,
                 )
                 .await
                 .unwrap();

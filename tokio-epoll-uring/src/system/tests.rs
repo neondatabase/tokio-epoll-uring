@@ -213,6 +213,7 @@ fn test_metrics() {
             None,
             metrics,
             Arc::new(()),
+            None,
         ))
         .unwrap();
     assert_eq!(

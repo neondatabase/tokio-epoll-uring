@@ -127,6 +127,12 @@ pub mod env_tunables {
                     }
                 })
         });
+    pub(crate) static SETUP_SQPOLL: once_cell::sync::Lazy<Option<u32>> =
+        once_cell::sync::Lazy::new(|| {
+            std::env::var("NEON_PAGESERVER_EPOLL_URING_SETUP_SQPOLL")
+                .map(|v| v.parse::<u32>().unwrap())
+                .ok()
+        });
     pub fn assert_no_unknown_env_vars() {
         std::env::vars()
             .filter_map(|(v, _)| {

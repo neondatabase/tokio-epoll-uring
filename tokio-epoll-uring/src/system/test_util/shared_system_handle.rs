@@ -33,6 +33,7 @@ impl SharedSystemHandle {
             None,
             &crate::metrics::GLOBAL_STORAGE,
             Arc::new(()),
+            None,
         )
         .await?;
         Ok(Self(Arc::new(RwLock::new(Some(handle)))))
