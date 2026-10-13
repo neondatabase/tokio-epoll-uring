@@ -168,10 +168,58 @@ impl<T: IoBufMut> BoundedBufMut for Slice<T> {
     type BufMut = T;
 
     fn stable_mut_ptr(&mut self) -> *mut u8 {
-        super::deref_mut(&mut self.buf)[self.begin..].as_mut_ptr()
+        // `get_mut` can change the buffer's initialized length or capacity.
+        assert!(
+            self.begin <= self.buf.bytes_init(),
+            "slice starts beyond initialized bytes"
+        );
+        assert!(
+            self.end <= self.buf.bytes_total(),
+            "slice ends beyond total bytes"
+        );
+
+        // Safety: the checks above keep the full view within the buffer's allocation.
+        // Use the buffer's pointer to preserve access to its uninitialized tail.
+        unsafe { IoBufMut::stable_mut_ptr(&mut self.buf).add(self.begin) }
     }
 
     unsafe fn set_init(&mut self, pos: usize) {
         self.buf.set_init(self.begin + pos);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes into the uninitialized part of a slice must stay within the
+    /// provenance of `stable_mut_ptr`. Passes natively either way; run under
+    /// `cargo +nightly miri test` to catch a pointer derived from the
+    /// initialized-only view.
+    #[test]
+    fn put_slice_into_uninitialized_tail() {
+        let mut slice = Vec::<u8>::with_capacity(8).slice(0..8);
+        slice.put_slice(b"abc");
+        assert_eq!(&slice[..], b"abc");
+
+        let mut slice = slice.into_inner().slice(3..8);
+        slice.put_slice(b"de");
+        assert_eq!(slice.into_inner(), b"abcde");
+    }
+
+    #[test]
+    #[should_panic(expected = "slice starts beyond initialized bytes")]
+    fn stable_mut_ptr_rejects_truncated_buffer() {
+        let mut slice = vec![0; 8].slice(4..8);
+        slice.get_mut().truncate(2);
+        slice.stable_mut_ptr();
+    }
+
+    #[test]
+    #[should_panic(expected = "slice ends beyond total bytes")]
+    fn stable_mut_ptr_rejects_smaller_replacement_buffer() {
+        let mut slice = vec![0; 8].slice(0..8);
+        *slice.get_mut() = Vec::new();
+        slice.stable_mut_ptr();
     }
 }
